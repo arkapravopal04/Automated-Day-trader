@@ -1,6 +1,15 @@
 This is the informatin page:
-
+https://github.com/arkapravopal04/Automated-Day-trader.git
 
 Auto Grad Engine
+---engine.py
+---this is the vision:
+---this acts as the main brain for all the other layers and tech stacks
+---performs many operations and can be easily called upon by any other file/stack
 ---
----
+
+Module 
+---module.py
+---this is the vision:
+---this keeps track of parameters
+---specific math happens here
