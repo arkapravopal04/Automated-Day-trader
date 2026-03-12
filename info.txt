@@ -1,5 +1,4 @@
 This is the informatin page:
-https://github.com/arkapravopal04/Automated-Day-trader.git
 
 Auto Grad Engine
 ---engine.py

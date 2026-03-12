@@ -97,6 +97,35 @@ class Tensor:
             self.grad += np.ones_like(self.data) * out.grad
         out._backward = _backward
         return out
+    def exp(self):
+        e = np.exp(self.data)
+        out = Tensor(e, (self,), 'exp')
+        def _backward():
+            self.grad += e * out.grad
+        out._backward = _backward
+        return out
+    def log(self):
+        out = Tensor(np.log(self.data), (self,), 'log')
+        def _backward():
+            self.grad += (1 / (self.data + 1e-8)) * out.grad
+        out._backward = _backward
+        return out
+    def max(self, axis=None, keepdims=False):
+        out = Tensor(np.max(self.data, axis=axis, keepdims=keepdims), (self,), 'max')
+        def _backward():
+            grad = np.zeros_like(self.data)
+            if axis is None:
+                grad[self.data == out.data] = out.grad
+            else:
+                if not keepdims:
+                    out_data = np.expand_dims(out.data, axis=axis)
+                else:
+                    out_data = out.data
+                grad[self.data == out_data] = out.grad
+            self.grad += grad
+        out._backward = _backward
+        return out
+    
 
     def im2col(self, kernel_size, stride= 1, padding=0):
         C, H, W = self.data.shape
@@ -134,6 +163,46 @@ class Tensor:
         out = Tensor(self.data.transpose(axes), (self,), 'transpose')
         def _backward():
             self.grad += out.grad.transpose(np.argsort(axes))
+        out._backward = _backward
+        return out
+    
+    def flatten(self):
+        size = int(np.prod(self.data.shape))
+        out = Tensor(self.data.flatten(), (self,), 'flatten')
+        def _backward():
+            self.grad += out.grad.reshape(self.data.shape)
+        out._backward = _backward
+        return out
+    
+    def mean(self, axis=None, keepdims = False):
+        out = Tensor(np.mean(self.data, axis=axis, keepdims=keepdims), (self,), 'mean')
+        def _backward():
+            grad = out.grad
+            if axis is None:
+                grad = np.ones_like(self.data) * grad / self.data.size
+            else:
+                if not keepdims:
+                    grad = np.expand_dims(grad, axis=axis)
+                grad = np.ones_like(self.data) * grad / self.data.shape[axis]
+            self.grad += grad
+        out._backward = _backward   
+        return out
+    
+    def concat(self, other, axis=0):
+        other = other if isinstance(other, Tensor) else Tensor(other)
+        out = Tensor(np.concatenate((self.data, other.data), axis=axis), (self, other), 'concat')
+        def _backward():
+            self.grad += out.grad[:self.data.shape[axis]]
+            other.grad += out.grad[self.data.shape[axis]:]
+        out._backward = _backward
+        return out
+    
+    def slice(self, start, end, axis = 0):
+        out = Tensor(self.data[start:end], (self,), 'slice')
+        def _backward():
+            grad = np.zeros_like(self.data)
+            grad[start:end] = out.grad
+            self.grad += grad
         out._backward = _backward
         return out
     
