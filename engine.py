@@ -192,8 +192,9 @@ class Tensor:
         other = other if isinstance(other, Tensor) else Tensor(other)
         out = Tensor(np.concatenate((self.data, other.data), axis=axis), (self, other), 'concat')
         def _backward():
-            self.grad += out.grad[:self.data.shape[axis]]
-            other.grad += out.grad[self.data.shape[axis]:]
+            grads = np.split(out.grad, [self.data.shape[axis]], axis=axis)
+            self.grad += grads[0]
+            other.grad += grads[1]
         out._backward = _backward
         return out
     
@@ -202,6 +203,16 @@ class Tensor:
         def _backward():
             grad = np.zeros_like(self.data)
             grad[start:end] = out.grad
+            self.grad += grad
+        out._backward = _backward
+        return out
+    
+
+    def __getitem__(self, key):
+        out = Tensor(self.data[key], (self,), 'getitem')
+        def _backward():
+            grad = np.zeros_like(self.data)
+            grad[key] = out.grad
             self.grad += grad
         out._backward = _backward
         return out
