@@ -52,7 +52,7 @@ class Conv2D(Module):
         self.w = Tensor(np.random.randn(out_channels, fan_in) * std, label=f'{label}_w')
         self.b = Tensor(np.zeros((out_channels, 1)), label=f'{label}_b')
 
-    def __call__(self, x):
+    def forward(self, x):
         col = x.im2col((self.kh, self.kw), self.stride, self.padding)
         
         res = self.w.matmul(col) + self.b
@@ -68,7 +68,7 @@ class Conv2D(Module):
     
 
 class Flatten(Module):
-    def __call__(self, x):
+    def forward(self, x):
         return x.flatten()
     def parameters(self):
         return []
@@ -78,10 +78,10 @@ class LayerNorm(Module):
         self.gamma = Tensor(np.ones(num_features), label=f'{label}_gamma')
         self.beta = Tensor(np.zeros(num_features), label=f'{label}_beta')
         self.eps = eps
-    def __call__(self , x):
+    def forward(self , x):
         mean = x.mean(axis = 0, keepdims = True)
         var = ((x - mean) ** 2).mean(axis = 0, keepdims = True)
-        x_normalized = (x - mean) / np.sqrt(var + self.eps)
+        x_normalized = (x - mean) / ((var + self.eps)**0.5)
         out = self.gamma * x_normalized + self.beta
         return out
     def parameters(self):
@@ -89,17 +89,22 @@ class LayerNorm(Module):
     
 
 class Dropout(Module):
-    def __init__(self, p = 0.5):
+    def __init__(self, p = 0.2):
         self.p = p
-    def __call__(self, x):
-        if np.random.rand() < self.p:
-            return x * 0
-        else:
-            return x / (1 - self.p)
+        self.training = True
+    def forward(self, x):
+        if not self.training:
+            return x
+        random_mask = (np.random.rand(*x.data.shape) > self.p).astype(np.float32)
+        out = Tensor(x.data * random_mask, (x,), 'dropout') 
+        def _backward():
+            x.grad += out.grad * random_mask
+        out._backward = _backward
+        return out * (1.0 / (1.0 - self.p))
     def parameters(self):
         return []
 
-class Adam_Optimiser(Module):
+class Adam_Optimiser:
     def __init__(self, parameters, lr = 0.001, betas = (0.9, 0.999), eps = 1e-8):
         self.parameters = parameters
         self.lr = lr
@@ -126,3 +131,56 @@ class Adam_Optimiser(Module):
     def zero_grad(self):
         for param in self.parameters:
             param.grad = np.zeros_like(param.data)
+
+
+class LSTMCell(Module):
+    def __init__(self, input_size, hidden_size, label = ''):
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.W_f = Tensor(np.random.randn(input_size + hidden_size, hidden_size) * np.sqrt( 1/ (input_size + hidden_size)), label=f'{label}_W_f')
+        self.b_f = Tensor(np.ones(hidden_size), label=f'{label}_b_f')  
+        self.W_i = Tensor(np.random.randn(input_size + hidden_size, hidden_size) * np.sqrt( 1/ (input_size + hidden_size)), label=f'{label}_W_i')
+        self.b_i = Tensor(np.zeros(hidden_size), label=f'{label}_b_i')
+        self.W_c = Tensor(np.random.randn(input_size + hidden_size, hidden_size) * np.sqrt( 1/ (input_size + hidden_size)), label=f'{label}_W_c')
+        self.b_c = Tensor(np.zeros(hidden_size), label=f'{label}_b_c')
+        self.W_o = Tensor(np.random.randn(input_size + hidden_size, hidden_size) * np.sqrt( 1/ (input_size + hidden_size)), label=f'{label}_W_o')
+        self.b_o = Tensor(np.zeros(hidden_size), label=f'{label}_b_o')
+
+    def forward(self, x, h_prev, c_prev):
+        combined = x.concat(h_prev)
+        f_t = (combined.matmul(self.W_f) + self.b_f).sigmoid()
+        i_t = (combined.matmul(self.W_i) + self.b_i).sigmoid()
+        g_t = (combined.matmul(self.W_c) + self.b_c).tanh()
+        o_t = (combined.matmul(self.W_o) + self.b_o).sigmoid()
+        c_next = f_t * c_prev + i_t * g_t
+        h_next = o_t * c_next.tanh()
+        return h_next, c_next
+    
+    def parameters(self):
+        return [self.W_f, self.b_f, self.W_i, self.b_i, self.W_c, self.b_c, self.W_o, self.b_o]
+    
+class LSTM(Module):
+    def __init__(self, input_size, hidden_size, num_layers, label = ''):
+        self.cells = [LSTMCell(input_size if i == 0 else hidden_size, hidden_size, label=f'lstm_cell_{i}') for i in range(num_layers)]
+    def forward(self, x, h_prev = None, c_prev = None):
+
+        if h_prev is None:
+            h_prev = [Tensor(np.zeros((self.cells[0].hidden_size,))) for _ in self.cells]
+        if c_prev is None:
+            c_prev = [Tensor(np.zeros((self.cells[0].hidden_size,))) for _ in self.cells]
+
+        all_hidden_states = []
+        for t in range(x.data.shape[0]):
+            x_t = x[t] 
+            for i, cell in enumerate(self.cells):
+                h_next, c_next = cell(x_t, h_prev[i], c_prev[i])
+                h_prev[i], c_prev[i] = h_next, c_next
+                x_t = h_next
+            all_hidden_states.append(h_prev[-1])
+        return all_hidden_states , (h_prev, c_prev)
+    
+    def parameters(self):
+        params = []
+        for cell in self.cells:
+            params.extend(cell.parameters())
+        return params
