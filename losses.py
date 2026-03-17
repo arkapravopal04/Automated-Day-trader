@@ -6,7 +6,7 @@ class CrossEntropyLoss:
     def __init__(self):
         pass
     def forward(self, logits, target_idx):
-        max_logits = np.max(logits.data, axis=1, keepdims=True)
+        max_logits = np.max(logits.data, axis=0)
         stable_logits = logits - max_logits
         exp_logits = stable_logits.exp()
         sum_logits = exp_logits.sum()
