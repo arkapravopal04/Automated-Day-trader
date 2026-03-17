@@ -1,4 +1,6 @@
 import numpy as np
+
+
 class Tensor:
     def __init__(self, data, _children=(), _op='', label=''):
         self.data = np.array(data, dtype=np.float64)
@@ -11,8 +13,13 @@ class Tensor:
         other = other if isinstance(other , Tensor) else Tensor(other)
         out = Tensor(self.data @ other.data, (self, other), '@')
         def _backward():
-            self.grad += out.grad @ other.data.T
-            other.grad += self.data.T @ out.grad
+            out_grad = out.grad if out.grad.ndim > 1 else out.grad.reshape(1, -1)
+            self_data = self.data if self.data.ndim > 1 else self.data.reshape(1, -1)
+            other_data = other.data if other.data.ndim > 1 else other.data.reshape(1, -1)
+            self_grad = out_grad @ other_data.T
+            other_grad = self_data.T @ out_grad            
+            self.grad += self_grad.reshape(self.data.shape)
+            other.grad += other_grad.reshape(other.data.shape)
         out._backward  = _backward
         return out
     def __add__(self, other):
