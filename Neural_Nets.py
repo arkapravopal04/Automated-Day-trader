@@ -184,3 +184,25 @@ class LSTM(Module):
         for cell in self.cells:
             params.extend(cell.parameters())
         return params
+
+
+class Attention(Module):
+    def __init__(self , hidden_size):
+        self.W_q = Tensor(np.random.randn(hidden_size, hidden_size) * np.sqrt(1. / hidden_size), label='W_q')
+        self.W_k = Tensor(np.random.randn(hidden_size, hidden_size) * np.sqrt(1. / hidden_size), label='W_k')
+        self.W_v = Tensor(np.random.randn(hidden_size, hidden_size) * np.sqrt(1. / hidden_size), label='W_v')
+    def forward(self, hidden_states):
+        h_stack = Tensor(np.stack([h.data for h in hidden_states], axis=0))
+        Q = h_stack.matmul(self.W_q)
+        K = h_stack.matmul(self.W_k)
+        V = h_stack.matmul(self.W_v)
+        scores = Q.matmul(K.transpose((1 , 0))) / np.sqrt(Q.data.shape[-1])
+        max_scores = Tensor(np.max(scores.data, axis=-1, keepdims=True))
+        stable_scores = scores - max_scores
+        exp_scores = stable_scores.exp()
+        sum_scores = Tensor(np.sum(exp_scores.data, axis=-1, keepdims=True))
+        weights = exp_scores / sum_scores
+        out = weights.matmul(V)
+        return out[-1]
+    def parameters(self):
+        return [self.W_q, self.W_k, self.W_v]
