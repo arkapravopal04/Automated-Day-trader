@@ -22,3 +22,8 @@ Modular Neural Network API: features a PyTorch-inspired Module class, allowing y
 Gradient Accumulation: correctly handles the multivariate chain rule using += logic, allowing a single Tensor to be reused across multiple branches of a network.
 
 NumPy-Powered Backend: built from first principles using NumPy for efficient matrix operations, bridging the gap between raw calculus and high-level deep learning.
+
+
+Also I forgot to write this in, this is a personal project and use it at your own risk 
+verify any actions taken by the bot
+do not risk money that you are affraid to loose😭😭😭
