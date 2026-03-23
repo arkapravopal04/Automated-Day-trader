@@ -206,3 +206,73 @@ class Attention(Module):
         return out[-1]
     def parameters(self):
         return [self.W_q, self.W_k, self.W_v]
+    
+class FusionLayers(Module):
+    def __init__(self, lstm_hidden_size, cnn_out_channels, nlp_hidden_size, hidden_size):
+        self.lstm_proj = Linear(lstm_hidden_size, hidden_size)
+        self.cnn_proj = Linear(cnn_out_channels, hidden_size)
+        self.nlp_proj = Linear(nlp_hidden_size, hidden_size)
+        self.regime_proj = Linear(3, hidden_size)
+        self.out_proj = Linear(hidden_size, hidden_size)
+        
+        self.lstm_norm = LayerNorm(hidden_size)
+        self.cnn_norm = LayerNorm(hidden_size)
+        self.nlp_norm = LayerNorm(hidden_size)
+        self.regime_norm = LayerNorm(hidden_size)
+        
+        self.attention = Attention(hidden_size)
+
+    def forward(self, lstm_out, cnn_out, nlp_out, regime_out):
+        lstm_hidden = self.lstm_proj(lstm_out)
+        lstm_hidden = self.lstm_norm(lstm_hidden)
+        cnn_hidden = self.cnn_proj(cnn_out)
+        cnn_hidden = self.cnn_norm(cnn_hidden)
+        
+        nlp_hidden = self.nlp_proj(nlp_out)
+        nlp_hidden = self.nlp_norm(nlp_hidden)
+        
+        exp_r = regime_out.exp()
+        regime_probs = exp_r / exp_r.sum()
+        regime_hidden = self.regime_proj(regime_probs)
+        regime_hidden = self.regime_norm(regime_hidden)
+        
+        signals = [lstm_hidden, cnn_hidden, nlp_hidden, regime_hidden]
+        fused = self.attention(signals)
+        out = self.out_proj(fused)
+        
+        return out
+
+    def parameters(self):
+        params = []
+        params.extend(self.lstm_proj.parameters())
+        params.extend(self.cnn_proj.parameters())
+        params.extend(self.nlp_proj.parameters())
+        params.extend(self.regime_proj.parameters())
+        params.extend(self.out_proj.parameters())
+        
+        params.extend(self.lstm_norm.parameters())
+        params.extend(self.cnn_norm.parameters())
+        params.extend(self.nlp_norm.parameters())
+        params.extend(self.regime_norm.parameters())
+        
+        params.extend(self.attention.parameters())
+        
+        return params
+    
+
+class RegimeDetector(Module):
+    def __init__(self, input_size, hidden_size, num_layers = 1):
+        self.lstm = LSTM(input_size, hidden_size, num_layers, label='regime_lstm')
+        self.attention = Attention(hidden_size)
+        self.linear = Linear(hidden_size, 3)
+    def forward(self, x):
+        hidden_states, _ = self.lstm(x)
+        attn_out = self.attention(hidden_states)
+        logits = self.linear(attn_out.reshape(1, -1))
+        return logits.reshape(3)
+    def parameters(self):
+        params = []
+        params.extend(self.lstm.parameters())
+        params.extend(self.attention.parameters())
+        params.extend(self.linear.parameters())
+        return params
