@@ -42,8 +42,6 @@ class TradingEnvironment:
         direction, size = action
         current_price = self.prices[self.current_step] 
 
-        if self.current_step % 500 == 0:
-            print(f"  Step {self.current_step}: balance={self.balance:.2f} position={self.position:.2f} entry={self.entry_price:.4f} price={current_price:.4f}")
         threshold = 0.3
         reward = 0
         if direction > threshold:

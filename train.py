@@ -14,6 +14,23 @@ from env import TradingEnvironment
 from agent import PPOAgent
 from models_utils import save_model, load_model, save_log
 
+
+import sys
+
+def print_step(episode, ticker, step, total_steps, balance, position, price):
+    # overwrite same line for step updates
+    msg = f"  [{ticker}] Ep{episode} | Step {step}/{total_steps} | Balance: ${balance:8.2f} | Pos: ${position:8.2f} | Price: ${price:.2f}"
+    sys.stdout.write('\r' + msg + ' ' * 10)
+    sys.stdout.flush()
+
+def print_episode(episode, ticker, balance, reward, trades, win_rate, std, best):
+    # permanent line for episode results
+    sys.stdout.write('\n')  # move past the step line
+    star = '★' if balance == best else ' '
+    print(f"{star} Ep {episode:3d} | {ticker:6s} | Balance: ${balance:9.2f} | Reward: {reward:10.2f} | Trades: {trades:4d} | WR: {win_rate:.1%} | Std: {std:.3f}", flush=True)
+
+
+
 import os
 
 # detect if running on Kaggle
@@ -115,7 +132,12 @@ for episode in range(1, EPISODES + 1):
             num_trades += 1
             if reward > 0:
                 winning_trades += 1
-        
+
+        if env.current_step % 100 == 0:
+            print_step(episode, ticker, env.current_step, 
+                    env.total_steps, env.balance, 
+                    env.position, env.prices[env.current_step-1])
+            
         total_reward += reward
         episode_balances.append(env.balance)
         
@@ -140,12 +162,9 @@ for episode in range(1, EPISODES + 1):
     }
     save_log(log_data, LOG_PATH)
     
-    print(f"Episode {episode:3d} | {ticker:8s} | "
-          f"Balance: ${final_balance:8.2f} | "
-          f"Reward: {total_reward:7.4f} | "
-          f"Trades: {num_trades:3d} | "
-          f"WinRate: {win_rate:.2%} | "
-          f"Std: {agent.std:.3f}", flush = True)
+    print_episode(episode, ticker, final_balance, total_reward, 
+              num_trades, win_rate, agent.std,
+              best_balance)
     
     if final_balance > best_balance:
         best_balance = final_balance
