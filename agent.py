@@ -19,7 +19,7 @@ class PPOAgent:
         self.epsilon = 0.2
         self.epochs = 5
         self.std = 0.3
-        self.std_min = 0.05
+        self.std_min = 0.02
         self.std_decay = 0.995
 
         self.actor_l1 = Linear(state_size, 64)
