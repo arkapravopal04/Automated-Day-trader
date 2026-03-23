@@ -15,12 +15,16 @@ def transform_data(data):
     data = data.dropna()
     return data
 
-def build_windows(data, window_size):
-    X, y = [], []
+def build_windows(data, window_size, raw_data=None):
+    X, y, prices = [], [], []
     for i in range(len(data) - window_size):
         X.append(data.iloc[i:i+window_size].values)
         y.append(1 if data.iloc[i+window_size]['Close'] > 0 else 0)
-    return np.array(X), np.array(y)
+        if raw_data is not None:
+            prices.append(raw_data.iloc[i+window_size]['Close'])
+        else:
+            prices.append(0.0)
+    return np.array(X), np.array(y), np.array(prices)
 
 class DataLoader:
     def __init__(self, X, y, batch_size=32):
@@ -48,14 +52,15 @@ class DataLoader:
             return batch_X, batch_y
         else:
             raise StopIteration
+        
+        
 
-
-
-raw = load_data("AAPL", "2015-01-01", "2024-01-01")
-transformed = transform_data(raw)
-X, y = build_windows(transformed, window_size=10)
-loader = DataLoader(X, y, batch_size=32)
-
-for batch_X, batch_y in loader:
-    print(batch_X.shape, batch_y.shape)
-    break
+def generate_regime_labels(X, threshold=0.001):
+    returns = X[:, :, 3].mean(axis=1) 
+    conditions = [
+        returns > threshold,       
+        returns < -threshold,      
+    ]
+    choices = [2, 0]
+    labels = np.select(conditions, choices, default=1)  
+    return labels
