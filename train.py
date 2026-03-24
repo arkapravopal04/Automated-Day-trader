@@ -30,9 +30,6 @@ def print_episode(episode, ticker, balance, reward, trades, win_rate, std, best)
     print(f"{star} Ep {episode:3d} | {ticker:6s} | Balance: ${balance:9.2f} | Reward: {reward:10.2f} | Trades: {trades:4d} | WR: {win_rate:.1%} | Std: {std:.3f}", flush=True)
 
 
-
-import os
-
 # detect if running on Kaggle
 if os.path.exists('/kaggle'):
     BASE_PATH = '/kaggle/working'
@@ -63,9 +60,9 @@ EPISODES = 850
 SAVE_EVERY = 50
 INITIAL_BALANCE = 10000
 
-BEST_MODEL_PATH = "/kaggle/working/models/best_model.pkl"
-CHECKPOINT_PATH = "/kaggle/working/models/checkpoint.pkl"
-LOG_PATH = "/kaggle/working/logs/training_log.csv"
+# BEST_MODEL_PATH = "/kaggle/working/models/best_model.pkl"
+# CHECKPOINT_PATH = "/kaggle/working/models/checkpoint.pkl"
+# LOG_PATH = "/kaggle/working/logs/training_log.csv"
 
 print("Loading data for all tickers...")
 datasets = {}
@@ -110,7 +107,7 @@ for episode in range(1, EPISODES + 1):
         initial_balance=INITIAL_BALANCE
     )
     
-    env.precomputed_nlp = nlp(f"{ticker} stock market update")
+    env.precomputed_nlp = Tensor(np.zeros(64))
 
     # reset
     state = env.reset()

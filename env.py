@@ -27,19 +27,28 @@ class TradingEnvironment:
         self.total_steps = len(X)   
         self.current_text = "market news headline"
         self.prices = prices
-
+        self.cooldown = 0
     def reset(self):
         self.current_step = 0
         self.balance = self.initial_balance
         self.position = 0
         self.entry_price = 0
+        self.cooldown = 0 
         return self._get_state()
     
 
 # weighted average entry price missing
     def step(self, action):
         
-        direction, size = action
+        # cooldown check
+        if self.cooldown > 0:
+            self.cooldown -= 1
+            direction, size = 0, 0  # force hold
+        else:
+            direction, size = action
+
+
+        # direction, size = action
         current_price = self.prices[self.current_step] 
 
         threshold = 0.3
@@ -50,6 +59,7 @@ class TradingEnvironment:
                 self.balance += abs(self.position) + pnl
                 self.position = 0
                 reward = pnl / self.initial_balance
+                self.cooldown = 10
                 
             if self.position == 0:
                 amount = self.balance * min(size, 0.5)
@@ -63,6 +73,7 @@ class TradingEnvironment:
                 self.balance += self.position + pnl
                 self.position = 0
                 reward = pnl / self.initial_balance
+                self.cooldown = 10
                 
             if self.position == 0:
                 amount = self.balance * min(size, 0.5)
