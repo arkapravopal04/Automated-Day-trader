@@ -59,10 +59,14 @@ class TradingEnvironment:
                 self.balance += abs(self.position) + pnl
                 self.position = 0
                 reward = pnl / self.initial_balance
-                self.cooldown = 10
+                self.cooldown = 50
                 
             if self.position == 0:
                 amount = self.balance * min(size, 0.5)
+                # if amount < self.initial_balance * 0.05:
+                #     pass
+                # else:
+                # move below for bigger trades
                 self.position = amount
                 self.balance -= amount
                 self.entry_price = current_price
@@ -73,10 +77,14 @@ class TradingEnvironment:
                 self.balance += self.position + pnl
                 self.position = 0
                 reward = pnl / self.initial_balance
-                self.cooldown = 10
+                self.cooldown = 50
                 
             if self.position == 0:
                 amount = self.balance * min(size, 0.5)
+                # if amount < self.initial_balance * 0.05: 
+                #     pass
+                # else:
+                # move below by one to make more
                 self.position = -amount 
                 self.balance -= amount
                 self.entry_price = current_price
