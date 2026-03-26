@@ -79,11 +79,10 @@ class LayerNorm(Module):
         self.beta = Tensor(np.zeros(num_features), label=f'{label}_beta')
         self.eps = eps
     def forward(self , x):
-        mean = x.mean(axis = 0, keepdims = True)
-        var = ((x - mean) ** 2).mean(axis = 0, keepdims = True)
-        x_normalized = (x - mean) / ((var + self.eps)**0.5)
-        out = self.gamma * x_normalized + self.beta
-        return out
+        mean = x.mean() 
+        var = ((x - mean)**2).mean()
+        self.out = (x - mean) / ((var + self.eps) ** 0.5) 
+        return self.out * self.gamma + self.beta
     def parameters(self):
         return [self.gamma, self.beta]
     
@@ -192,23 +191,31 @@ class Attention(Module):
         self.W_k = Tensor(np.random.randn(hidden_size, hidden_size) * np.sqrt(1. / hidden_size), label='W_k')
         self.W_v = Tensor(np.random.randn(hidden_size, hidden_size) * np.sqrt(1. / hidden_size), label='W_v')
     def forward(self, hidden_states):
-        h_stack = Tensor(np.stack([h.data for h in hidden_states], axis=0))
+        if isinstance(hidden_states, list):
+            h_stack = Tensor.stack(hidden_states, axis = 0)
+        else:
+            h_stack = hidden_states
         Q = h_stack.matmul(self.W_q)
         K = h_stack.matmul(self.W_k)
         V = h_stack.matmul(self.W_v)
-        scores = Q.matmul(K.transpose((1 , 0))) / np.sqrt(Q.data.shape[-1])
-        max_scores = Tensor(np.max(scores.data, axis=-1, keepdims=True))
-        stable_scores = scores - max_scores
+        kT = Tensor(K.data.T)
+        d_k = Q.data.shape[-1]
+        scores = Q.matmul(kT)*(d_k**-0.5)
+        scores = Q.matmul(kT)*(d_k**-0.5)
+        max_val = np.max(scores.data, axis=-1, keepdims=True)
+        stable_scores = scores + (Tensor(max_val) * -1.0)
         exp_scores = stable_scores.exp()
-        sum_scores = Tensor(np.sum(exp_scores.data, axis=-1, keepdims=True))
-        weights = exp_scores / sum_scores
+        sum_scores = exp_scores.sum(axis=-1, keepdims=True)
+        weights = exp_scores * (sum_scores**-1.0)
         out = weights.matmul(V)
-        return out[-1]
+        return out
     def parameters(self):
         return [self.W_q, self.W_k, self.W_v]
     
 class FusionLayers(Module):
     def __init__(self, lstm_hidden_size, cnn_out_channels, nlp_hidden_size, hidden_size):
+        self.lstm_hidden_size = lstm_hidden_size
+        self.hidden_size = hidden_size
         self.lstm_proj = Linear(lstm_hidden_size, hidden_size)
         self.cnn_proj = Linear(cnn_out_channels, hidden_size)
         self.nlp_proj = Linear(nlp_hidden_size, hidden_size)
@@ -223,7 +230,14 @@ class FusionLayers(Module):
         self.attention = Attention(hidden_size)
 
     def forward(self, lstm_out, cnn_out, nlp_out, regime_out):
-        lstm_hidden = self.lstm_proj(lstm_out)
+        if lstm_out.data.size > self.lstm_hidden_size:
+            reshaped = lstm_out.data.reshape(-1, self.lstm_hidden_size)
+            feat_data = reshaped[-1:].reshape(1, -1)
+            lstm_feat = Tensor(feat_data, (lstm_out,), 'slice_last_step')
+        else:
+            feat_data = lstm_out.data.reshape(1, -1)
+            lstm_feat = Tensor(feat_data, (lstm_out,), 'reshape_fusion')
+        lstm_hidden = self.lstm_proj(lstm_feat)
         lstm_hidden = self.lstm_norm(lstm_hidden)
         cnn_hidden = self.cnn_proj(cnn_out)
         cnn_hidden = self.cnn_norm(cnn_hidden)
@@ -268,7 +282,9 @@ class RegimeDetector(Module):
     def forward(self, x):
         hidden_states, _ = self.lstm(x)
         attn_out = self.attention(hidden_states)
-        logits = self.linear(attn_out.reshape(1, -1))
+        last_step_data = attn_out.data[-1].reshape(1, -1)
+        last_step = Tensor(last_step_data, _children=(attn_out,), _op='slice_last')
+        logits = self.linear(last_step)
         return logits.reshape(3)
     def parameters(self):
         params = []

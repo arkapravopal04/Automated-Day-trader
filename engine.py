@@ -98,10 +98,21 @@ class Tensor:
         return self * other
     def __radd__(self, other):
         return self + other
-    def sum(self):
-        out = Tensor(np.sum(self.data), (self,), 'sum')
+    def sum(self, axis=None, keepdims=False):
+        res = np.sum(self.data, axis=axis, keepdims=keepdims)
+        out = Tensor(res, (self,), 'sum')
+
         def _backward():
-            self.grad += np.ones_like(self.data) * out.grad
+            grad_to_broadcast = out.grad
+            if axis is not None and not keepdims:
+                shape = list(self.data.shape)
+                if isinstance(axis, int):
+                    shape[axis] = 1
+                else: # tuple of axes
+                    for a in axis:
+                        shape[a] = 1
+                grad_to_broadcast = out.grad.reshape(shape)
+            self.grad += np.ones_like(self.data) * grad_to_broadcast
         out._backward = _backward
         return out
     def exp(self):
@@ -221,6 +232,17 @@ class Tensor:
             grad = np.zeros_like(self.data)
             grad[key] = out.grad
             self.grad += grad
+        out._backward = _backward
+        return out
+    
+    @staticmethod
+    def stack(tensors, axis=0):
+        data = np.stack([t.data for t in tensors], axis=axis)
+        out = Tensor(data, tuple(tensors), 'stack')
+        def _backward():
+            grads = np.split(out.grad, len(tensors), axis=axis)
+            for i, t in enumerate(tensors):
+                t.grad += np.squeeze(grads[i], axis=axis)
         out._backward = _backward
         return out
     
