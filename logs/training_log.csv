@@ -237,3 +237,4 @@ episode,ticker,total_reward,final_balance,num_trades,win_rate,max_drawdown,std,n
 198,JPM,70.9423,12600.86,187,0.9037,0.2503,0.1112,False
 199,JPM,58.4288,13384.01,190,0.8526,0.1905,0.1106,False
 200,JPM,54.2335,14986.44,188,0.883,0.2764,0.1101,False
+1,JPM,7.9658,8600.69,198,0.2828,0.2038,0.2985,False

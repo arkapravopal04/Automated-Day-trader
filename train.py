@@ -52,7 +52,6 @@ os.makedirs(f"{BASE_PATH}/logs", exist_ok=True)
  
 BEST_MODEL_PATH  = f"{BASE_PATH}/models/best_model.pkl"
 CHECKPOINT_PATH  = f"{BASE_PATH}/models/checkpoint.pkl"
-# CHECKPOINT_PATH  = BEST_MODEL_PATH
 LOG_PATH         = f"{BASE_PATH}/logs/training_log.csv"
 
 TICKERS        = ["JPM"]   
