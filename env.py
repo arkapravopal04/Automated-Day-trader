@@ -92,7 +92,7 @@ class TradingEnvironment:
                 
                 self.position = 0.0
                 self.entry_price = 0.0
-                self.cooldown = 5 
+                self.cooldown = 20
                 trade_occurred = True
 
             if self.cooldown > 0:
