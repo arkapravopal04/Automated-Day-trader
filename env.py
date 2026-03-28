@@ -11,7 +11,7 @@ from nlp import NLPEncoder
 
 class TradingEnvironment:
     def __init__(self, X, y, lstm, attention, cnn, flatten, regime, fusion, nlp,
-                 prices, initial_balance=10_000):
+                 prices, initial_balance=10000):
         self.X = X
         self.y = y
         self.lstm = lstm
@@ -60,75 +60,80 @@ class TradingEnvironment:
         return self._get_state()
 
 
+
     def step(self, action):
-            direction = float(action[0])
-            size = float(np.clip(action[1], 0.0, 1.0))
+        direction = float(action[0])
+        size = float(np.clip(action[1], 0.0, 1.0))
 
-            idx = min(self.current_step, self.total_steps - 1)
-            current_price = self.prices[idx]
-            
-            reward = 0.0
-            trade_occurred = False
-            
-            TRADE_THRESHOLD = 0.7
-            NEUTRAL_ZONE = 0.5
-            
-            should_close = (
-                (abs(direction) < NEUTRAL_ZONE) or
-                (direction < -TRADE_THRESHOLD and self.position > 0) or
-                (direction > TRADE_THRESHOLD and self.position < 0)
-            )
+        idx = min(self.current_step, self.total_steps - 1)
+        current_price = self.prices[idx]
+        
+        reward = 0.0
+        trade_occurred = False
+        self.last_trade_pnl = None
+        
+        TRADE_THRESHOLD = 0.7
+        NEUTRAL_ZONE = 0.5
+        
+        should_close = (
+            (abs(direction) < NEUTRAL_ZONE) or
+            (direction < -TRADE_THRESHOLD and self.position > 0) or
+            (direction > TRADE_THRESHOLD and self.position < 0)
+        )
 
-            if should_close and self.position != 0:
-                if self.position > 0: # Long
-                    price_ratio = current_price / self.entry_price
-                    close_value = self.position * price_ratio
-                else: # Short
-                    
-                    price_diff_pct = (current_price - self.entry_price) / self.entry_price
-                    close_value = abs(self.position) * (1.0 - price_diff_pct)
+        if should_close and self.position != 0 and self.entry_price != 0:
+            if self.position > 0:
+                close_value = self.position * (current_price / self.entry_price)
+                trade_pnl = (current_price - self.entry_price) / self.entry_price
+            else:
+                close_value = abs(self.position) * (2.0 - (current_price / self.entry_price))
+                trade_pnl = (self.entry_price - current_price) / self.entry_price
 
-                self.balance += close_value * (1.0 - self.fee)
-                
-                self.position = 0.0
-                self.entry_price = 0.0
-                self.cooldown = 20
+            self.balance += close_value * (1.0 - self.fee)
+            self.last_trade_pnl = trade_pnl 
+            reward += trade_pnl * 100.0     
+            self.position = 0.0
+            self.entry_price = 0.0
+            self.cooldown = 20
+            trade_occurred = True
+
+        if self.cooldown > 0:
+            self.cooldown -= 1
+        elif self.position == 0 and abs(direction) >= TRADE_THRESHOLD and size > 0.01:
+            investment = self.balance * size
+            if investment > 10.0:
+                effective_investment = investment * (1.0 - self.fee)
+                self.entry_price = current_price
+                self.position = effective_investment if direction > 0 else -effective_investment
+                self.balance -= investment
                 trade_occurred = True
 
-            if self.cooldown > 0:
-                self.cooldown -= 1
-            elif self.position == 0 and abs(direction) >= TRADE_THRESHOLD and size > 0.01:
-                investment = self.balance * size
-                if investment > 10.0: 
-                    effective_investment = investment * (1.0 - self.fee)
-                    self.entry_price = current_price
-                    self.position = effective_investment if direction > 0 else -effective_investment
-                    self.balance -= investment
-                    trade_occurred = True
+        # Unrealised P&L for open positions
+        if self.position != 0 and self.entry_price != 0:
+            prev_price = self.prices[max(0, self.current_step - 1)]
+            step_return = np.log(current_price / (prev_price + 1e-8))
+            reward += step_return * 100.0 * np.sign(self.position)
+        elif not trade_occurred:
+            reward -= 0.001 
 
-            if self.position != 0:
-                prev_price = self.prices[max(0, self.current_step - 1)]
-                step_return = (current_price - prev_price) / (prev_price + 1e-8)
-                
-                reward = step_return * 100.0 * np.sign(self.position)
-            else:
-                reward = -0.0001 
+        self.current_step += 1
+        
+        # Only terminate early on near-total loss
+        done = (self.current_step >= self.total_steps or 
+                self.net_worth <= self.initial_balance * 0.1)
 
-            self.current_step += 1
-            done = self.current_step >= self.total_steps
-            if trade_occurred:
-                self.last_trade_pnl = self.net_worth - self.initial_balance
+        if not np.isfinite(reward):
+            reward = 0.0
             
-            if not np.isfinite(reward):
-                reward = 0.0
-                
-            self.balance = max(0.0, self.balance)
-            next_state = self._get_state() if not done else None
+        self.balance = max(0.0, self.balance)
+        next_state = self._get_state() if not done else None
 
-            return next_state, reward, done
+        return next_state, reward, done
+
+
     def _get_state(self):
         idx = min(self.current_step, self.total_steps - 1)
-        sample_data = self.X[idx].astype(np.float64)  # (window, features)
+        sample_data = self.X[idx].astype(np.float64) 
 
         sample = Tensor(sample_data)
 
