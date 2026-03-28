@@ -86,7 +86,8 @@ class TradingEnvironment:
                 close_value = self.position * (current_price / self.entry_price)
                 trade_pnl = (current_price - self.entry_price) / self.entry_price
             else:
-                close_value = abs(self.position) * (2.0 - (current_price / self.entry_price))
+                close_value = abs(self.position) * (1.0 - (current_price - self.entry_price) / self.entry_price)
+                close_value = max(0.0, close_value)  
                 trade_pnl = (self.entry_price - current_price) / self.entry_price
 
             self.balance += close_value * (1.0 - self.fee)
@@ -157,10 +158,10 @@ class TradingEnvironment:
         regime_out = self.regime(sample)
 
         
-        l_f = Tensor(lstm_out.data[-1].reshape(1, -1))   
-        c_f = Tensor(cnn_out.data.reshape(1, -1))         
-        n_f = Tensor(nlp_out.data.reshape(1, -1))         
-        r_f = Tensor(regime_out.data.reshape(1, -1))      
+        l_f = lstm_out[-1].reshape(1, -1)     
+        c_f = cnn_out.reshape(1, -1)          
+        n_f = Tensor(nlp_out.data.reshape(1, -1))  
+        r_f = regime_out.reshape(1, -1)      
 
         fused = self.fusion(l_f, c_f, n_f, r_f)
         f_flat = Tensor(fused.data.flatten())

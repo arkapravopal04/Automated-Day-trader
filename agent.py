@@ -16,12 +16,14 @@ class PPOAgent:
     def __init__(self, state_size=67, action_size=2,
                  lstm=None, attention=None, cnn=None, flatten=None,
                  regime=None, fusion=None):
+
+        # hyperparams
         self.gamma = 0.99
-        self.epsilon = 0.2
-        self.epochs = 5
-        self.std = 0.3
-        self.std_min = 0.02
-        self.std_decay = 0.995
+        self.epsilon = 0.1 # increases stability but can slow learning
+        self.epochs = 5 # increases training time but can improve stability
+        self.std = 0.5
+        self.std_min = 0.05
+        self.std_decay = 0.999
 
         self.states = []
         self.actions = []

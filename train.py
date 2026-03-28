@@ -6,6 +6,7 @@ import numpy as np
 import random
 import os
 import sys
+import csv
  
 from engine import Tensor
 from Neural_Nets import LSTM, Conv2D, Flatten, Attention, FusionLayers, RegimeDetector
@@ -44,6 +45,18 @@ def compute_max_drawdown(net_worths):
         if dd > max_dd:
             max_dd = dd
     return max_dd
+
+def load_best_net_worth(log_path, initial_balance):
+    if not os.path.exists(log_path):
+        return initial_balance
+    best = initial_balance
+    with open(log_path, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            nw = float(row['final_balance'])
+            if nw > best:
+                best = nw
+    return best
  
 
 BASE_PATH = '/kaggle/working' if os.path.exists('/kaggle') else '.'
@@ -60,8 +73,8 @@ TICKERS        = ["RELIANCE.NS"]
 START_DATE     = "2015-01-01"
 END_DATE       = "2025-01-01"
 WINDOW_SIZE    = 10
-EPISODES       = 300
-SAVE_EVERY     = 5
+EPISODES       = 1500
+SAVE_EVERY     = 10
 # do update initial balance in env.py
 INITIAL_BALANCE = 10000
 
@@ -114,7 +127,8 @@ agent = PPOAgent(
 
 load_model(agent, CHECKPOINT_PATH)
  
-best_net_worth = INITIAL_BALANCE
+best_net_worth = load_best_net_worth(LOG_PATH, INITIAL_BALANCE)
+print(f"Resuming with best net worth: {currency_units}{best_net_worth:.2f}")
 print(f"Starting training for {EPISODES} episodes...\n")
 for episode in range(1, EPISODES + 1):
     ticker = random.choice(list(datasets.keys()))
