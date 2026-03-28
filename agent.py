@@ -1,23 +1,25 @@
-'''
-this is where the agent sits
-'''
+"""
+PPO agent — actor-critic with clipped surrogate objective.
+"""
+
 import numpy as np
 from engine import Tensor
 from Neural_Nets import LayerNorm, Dropout, Linear, Adam_Optimiser
 
+
 class PPOAgent:
     def __init__(self, state_size=67, action_size=2):
+        self.gamma = 0.99
+        self.epsilon = 0.2     
+        self.epochs = 5
+        self.std = 0.3 
+        self.std_min = 0.02
+        self.std_decay = 0.995
         self.states = []
         self.actions = []
         self.rewards = []
         self.log_probs = []
         self.values = []
-        self.gamma = 0.99
-        self.epsilon = 0.2
-        self.epochs = 5
-        self.std = 0.3         
-        self.std_min = 0.02
-        self.std_decay = 0.995
         self.actor_l1 = Linear(state_size, 64)
         self.actor_norm1 = LayerNorm(64)
         self.actor_drop1 = Dropout(0.1)
@@ -32,111 +34,119 @@ class PPOAgent:
         self.critic_norm2 = LayerNorm(32)
         self.critic_drop2 = Dropout(0.1)
         self.critic_out = Linear(32, 1)
-        all_params = []
-        #Actor parameters
-        all_params.extend(self.actor_l1.parameters())
-        all_params.extend(self.actor_norm1.parameters())
-        all_params.extend(self.actor_l2.parameters())
-        all_params.extend(self.actor_norm2.parameters())
-        all_params.extend(self.actor_out.parameters())
-        #Critic parameters
-        all_params.extend(self.critic_l1.parameters())
-        all_params.extend(self.critic_norm1.parameters())
-        all_params.extend(self.critic_l2.parameters())
-        all_params.extend(self.critic_norm2.parameters())
-        all_params.extend(self.critic_out.parameters())
-        self.optimizer = Adam_Optimiser(all_params, lr=0.0003)
-        
-    def select_action(self, state):
-        self._set_train_mode(False)
+        all_params = (
+            self.actor_l1.parameters() + self.actor_norm1.parameters() +
+            self.actor_l2.parameters() + self.actor_norm2.parameters() +
+            self.actor_out.parameters() +
+            self.critic_l1.parameters() + self.critic_norm1.parameters() +
+            self.critic_l2.parameters() + self.critic_norm2.parameters() +
+            self.critic_out.parameters()
+        )
+        self.optimizer = Adam_Optimiser(all_params, lr=3e-4)
+
+    def _set_train_mode(self, mode: bool):
+        for drop in (self.actor_drop1, self.actor_drop2,
+                     self.critic_drop1, self.critic_drop2):
+            drop.training = mode
+
+    def _actor_forward(self, state):
         x = self.actor_drop1(self.actor_norm1(self.actor_l1(state).relu()))
         x = self.actor_drop2(self.actor_norm2(self.actor_l2(x).relu()))
-        out = self.actor_out(x)
+        return self.actor_out(x)
 
-        direction_mean = out[0].tanh()
-        size_mean = out[1].sigmoid()
-        direction = direction_mean.data + np.random.normal(0, self.std)
-        size = size_mean.data + np.random.normal(0, self.std)
-        direction = np.clip(direction, -1, 1)
-        size = np.clip(size, 0, 1)    
-        log_prob_d = -0.5 * ((direction - direction_mean.data) / self.std) ** 2
-        log_prob_s = -0.5 * ((size - size_mean.data) / self.std) ** 2
-        log_prob = log_prob_d + log_prob_s
+    def _critic_forward(self, state):
         v = self.critic_drop1(self.critic_norm1(self.critic_l1(state).relu()))
         v = self.critic_drop2(self.critic_norm2(self.critic_l2(v).relu()))
-        value = self.critic_out(v)
+        return self.critic_out(v)
+
+    def _log_prob(self, action_val, mean_val):
+        """Gaussian log-probability (scalar, detached from graph)."""
+        return -0.5 * ((action_val - mean_val) / (self.std + 1e-8)) ** 2
+
+    def select_action(self, state):
+        self._set_train_mode(False)
+
+        out = self._actor_forward(state)
+        direction_mean = float(out[0].tanh().data)
+        size_mean = float(out[1].sigmoid().data)
+
+        direction = np.clip(direction_mean + np.random.normal(0, self.std), -1, 1)
+        size = np.clip(size_mean + np.random.normal(0, self.std), 0, 1)
+
+        log_prob = self._log_prob(direction, direction_mean) + \
+                   self._log_prob(size, size_mean)
+
+        value = float(self._critic_forward(state).data.flat[0])
+
         self.states.append(state)
         self.actions.append(np.array([direction, size]))
         self.log_probs.append(log_prob)
-        self.values.append(value.data[0])
-        
-        return np.array([direction, size])
-    
-    def _set_train_mode(self, mode):
-        """Helper to toggle training mode for dropout layers."""
-        self.actor_drop1.training = mode
-        self.actor_drop2.training = mode
-        self.critic_drop1.training = mode
-        self.critic_drop2.training = mode
+        self.values.append(value)
 
-    def compute_rewards(self, next_value=0):
-        """Calculates discounted returns and normalizes them."""
-        discounted_rewards = []
-        R = next_value
+        return np.array([direction, size])
+
+    def compute_returns(self, next_value=0.0):
+        R = float(next_value)
+        returns = []
         for r in reversed(self.rewards):
-            R = r + self.gamma * R
-            discounted_rewards.insert(0, R)
-            
-        discounted_rewards = np.array(discounted_rewards) 
-        if len(discounted_rewards) > 1:
-            discounted_rewards = (discounted_rewards - discounted_rewards.mean()) / (discounted_rewards.std() + 1e-8)
-        return discounted_rewards
-    
+            R = float(r) + self.gamma * R
+            returns.insert(0, R)
+        returns = np.array(returns, dtype=np.float64)
+        if len(returns) > 1:
+            returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+        return returns
+
     def update(self):
-        """PPO update step: clips the policy ratio to prevent destructively large updates."""
-        #Prepare stored data
+        if not self.states:
+            return
+
         states = self.states
         actions = self.actions
-        old_log_probs = np.array(self.log_probs)
-        
-        #Compute returns and advantages
-        returns = self.compute_rewards(next_value=0)
-        advantages = returns - np.array(self.values)
+        old_log_probs = np.array(self.log_probs, dtype=np.float64)
 
-        # Enable training mode 
+        returns = self.compute_returns(next_value=0.0)
+        advantages = returns - np.array(self.values, dtype=np.float64)
+
+        # Normalise advantages
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
         self._set_train_mode(True)
 
-        #PPO Optimization Loop
         for _ in range(self.epochs):
-            for i in range(len(states)):
+            # Shuffle mini-batch order each epoch
+            indices = np.random.permutation(len(states))
+            for i in indices:
                 state = states[i]
                 action = actions[i]
-                old_log_p = old_log_probs[i]
-                adv = advantages[i]
-                ret = returns[i]
-                x = self.actor_drop1(self.actor_norm1(self.actor_l1(state).relu()))
-                x = self.actor_drop2(self.actor_norm2(self.actor_l2(x).relu()))
-                out = self.actor_out(x)
-                
+                old_log_p = float(old_log_probs[i])
+                adv = float(advantages[i])
+                ret = float(returns[i])
+
+                out = self._actor_forward(state)
                 direction_mean = out[0].tanh()
                 size_mean = out[1].sigmoid()
-                
-                new_log_prob_d = -0.5 * ((action[0] - direction_mean.data) / self.std) ** 2
-                new_log_prob_s = -0.5 * ((action[1] - size_mean.data) / self.std) ** 2
-                new_log_prob = new_log_prob_d + new_log_prob_s  
-                ratio_data = np.exp(float(new_log_prob) - old_log_p)
-                clipped = np.clip(ratio_data, 1 - self.epsilon, 1 + self.epsilon)
-                surr1 = Tensor(ratio_data * adv)
-                surr2 = Tensor(clipped * adv)
-                actor_loss = Tensor(-np.minimum(surr1.data, surr2.data))
-                v = self.critic_drop1(self.critic_norm1(self.critic_l1(state).relu()))
-                v = self.critic_drop2(self.critic_norm2(self.critic_l2(v).relu()))
-                new_value = self.critic_out(v)
-                
-                critic_loss = (Tensor(np.array([ret])) - new_value) ** 2
-                loss = (actor_loss + 0.5 * critic_loss).sum()
+
+                new_log_p = (self._log_prob(action[0], float(direction_mean.data)) +
+                             self._log_prob(action[1], float(size_mean.data)))
+                ratio = np.exp(float(new_log_p) - old_log_p)
+                clipped_ratio = np.clip(ratio, 1 - self.epsilon, 1 + self.epsilon)
+
+                surr = min(ratio * adv, clipped_ratio * adv)
+                actor_loss = Tensor(np.array([-surr]))
+
+                new_value = self._critic_forward(state)
+                ret_tensor = Tensor(np.array([ret]))
+                critic_loss = (ret_tensor - new_value) ** 2
+
+                loss = (actor_loss + Tensor(np.array([0.5])) * critic_loss).sum()
+
                 self.optimizer.zero_grad()
                 loss.backward()
+                for p in self.optimizer.parameters:
+                    np.clip(p.grad, -1.0, 1.0, out=p.grad)
                 self.optimizer.step()
+
         self.std = max(self.std_min, self.std * self.std_decay)
+
         self.states, self.actions, self.rewards, self.log_probs, self.values = [], [], [], [], []

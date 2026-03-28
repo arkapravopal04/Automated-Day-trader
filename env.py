@@ -1,15 +1,17 @@
-'''
-this is the palce where we store the actual environment of the project
-'''
+"""
+Trading environment — wraps market data, neural feature extractors,
+and a simple portfolio simulator into an RL-compatible step/reset API.
+"""
 
 import numpy as np
 from engine import Tensor
 from Neural_Nets import LSTM, Conv2D, Flatten, Linear, Attention, FusionLayers, RegimeDetector
-from nlp import NLPEncoder, get_sentiment_vector, fetch_news
+from nlp import NLPEncoder
 
 
 class TradingEnvironment:
-    def __init__(self, X, y, lstm, attention, cnn, flatten, regime, fusion, nlp, prices, initial_balance=10000):
+    def __init__(self, X, y, lstm, attention, cnn, flatten, regime, fusion, nlp,
+                 prices, initial_balance=10_000):
         self.X = X
         self.y = y
         self.lstm = lstm
@@ -19,30 +21,33 @@ class TradingEnvironment:
         self.regime = regime
         self.fusion = fusion
         self.nlp = nlp
-        self.initial_balance = float(initial_balance)
-        self.fee = 0.001  
-        self.current_step = 0        
-        self.balance = self.initial_balance  
-        self.position = 0.0       
-        self.entry_price = 0.0       
-        self.total_steps = len(X)   
-        self.current_text = "market news headline"
         self.prices = prices
+        self.initial_balance = float(initial_balance)
+        self.fee = 0.001
+        self.total_steps = len(X)
+        self.current_step = 0
+        self.balance = self.initial_balance
+        self.position = 0.0     
+        self.entry_price = 0.0
         self.cooldown = 0
+
+        self.precomputed_nlp = None
+        self.current_text = "market news headline"
 
     @property
     def net_worth(self):
         idx = min(self.current_step, self.total_steps - 1)
         current_price = self.prices[idx]
-        
+
         if self.position == 0 or self.entry_price == 0:
             return self.balance
-        
+
         if self.position > 0:
             pos_value = self.position * (current_price / self.entry_price)
         else:
-            pos_value = abs(self.position) * (1.0 - (current_price - self.entry_price) / self.entry_price)
-            
+            price_ratio = (current_price - self.entry_price) / self.entry_price
+            pos_value = abs(self.position) * (1.0 - price_ratio)
+
         return self.balance + pos_value
 
     def reset(self):
@@ -50,110 +55,125 @@ class TradingEnvironment:
         self.balance = self.initial_balance
         self.position = 0.0
         self.entry_price = 0.0
-        self.cooldown = 0 
+        self.cooldown = 0
+        self.last_trade_pnl = None  
         return self._get_state()
 
     def step(self, action):
-        direction = action[0]
-        size = np.clip(action[1], 0.1, 1.0)
+        """
+        action : array [direction, size]
+            direction ∈ [-1, 1]  — positive = long signal, negative = short
+            size      ∈ [0, 1]   — fraction of balance to invest
+        """
+        direction = float(action[0])
+        size = float(np.clip(action[1], 0.1, 1.0))
+
         idx = min(self.current_step, self.total_steps - 1)
         current_price = self.prices[idx]
+
         reward = 0.0
         trade_occurred = False
-        
-        trade_threshold = 0.5
-        neutral_zone = 0.3
-        should_close = (abs(direction) < neutral_zone) or \
-                       (direction < -trade_threshold and self.position > 0) or \
-                       (direction > trade_threshold and self.position < 0)
 
-        if should_close and self.position != 0:
+        TRADE_THRESHOLD = 0.5
+        NEUTRAL_ZONE = 0.3
+
+        should_close = (
+            (abs(direction) < NEUTRAL_ZONE) or
+            (direction < -TRADE_THRESHOLD and self.position > 0) or
+            (direction > TRADE_THRESHOLD and self.position < 0)
+        )
+
+        if should_close and self.position != 0 and self.entry_price != 0:
             if self.position > 0:
-                trade_reward = (current_price - self.entry_price) / self.entry_price
-                final_value = self.position * (current_price / self.entry_price)
+                trade_pnl = (current_price - self.entry_price) / self.entry_price
+                close_value = self.position * (current_price / self.entry_price)
             else:
-                trade_reward = (self.entry_price - current_price) / self.entry_price
-                final_value = abs(self.position) * (1.0 - (current_price - self.entry_price) / self.entry_price)
-            
-            reward += trade_reward * 100.0 
-            self.balance += final_value * (1.0 - self.fee)
+                trade_pnl = (self.entry_price - current_price) / self.entry_price
+                price_ratio = (current_price - self.entry_price) / self.entry_price
+                close_value = abs(self.position) * (1.0 - price_ratio)
+
+            reward += trade_pnl * 100.0
+            self.balance += close_value * (1.0 - self.fee)
             self.position = 0.0
             self.entry_price = 0.0
-            
-            self.cooldown = 20 
+            self.cooldown = 20
             trade_occurred = True
+            self.last_trade_pnl = trade_pnl   
         if self.cooldown > 0:
             self.cooldown -= 1
-        elif self.position == 0 and abs(direction) >= trade_threshold:
+        elif self.position == 0 and abs(direction) >= TRADE_THRESHOLD:
             investment = self.balance * size
             if investment > 50.0:
                 effective_investment = investment * (1.0 - self.fee)
                 self.entry_price = current_price
-                if direction > trade_threshold:
-                    self.position = effective_investment
-                else:
-                    self.position = -effective_investment
+                self.position = effective_investment if direction > 0 else -effective_investment
                 self.balance -= investment
                 trade_occurred = True
-
         self.current_step += 1
         done = self.current_step >= self.total_steps
-        
+
         if not done and not trade_occurred and self.position != 0:
             prev_price = self.prices[self.current_step - 1]
-            step_return = (self.prices[self.current_step] - prev_price) / prev_price
-            
-            if self.position > 0:
-                reward += step_return * 100.0
-            else:
-                reward -= step_return * 100.0
-        
-        if self.position == 0:
+            next_price = self.prices[self.current_step]
+            step_return = (next_price - prev_price) / (prev_price + 1e-8)
+            reward += step_return * 100.0 * np.sign(self.position)
+
+        if self.position == 0 and not trade_occurred:
             reward -= 0.001
 
-        next_state = self._get_state() if not done else None
-        
-        self.balance = max(0.0, self.balance)
-        
-        if np.isnan(reward) or np.isinf(reward):
+        if not np.isfinite(reward):
             reward = 0.0
-            
+
+        self.balance = max(0.0, self.balance)
+        next_state = self._get_state() if not done else None
+
         return next_state, reward, done
 
     def _get_state(self):
         idx = min(self.current_step, self.total_steps - 1)
-        sample_data = self.X[idx]
+        sample_data = self.X[idx].astype(np.float64)  # (window, features)
+
         sample = Tensor(sample_data)
-        
+
+        # LSTM + attention
         hidden_states, _ = self.lstm(sample)
         lstm_out = self.attention(hidden_states)
-        cnn_out = self.flatten(self.cnn(Tensor(sample_data.reshape(1, 10, 5))))
-        
-        if hasattr(self, 'precomputed_nlp'):
-            nlp_out = self.precomputed_nlp
-        else:
-            nlp_out = self.nlp(self.current_text)
-            
+
+        # CNN + flatten
+        window_size, num_features = sample_data.shape
+        cnn_input = Tensor(sample_data.reshape(1, window_size, num_features))
+        cnn_raw = self.cnn(cnn_input)
+        cnn_out = self.flatten(cnn_raw)
+
+        # NLP
+        nlp_out = (
+            self.precomputed_nlp if self.precomputed_nlp is not None
+            else self.nlp(self.current_text)
+        )
+
+        # Regime
         regime_out = self.regime(sample)
+
         
-        l_f = Tensor(lstm_out.data.flatten())
-        c_f = Tensor(cnn_out.data.flatten())
-        n_f = Tensor(nlp_out.data.flatten())
-        r_f = Tensor(regime_out.data.flatten())
-        
+        l_f = Tensor(lstm_out.data[-1].reshape(1, -1))   
+        c_f = Tensor(cnn_out.data.reshape(1, -1))         
+        n_f = Tensor(nlp_out.data.reshape(1, -1))         
+        r_f = Tensor(regime_out.data.reshape(1, -1))      
+
         fused = self.fusion(l_f, c_f, n_f, r_f)
         f_flat = Tensor(fused.data.flatten())
-        
+
+        # Portfolio features
         current_price = self.prices[idx]
         unrealised_pnl = 0.0
         if self.position != 0 and self.entry_price != 0:
-            side = 1 if self.position > 0 else -1
-            unrealised_pnl = side * (current_price - self.entry_price) / self.entry_price
-            
+            side = np.sign(self.position)
+            unrealised_pnl = float(side * (current_price - self.entry_price) / (self.entry_price + 1e-8))
+
         portfolio = Tensor(np.array([
-            self.position / (self.initial_balance + 1e-6), 
-            self.balance / (self.initial_balance + 1e-6), 
+            self.position / (self.initial_balance + 1e-6),
+            self.balance / (self.initial_balance + 1e-6),
             unrealised_pnl
-        ])) 
-        
+        ], dtype=np.float64))
+
         return f_flat.concat(portfolio)

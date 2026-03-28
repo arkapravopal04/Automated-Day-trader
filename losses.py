@@ -1,27 +1,27 @@
 import numpy as np
 from engine import Tensor
-import Neural_Nets as nn
+
 
 class CrossEntropyLoss:
-    def __init__(self):
-        pass
     def forward(self, logits, target_idx):
-        max_logits = np.max(logits.data, axis=0)
-        stable_logits = logits - max_logits
-        exp_logits = stable_logits.exp()
-        sum_logits = exp_logits.sum()
-        probs = exp_logits / sum_logits
-
-        target_prob = probs.data[target_idx]
-        target_tensor = Tensor(target_prob, (probs,), 'target_select')
-
-        def _backward():
-            grad = np.zeros_like(probs.data)
-            grad[target_idx] = target_tensor.grad
-            probs.grad += grad
-
-        target_tensor._backward = _backward
-        loss = target_tensor.log() * -1
+        max_logit = np.max(logits.data)
+        shifted = logits - max_logit          
+        exp_shifted = shifted.exp()
+        log_sum_exp = exp_shifted.sum().log()
+        log_prob_target = shifted[target_idx] - log_sum_exp
+        loss = log_prob_target * -1.0
         return loss
+
     def __call__(self, logits, target_idx):
         return self.forward(logits, target_idx)
+
+
+class MSELoss:
+    """Mean-squared-error loss (useful for critic / regression heads)."""
+
+    def forward(self, pred, target):
+        diff = pred - target
+        return (diff ** 2).mean()
+
+    def __call__(self, pred, target):
+        return self.forward(pred, target)

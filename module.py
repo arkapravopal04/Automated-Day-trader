@@ -13,6 +13,12 @@ class Module:
                 params.append(attr)
             elif isinstance(attr, Module):
                 params.extend(attr.parameters())
+            elif isinstance(attr, (list, tuple)):
+                for item in attr:
+                    if isinstance(item, Module):
+                        params.extend(item.parameters())
+                    elif isinstance(item, Tensor):
+                        params.append(item)
         return params
 
     def forward(self, *args, **kwargs):
