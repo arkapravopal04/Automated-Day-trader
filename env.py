@@ -70,8 +70,8 @@ class TradingEnvironment:
             reward = 0.0
             trade_occurred = False
             
-            TRADE_THRESHOLD = 0.5
-            NEUTRAL_ZONE = 0.3
+            TRADE_THRESHOLD = 0.7
+            NEUTRAL_ZONE = 0.5
             
             should_close = (
                 (abs(direction) < NEUTRAL_ZONE) or
