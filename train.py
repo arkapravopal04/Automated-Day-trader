@@ -18,7 +18,7 @@ from models_utils import save_model, load_model, save_log
 
 def print_step(episode, ticker, step, total_steps, net_worth, position, price):
     msg = (f"  [{ticker}] Ep{episode} | Step {step}/{total_steps} "
-           f"| NetWorth: ${net_worth:8.2f} | Pos: ${position:8.2f} | Price: ${price:.2f}")
+           f"| NetWorth: {currency_units}{net_worth:8.2f} | Pos: {currency_units}{position:8.2f} | Price: {currency_units}{price:.2f}")
     sys.stdout.write('\r' + msg + ' ' * 10)
     sys.stdout.flush()
  
@@ -27,8 +27,8 @@ def print_episode(episode, ticker, net_worth, reward, trades, win_rate, std, bes
     sys.stdout.write('\n')
     star = '★' if net_worth >= best else ' '
     print(
-        f"{star} Ep {episode:3d} | {ticker:6s} | NetWorth: ${net_worth:9.2f} "
-        f"| Pos: ${position:8.2f} | Reward: {reward:10.2f} "
+        f"{star} Ep {episode:3d} | {ticker:6s} | NetWorth: {currency_units}{net_worth:9.2f} "
+        f"| Pos: {currency_units}{position:8.2f} | Reward: {reward:10.2f} "
         f"| Trades: {trades:4d} | WR: {win_rate:.1%} | Std: {std:.3f}",
         flush=True
     )
@@ -54,12 +54,14 @@ BEST_MODEL_PATH  = f"{BASE_PATH}/models/best_model.pkl"
 CHECKPOINT_PATH  = f"{BASE_PATH}/models/checkpoint.pkl"
 LOG_PATH         = f"{BASE_PATH}/logs/training_log.csv"
 
-TICKERS        = ["JPM"]   
+# $ , ₹, €
+currency_units = "₹"  # use symbol corresponding to currency
+TICKERS        = ["RELIANCE.NS"]   
 START_DATE     = "2015-01-01"
 END_DATE       = "2025-01-01"
 WINDOW_SIZE    = 10
-EPISODES       = 1
-SAVE_EVERY     = 1
+EPISODES       = 200
+SAVE_EVERY     = 5
 INITIAL_BALANCE = 10000
 
 CNN_FLAT_SIZE  = 128
@@ -170,7 +172,7 @@ for episode in range(1, EPISODES + 1):
     if is_new_best:
         best_net_worth = final_net_worth
         save_model(agent, BEST_MODEL_PATH)
-        print(f"  ★ NEW BEST  ${best_net_worth:.2f}  — model saved → {BEST_MODEL_PATH}")
+        print(f"  ★ NEW BEST  {currency_units}{best_net_worth:.2f}  — model saved → {BEST_MODEL_PATH}")
  
     if episode % SAVE_EVERY == 0:
         save_model(agent, CHECKPOINT_PATH)
@@ -178,6 +180,6 @@ for episode in range(1, EPISODES + 1):
  
  
 print(f"\nTraining complete.")
-print(f"Best Net Worth achieved: ${best_net_worth:.2f}")
+print(f"Best Net Worth achieved: {currency_units}{best_net_worth:.2f}")
 print(f"Best model saved to:     {BEST_MODEL_PATH}")
  
