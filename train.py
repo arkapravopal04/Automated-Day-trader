@@ -98,7 +98,18 @@ fusion    = FusionLayers(
     nlp_hidden_size=64,
     hidden_size=64
 )
-agent = PPOAgent(state_size=FUSED_STATE_SIZE, action_size=2)
+# better than before but still not great. The agent can learn some patterns but struggles to consistently outperform the baseline.
+agent = PPOAgent(
+    state_size=FUSED_STATE_SIZE,
+    action_size=2,
+    lstm=lstm,
+    attention=attention,
+    cnn=cnn,
+    flatten=flatten,
+    regime=regime,
+    fusion=fusion,
+)
+
 
 load_model(agent, CHECKPOINT_PATH)
  

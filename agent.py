@@ -1,5 +1,10 @@
 """
 PPO agent — actor-critic with clipped surrogate objective.
+
+The feature extractors (LSTM, Attention, CNN, RegimeDetector, FusionLayers)
+are registered here and included in the optimiser so their weights are trained
+end-to-end alongside the PPO head. Without this, the state representation
+is a frozen random projection and the agent cannot learn meaningful patterns.
 """
 
 import numpy as np
@@ -8,46 +13,72 @@ from Neural_Nets import LayerNorm, Dropout, Linear, Adam_Optimiser
 
 
 class PPOAgent:
-    def __init__(self, state_size=67, action_size=2):
+    def __init__(self, state_size=67, action_size=2,
+                 lstm=None, attention=None, cnn=None, flatten=None,
+                 regime=None, fusion=None):
         self.gamma = 0.99
-        self.epsilon = 0.2     
+        self.epsilon = 0.2
         self.epochs = 5
-        self.std = 0.3 
+        self.std = 0.3
         self.std_min = 0.02
         self.std_decay = 0.995
+
         self.states = []
         self.actions = []
         self.rewards = []
         self.log_probs = []
         self.values = []
-        self.actor_l1 = Linear(state_size, 64)
+
+        self.lstm      = lstm
+        self.attention = attention
+        self.cnn       = cnn
+        self.flatten   = flatten
+        self.regime    = regime
+        self.fusion    = fusion
+
+        self.actor_l1    = Linear(state_size, 64)
         self.actor_norm1 = LayerNorm(64)
         self.actor_drop1 = Dropout(0.1)
-        self.actor_l2 = Linear(64, 32)
+        self.actor_l2    = Linear(64, 32)
         self.actor_norm2 = LayerNorm(32)
         self.actor_drop2 = Dropout(0.1)
-        self.actor_out = Linear(32, action_size)
-        self.critic_l1 = Linear(state_size, 64)
+        self.actor_out   = Linear(32, action_size)
+
+        self.critic_l1    = Linear(state_size, 64)
         self.critic_norm1 = LayerNorm(64)
         self.critic_drop1 = Dropout(0.1)
-        self.critic_l2 = Linear(64, 32)
+        self.critic_l2    = Linear(64, 32)
         self.critic_norm2 = LayerNorm(32)
         self.critic_drop2 = Dropout(0.1)
-        self.critic_out = Linear(32, 1)
-        all_params = (
-            self.actor_l1.parameters() + self.actor_norm1.parameters() +
-            self.actor_l2.parameters() + self.actor_norm2.parameters() +
-            self.actor_out.parameters() +
-            self.critic_l1.parameters() + self.critic_norm1.parameters() +
-            self.critic_l2.parameters() + self.critic_norm2.parameters() +
+        self.critic_out   = Linear(32, 1)
+
+        head_params = (
+            self.actor_l1.parameters()    + self.actor_norm1.parameters() +
+            self.actor_l2.parameters()    + self.actor_norm2.parameters() +
+            self.actor_out.parameters()   +
+            self.critic_l1.parameters()   + self.critic_norm1.parameters() +
+            self.critic_l2.parameters()   + self.critic_norm2.parameters() +
             self.critic_out.parameters()
         )
-        self.optimizer = Adam_Optimiser(all_params, lr=3e-4)
+        extractor_params = self._extractor_parameters()
+
+        self.optimizer           = Adam_Optimiser(head_params,       lr=3e-4)
+        self.extractor_optimizer = Adam_Optimiser(extractor_params,  lr=1e-4) \
+                                   if extractor_params else None
+
 
     def _set_train_mode(self, mode: bool):
         for drop in (self.actor_drop1, self.actor_drop2,
                      self.critic_drop1, self.critic_drop2):
             drop.training = mode
+
+    def _extractor_parameters(self):
+        params = []
+        for module in (self.lstm, self.attention, self.cnn,
+                       self.flatten, self.regime, self.fusion):
+            if module is not None and hasattr(module, 'parameters'):
+                params.extend(module.parameters())
+        return params
 
     def _actor_forward(self, state):
         x = self.actor_drop1(self.actor_norm1(self.actor_l1(state).relu()))
@@ -60,7 +91,6 @@ class PPOAgent:
         return self.critic_out(v)
 
     def _log_prob(self, action_val, mean_val):
-        """Gaussian log-probability (scalar, detached from graph)."""
         return -0.5 * ((action_val - mean_val) / (self.std + 1e-8)) ** 2
 
     def select_action(self, state):
@@ -85,6 +115,7 @@ class PPOAgent:
 
         return np.array([direction, size])
 
+
     def compute_returns(self, next_value=0.0):
         R = float(next_value)
         returns = []
@@ -107,14 +138,12 @@ class PPOAgent:
         returns = self.compute_returns(next_value=0.0)
         advantages = returns - np.array(self.values, dtype=np.float64)
 
-        # Normalise advantages
         if len(advantages) > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         self._set_train_mode(True)
 
         for _ in range(self.epochs):
-            # Shuffle mini-batch order each epoch
             indices = np.random.permutation(len(states))
             for i in indices:
                 state = states[i]
@@ -142,10 +171,19 @@ class PPOAgent:
                 loss = (actor_loss + Tensor(np.array([0.5])) * critic_loss).sum()
 
                 self.optimizer.zero_grad()
+                if self.extractor_optimizer:
+                    self.extractor_optimizer.zero_grad()
+
                 loss.backward()
+
                 for p in self.optimizer.parameters:
                     np.clip(p.grad, -1.0, 1.0, out=p.grad)
                 self.optimizer.step()
+
+                if self.extractor_optimizer:
+                    for p in self.extractor_optimizer.parameters:
+                        np.clip(p.grad, -0.5, 0.5, out=p.grad)
+                    self.extractor_optimizer.step()
 
         self.std = max(self.std_min, self.std * self.std_decay)
 
