@@ -52,6 +52,7 @@ os.makedirs(f"{BASE_PATH}/logs", exist_ok=True)
  
 BEST_MODEL_PATH  = f"{BASE_PATH}/models/best_model.pkl"
 CHECKPOINT_PATH  = f"{BASE_PATH}/models/checkpoint.pkl"
+# CHECKPOINT_PATH  = BEST_MODEL_PATH
 LOG_PATH         = f"{BASE_PATH}/logs/training_log.csv"
 
 TICKERS        = ["JPM"]   
@@ -59,7 +60,7 @@ START_DATE     = "2015-01-01"
 END_DATE       = "2025-01-01"
 WINDOW_SIZE    = 10
 EPISODES       = 200
-SAVE_EVERY     = 50
+SAVE_EVERY     = 5
 INITIAL_BALANCE = 10000
 
 CNN_FLAT_SIZE  = 128
@@ -97,7 +98,7 @@ fusion    = FusionLayers(
     hidden_size=64
 )
 agent = PPOAgent(state_size=FUSED_STATE_SIZE, action_size=2)
- 
+
 load_model(agent, CHECKPOINT_PATH)
  
 best_net_worth = INITIAL_BALANCE
