@@ -19,9 +19,9 @@ class PPOAgent:
 
         # hyperparams
         self.gamma = 0.99
-        self.epsilon = 0.1 # increases stability but can slow learning
-        self.epochs = 5 # increases training time but can improve stability
-        self.std = 0.5
+        self.epsilon = 0.2 # increases stability but can slow learning
+        self.epochs = 10 # increases training time but can improve stability
+        self.std = 0.3
         self.std_min = 0.05
         self.std_decay = 0.999
 

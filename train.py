@@ -68,8 +68,8 @@ CHECKPOINT_PATH  = f"{BASE_PATH}/models/checkpoint.pkl"
 LOG_PATH         = f"{BASE_PATH}/logs/training_log.csv"
 
 # $ , ₹, €
-currency_units = "₹"  # use symbol corresponding to currency
-TICKERS        = ["RELIANCE.NS"]   
+currency_units = "$"  # use symbol corresponding to currency
+TICKERS        = ["JPM"]   
 START_DATE     = "2015-01-01"
 END_DATE       = "2025-01-01"
 WINDOW_SIZE    = 10
@@ -126,6 +126,11 @@ agent = PPOAgent(
 
 
 load_model(agent, CHECKPOINT_PATH)
+
+
+extractor_param_count = len(agent._extractor_parameters())
+print(f"Extractor params: {extractor_param_count}")
+print(f"Extractor optimizer: {'active' if agent.extractor_optimizer else 'NONE'}")
  
 best_net_worth = load_best_net_worth(LOG_PATH, INITIAL_BALANCE)
 print(f"Resuming with best net worth: {currency_units}{best_net_worth:.2f}")
