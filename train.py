@@ -68,8 +68,8 @@ CHECKPOINT_PATH  = f"{BASE_PATH}/models/checkpoint.pkl"
 LOG_PATH         = f"{BASE_PATH}/logs/training_log.csv"
 
 # $ , ₹, €
-currency_units = "$"  # use symbol corresponding to currency
-TICKERS        = ["JPM"]   
+currency_units = "₹"  # use symbol corresponding to currency
+TICKERS        = ["RELIANCE.NS"]   
 START_DATE     = "2015-01-01"
 END_DATE       = "2025-01-01"
 WINDOW_SIZE    = 10
