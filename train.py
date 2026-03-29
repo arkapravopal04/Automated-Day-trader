@@ -165,7 +165,7 @@ for episode in range(1, EPISODES + 1):
                 winning_trades += 1
             env.last_trade_pnl = None   
  
-        if env.current_step % 50 == 0:
+        if env.current_step % 25 == 0:
             price_idx = min(env.current_step - 1, env.total_steps - 1)
             print_step(episode, ticker, env.current_step,
                        env.total_steps, env.net_worth,
