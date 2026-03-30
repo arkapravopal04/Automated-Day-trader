@@ -73,7 +73,7 @@ TICKERS        = ["RELIANCE.NS"]
 START_DATE     = "2015-01-01"
 END_DATE       = "2025-01-01"
 WINDOW_SIZE    = 10
-EPISODES       = 500
+EPISODES       = 50
 SAVE_EVERY     = 10
 # do update initial balance in env.py
 INITIAL_BALANCE = 10000
