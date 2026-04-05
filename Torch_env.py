@@ -80,7 +80,7 @@ class TradingEnvironment:
         direction = float(action[0])
         size = float(np.clip(action[1], 0.0, 1.0))
 
-        idx = min(self.current_step, self.total_steps - 1)
+        idx  = min(self.current_step, self.total_steps - 1)
         current_price = self.prices[idx]
 
         reward = 0.0
@@ -96,12 +96,12 @@ class TradingEnvironment:
         if should_close and self.position != 0 and self.entry_price != 0:
             if self.position > 0:
                 close_value = self.position * (current_price / self.entry_price)
-                trade_pnl = (current_price - self.entry_price) / self.entry_price
+                trade_pnl   = (current_price - self.entry_price) / self.entry_price
             else:
                 close_value = abs(self.position) * (
                     1.0 - (current_price - self.entry_price) / self.entry_price)
                 close_value = max(0.0, close_value)
-                trade_pnl = (self.entry_price - current_price) / self.entry_price
+                trade_pnl   = (self.entry_price - current_price) / self.entry_price
 
             self.balance+= close_value * (1.0 - self.fee)
             self.last_trade_pnl = trade_pnl
@@ -152,10 +152,43 @@ class TradingEnvironment:
         reward = float(np.clip(reward, -R_CLIP, R_CLIP))
 
         self.balance = max(0.0, self.balance)
-        next_state  = self._get_state() if not done else None
+        next_state = self._get_state() if not done else None
 
         return next_state, reward, done, info
 
+
+    def compute_features(self, idx: int) -> torch.Tensor:
+    
+        idx = min(idx, self.total_steps - 1)
+        sample_data = self.X[idx].astype(np.float32)
+        sample = torch.tensor(sample_data, dtype=torch.float32, device=DEVICE)
+
+        hidden_states, _ = self.lstm(sample)
+        lstm_out = self.attention(hidden_states)
+        l_f = lstm_out[-1].unsqueeze(0)
+
+        window_size, num_features = sample_data.shape
+        cnn_input = sample.reshape(1, window_size, num_features)
+        cnn_raw = self.cnn(cnn_input)
+        cnn_flat  = self.flatten(cnn_raw)
+        c_f = cnn_flat.unsqueeze(0)
+
+        if self.precomputed_nlp is not None:
+            nlp_np = self.precomputed_nlp
+            if isinstance(nlp_np, torch.Tensor):
+                n_f = nlp_np.to(DEVICE).reshape(1, -1).detach()
+            else:
+                n_f = torch.tensor(nlp_np, dtype=torch.float32, device=DEVICE).reshape(1, -1)
+        else:
+            with torch.no_grad():
+                nlp_out = self.nlp(self.current_text)
+            n_f = torch.tensor(nlp_out, dtype=torch.float32, device=DEVICE).reshape(1, -1)
+
+        regime_out = self.regime(sample)
+        r_f = regime_out
+
+        fused = self.fusion(l_f, c_f, n_f, r_f)
+        return fused.squeeze(0)  
 
     def _get_state(self):
         idx = min(self.current_step, self.total_steps - 1)

@@ -18,9 +18,9 @@ from Torch_agent import PPOAgent
 from Torch_models_utils import save_model, load_model, save_log
 
 RED = "\033[91m"
-GREEN = "\033[92m"
+GREEN= "\033[92m"
 ORANGE = "\033[38;5;208m"
-RESET = "\033[0m"
+RESET= "\033[0m"
 
 
 def print_step(episode, ticker, step, total_steps, net_worth, position, price):
@@ -103,7 +103,7 @@ print("Loading data for all tickers...")
 datasets = {}
 for ticker in TICKERS:
     try:
-        raw         = load_data(ticker, START_DATE, END_DATE)
+        raw = load_data(ticker, START_DATE, END_DATE)
         transformed = transform_data(raw)
         X, y, prices = build_windows(transformed, WINDOW_SIZE, raw_data=raw)
         datasets[ticker] = (X, y, prices)
@@ -144,7 +144,8 @@ agent = PPOAgent(
 load_model(agent, CHECKPOINT_PATH)
 # load_model(agent, BEST_MODEL_PATH)
 
-print(f"Extractor params (frozen): {len(agent._extractor_parameters())}")
+print(f"Extractor params (trainable): {len(agent._extractor_parameters())}")
+print(f"Extractor optimizer: {'active' if agent.extractor_optimizer else 'NONE'}")
 
 best_net_worth = load_best_net_worth(LOG_PATH, INITIAL_BALANCE)
 print(f"Resuming with best net worth: {currency_units}{best_net_worth:.2f}")
@@ -174,7 +175,7 @@ for episode in range(1, EPISODES + 1):
     episode_bankrupt = False
 
     while not done:
-        action = agent.select_action(state)
+        action = agent.select_action(state, idx=env.current_step)
         next_state, reward, done, info  = env.step(action)
         agent.rewards.append(reward)
 
@@ -199,7 +200,7 @@ for episode in range(1, EPISODES + 1):
         if next_state is not None:
             state = next_state
 
-    agent.update()
+    agent.update(feature_fn=env.compute_features)
 
     final_net_worth = env.net_worth
     win_rate  = winning_trades / num_trades if num_trades > 0 else 0.0
