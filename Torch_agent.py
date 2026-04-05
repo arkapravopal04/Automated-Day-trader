@@ -93,20 +93,12 @@ class PPOAgent:
         self.regime= regime
         self.fusion= fusion
 
-        # Networks
         self.actor= ActorNet(state_size, action_size).to(DEVICE)
         self.critic = CriticNet(state_size).to(DEVICE)
 
-        # Optimisers
         head_params = (list(self.actor.parameters()) +
                        list(self.critic.parameters()))
-        extractor_params = self._extractor_parameters()
-
         self.optimizer = torch.optim.Adam(head_params, lr=3e-4)
-        self.extractor_optimizer = (
-            torch.optim.Adam(extractor_params, lr=5e-5)
-            if extractor_params else None
-        )
 
     def _extractor_parameters(self):
         params = []
@@ -156,10 +148,10 @@ class PPOAgent:
         if not self.states:
             return
 
-        states        = self.states
-        actions       = self.actions
+        states = self.states
+        actions = self.actions
         old_log_probs = np.array(self.log_probs, dtype=np.float64)
-        old_values    = np.array(self.values,    dtype=np.float64)
+        old_values = np.array(self.values,    dtype=np.float64)
 
         returns = self.compute_returns(next_value=0.0)
         if len(returns) > 1:
@@ -180,62 +172,48 @@ class PPOAgent:
                 old_log_p = float(old_log_probs[i])
                 adv = float(advantages[i])
                 ret= float(returns[i])
-                old_val   = float(old_values[i])
+                old_val = float(old_values[i])
 
-                out= self.actor(state)          
+                out = self.actor(state)
                 direction_mean = torch.tanh(out[0, 0])
-                size_mean = torch.sigmoid(out[0, 1])
+                size_mean  = torch.sigmoid(out[0, 1])
 
-                diff_dir = torch.tensor([action[0]], device=DEVICE) - direction_mean
-                diff_size = torch.tensor([action[1]], device=DEVICE) - size_mean
+                diff_dir = torch.tensor([action[0]], dtype=torch.float32, device=DEVICE) - direction_mean
+                diff_size = torch.tensor([action[1]], dtype=torch.float32, device=DEVICE) - size_mean
                 inv_std2 = 1.0 / (self.std + 1e-8) ** 2
 
                 new_log_p_tensor = (
                     -0.5 * diff_dir  * diff_dir  * inv_std2 +
                     -0.5 * diff_size * diff_size * inv_std2
                 )
-                new_log_p = float(new_log_p_tensor.item())
 
-                ratio = np.exp(new_log_p - old_log_p)
-                clipped_ratio = np.clip(ratio, 1 - self.epsilon, 1 + self.epsilon)
-                surr  = min(ratio * adv, clipped_ratio * adv)
-                actor_loss = (torch.tensor([-surr], device=DEVICE) -
-                              self.entropy_coef * new_log_p_tensor)
+                old_log_p_t = torch.tensor([old_log_p], dtype=torch.float32, device=DEVICE)
+                adv_t  = torch.tensor([adv],       dtype=torch.float32, device=DEVICE)
 
-                new_value   = self.critic(state)            
-                new_value_f = float(new_value.item())
-                ret_t = torch.tensor([[ret]], dtype=torch.float32, device=DEVICE)
+                ratio= torch.exp(new_log_p_tensor - old_log_p_t)
+                clipped_ratio = torch.clamp(ratio, 1.0 - self.epsilon, 1.0 + self.epsilon)
+                surr= torch.min(ratio * adv_t, clipped_ratio * adv_t)
+                actor_loss = -surr - self.entropy_coef * new_log_p_tensor
 
-                unclipped_loss = (ret - new_value_f) ** 2
-                clipped_val    = np.clip(new_value_f,
-                                         old_val - self.value_clip,
-                                         old_val + self.value_clip)
-                clipped_loss = (ret - clipped_val) ** 2
+                # Critic loss — fully tensor-based, proper clipped value target.
+                new_value = self.critic(state)
+                ret_t = torch.tensor([[ret]],     dtype=torch.float32, device=DEVICE)
+                old_val_t = torch.tensor([[old_val]], dtype=torch.float32, device=DEVICE)
 
-                if clipped_loss >= unclipped_loss:
-                    critic_loss = torch.tensor([clipped_loss], device=DEVICE)
-                else:
-                    critic_loss = (ret_t - new_value) ** 2
+                clipped_value  = torch.clamp(new_value,
+                                             old_val_t - self.value_clip,
+                                             old_val_t + self.value_clip)
+                unclipped_loss = (ret_t - new_value) ** 2
+                clipped_loss = (ret_t - clipped_value) ** 2
+                critic_loss = torch.max(unclipped_loss, clipped_loss)
 
                 loss = actor_loss + 0.5 * critic_loss
 
                 self.optimizer.zero_grad()
-                if self.extractor_optimizer:
-                    self.extractor_optimizer.zero_grad()
-
                 loss.backward()
-
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(),  1.0)
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
                 self.optimizer.step()
-
-                if self.extractor_optimizer:
-                    for module in (self.lstm, self.attention, self.cnn,
-                                   self.flatten, self.regime, self.fusion):
-                        if module is not None:
-                            torch.nn.utils.clip_grad_norm_(
-                                module.parameters(), 0.5)
-                    self.extractor_optimizer.step()
 
         self.std = max(self.std_min, self.std * self.std_decay)
         self.states, self.actions, self.rewards, self.log_probs, self.values = \

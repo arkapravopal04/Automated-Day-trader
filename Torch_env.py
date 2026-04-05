@@ -45,7 +45,7 @@ class TradingEnvironment:
         self.current_text= "market news headline"
 
         self.stress_threshold = 0.9 * self.initial_balance
-        self.death_threshold  = 0.7 * self.initial_balance
+        self.death_threshold = 0.7 * self.initial_balance
 
 
     @property
@@ -58,15 +58,15 @@ class TradingEnvironment:
             pos_value = self.position * (current_price / self.entry_price)
         else:
             price_ratio = (current_price - self.entry_price) / self.entry_price
-            pos_value   = abs(self.position) * (1.0 - price_ratio)
+            pos_value= abs(self.position) * (1.0 - price_ratio)
         return self.balance + pos_value
 
     def reset(self):
         self.current_step  = 0
-        self.balance       = self.initial_balance
-        self.position      = 0.0
+        self.balance = self.initial_balance
+        self.position  = 0.0
         self.entry_price   = 0.0
-        self.cooldown      = 0
+        self.cooldown= 0
         self.last_trade_pnl = None
 
         first_price = self.prices[0]
@@ -78,12 +78,12 @@ class TradingEnvironment:
 
     def step(self, action):
         direction = float(action[0])
-        size      = float(np.clip(action[1], 0.0, 1.0))
+        size = float(np.clip(action[1], 0.0, 1.0))
 
-        idx           = min(self.current_step, self.total_steps - 1)
+        idx = min(self.current_step, self.total_steps - 1)
         current_price = self.prices[idx]
 
-        reward        = 0.0
+        reward = 0.0
         trade_occurred = False
         self.last_trade_pnl = None
 
@@ -96,12 +96,12 @@ class TradingEnvironment:
         if should_close and self.position != 0 and self.entry_price != 0:
             if self.position > 0:
                 close_value = self.position * (current_price / self.entry_price)
-                trade_pnl   = (current_price - self.entry_price) / self.entry_price
+                trade_pnl = (current_price - self.entry_price) / self.entry_price
             else:
                 close_value = abs(self.position) * (
                     1.0 - (current_price - self.entry_price) / self.entry_price)
                 close_value = max(0.0, close_value)
-                trade_pnl   = (self.entry_price - current_price) / self.entry_price
+                trade_pnl = (self.entry_price - current_price) / self.entry_price
 
             self.balance+= close_value * (1.0 - self.fee)
             self.last_trade_pnl = trade_pnl
@@ -152,44 +152,43 @@ class TradingEnvironment:
         reward = float(np.clip(reward, -R_CLIP, R_CLIP))
 
         self.balance = max(0.0, self.balance)
-        next_state   = self._get_state() if not done else None
+        next_state  = self._get_state() if not done else None
 
         return next_state, reward, done, info
 
 
     def _get_state(self):
-        idx         = min(self.current_step, self.total_steps - 1)
+        idx = min(self.current_step, self.total_steps - 1)
         sample_data = self.X[idx].astype(np.float32)
 
         sample = torch.tensor(sample_data, dtype=torch.float32, device=DEVICE)
 
-        with torch.no_grad() if not self.lstm.training else torch.enable_grad():
+        with torch.no_grad():
             hidden_states, _ = self.lstm(sample)
+            lstm_out = self.attention(hidden_states)
+            l_f= lstm_out[-1].unsqueeze(0)
 
-        lstm_out = self.attention(hidden_states)  
-        l_f      = lstm_out[-1].unsqueeze(0)                   
+            window_size, num_features = sample_data.shape
+            cnn_input = sample.reshape(1, window_size, num_features)
+            cnn_raw = self.cnn(cnn_input)
+            cnn_flat  = self.flatten(cnn_raw)
+            c_f  = cnn_flat.unsqueeze(0)
 
-        window_size, num_features = sample_data.shape
-        cnn_input = sample.reshape(1, window_size, num_features)  
-        cnn_raw   = self.cnn(cnn_input) 
-        cnn_flat  = self.flatten(cnn_raw) 
-        c_f       = cnn_flat.unsqueeze(0)                         
-
-        if self.precomputed_nlp is not None:
-            nlp_np = self.precomputed_nlp
-            if isinstance(nlp_np, torch.Tensor):
-                n_f = nlp_np.to(DEVICE).reshape(1, -1)
+            if self.precomputed_nlp is not None:
+                nlp_np = self.precomputed_nlp
+                if isinstance(nlp_np, torch.Tensor):
+                    n_f = nlp_np.to(DEVICE).reshape(1, -1)
+                else:
+                    n_f = torch.tensor(nlp_np, dtype=torch.float32, device=DEVICE).reshape(1, -1)
             else:
-                n_f = torch.tensor(nlp_np, dtype=torch.float32, device=DEVICE).reshape(1, -1)
-        else:
-            nlp_out = self.nlp(self.current_text)
-            n_f  = torch.tensor(nlp_out, dtype=torch.float32, device=DEVICE).reshape(1, -1)
+                nlp_out = self.nlp(self.current_text)
+                n_f = torch.tensor(nlp_out, dtype=torch.float32, device=DEVICE).reshape(1, -1)
 
-        regime_out = self.regime(sample)  
-        r_f        = regime_out                         
+            regime_out = self.regime(sample)
+            r_f = regime_out
 
-        fused  = self.fusion(l_f, c_f, n_f, r_f)       
-        f_flat = fused.squeeze(0)   
+            fused  = self.fusion(l_f, c_f, n_f, r_f)
+            f_flat = fused.squeeze(0)
 
         current_price = self.prices[idx]
         unrealised_pnl = 0.0
@@ -204,4 +203,4 @@ class TradingEnvironment:
             unrealised_pnl,
         ], dtype=torch.float32, device=DEVICE)
 
-        return torch.cat([f_flat, portfolio], dim=0)    
+        return torch.cat([f_flat, portfolio], dim=0)

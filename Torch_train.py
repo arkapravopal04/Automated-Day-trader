@@ -17,10 +17,10 @@ from Torch_env import TradingEnvironment
 from Torch_agent import PPOAgent
 from Torch_models_utils import save_model, load_model, save_log
 
-RED    = "\033[91m"
-GREEN  = "\033[92m"
+RED = "\033[91m"
+GREEN = "\033[92m"
 ORANGE = "\033[38;5;208m"
-RESET  = "\033[0m"
+RESET = "\033[0m"
 
 
 def print_step(episode, ticker, step, total_steps, net_worth, position, price):
@@ -144,9 +144,7 @@ agent = PPOAgent(
 load_model(agent, CHECKPOINT_PATH)
 # load_model(agent, BEST_MODEL_PATH)
 
-extractor_param_count = len(agent._extractor_parameters())
-print(f"Extractor params:    {extractor_param_count}")
-print(f"Extractor optimizer: {'active' if agent.extractor_optimizer else 'NONE'}")
+print(f"Extractor params (frozen): {len(agent._extractor_parameters())}")
 
 best_net_worth = load_best_net_worth(LOG_PATH, INITIAL_BALANCE)
 print(f"Resuming with best net worth: {currency_units}{best_net_worth:.2f}")
@@ -239,4 +237,4 @@ for episode in range(1, EPISODES + 1):
 
 print(f"\nTraining complete.")
 print(f"Best Net Worth achieved: {currency_units}{best_net_worth:.2f}")
-print(f"Best model saved to:     {BEST_MODEL_PATH}")
+print(f"Best model saved to: {BEST_MODEL_PATH}")
