@@ -8,6 +8,15 @@ from engine import Tensor
 from Neural_Nets import LSTM, Conv2D, Flatten, Linear, Attention, FusionLayers, RegimeDetector
 from nlp import NLPEncoder
 
+TRADE_THRESHOLD = 0.6   # direction must exceed this to open / flip
+NEUTRAL_ZONE    = 0.4   # direction below this triggers a close
+R_TRADE_SCALE   = 10.0   #tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.  At 10.0 (10× original) the agent learned to make profitable trades but was less consistent and more prone to large drawdowns, likely because the strong reward signal encouraged riskier behavior.  5.0 seems to strike a better balance between rewarding good trades and encouraging more cautious risk management.
+R_STEP_SCALE    = 3.0  # encourages the agent to manage open positions effectively, tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.
+R_IDLE_PENALTY  = 0.005 # small penalty for taking no action, encourages the agent to trade and learn from the environment rather than sitting idle.  Tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.
+R_STRESS_SCALE  = 2.5   # net worth stress penalty scale — increases as net worth approaches the death threshold, encouraging the agent to take more risk to escape drawdown traps but not so strong that it causes reckless behavior.  At 5.0 (5× original) the agent was more likely to take large risky trades in an attempt to escape drawdowns, which sometimes paid off but often led to faster bankruptcies.  2.0 seems to strike a better balance between encouraging recovery attempts and avoiding reckless gambles.
+R_BANKRUPT      = 10.0  # bankruptcy penalty large but not very big,  to allow recovery
+R_CLIP          = 10.0  # prevents extreme outliers that could destabilise training
+
 
 class TradingEnvironment:
     def __init__(self, X, y, lstm, attention, cnn, flatten, regime, fusion, nlp,
@@ -27,12 +36,17 @@ class TradingEnvironment:
         self.total_steps = len(X)
         self.current_step = 0
         self.balance = self.initial_balance
-        self.position = 0.0     
+        self.position = 0.0
         self.entry_price = 0.0
         self.cooldown = 0
 
+        self.last_trade_pnl = None
+
         self.precomputed_nlp = None
         self.current_text = "market news headline"
+
+        self.stress_threshold = 0.9 * self.initial_balance   
+        self.death_threshold  = 0.7 * self.initial_balance   
 
     @property
     def net_worth(self):
@@ -56,10 +70,14 @@ class TradingEnvironment:
         self.position = 0.0
         self.entry_price = 0.0
         self.cooldown = 0
-        self.last_trade_pnl = None  
+        self.last_trade_pnl = None
+
+        #Dataleak fix 
+        first_price = self.prices[0]
+        if first_price > 0:
+            self.prices = self.prices / first_price * 100.0
+
         return self._get_state()
-
-
 
     def step(self, action):
         direction = float(action[0])
@@ -67,14 +85,11 @@ class TradingEnvironment:
 
         idx = min(self.current_step, self.total_steps - 1)
         current_price = self.prices[idx]
-        
+
         reward = 0.0
         trade_occurred = False
         self.last_trade_pnl = None
-        
-        TRADE_THRESHOLD = 0.7
-        NEUTRAL_ZONE = 0.5
-        
+
         should_close = (
             (abs(direction) < NEUTRAL_ZONE) or
             (direction < -TRADE_THRESHOLD and self.position > 0) or
@@ -86,55 +101,79 @@ class TradingEnvironment:
                 close_value = self.position * (current_price / self.entry_price)
                 trade_pnl = (current_price - self.entry_price) / self.entry_price
             else:
-                close_value = abs(self.position) * (1.0 - (current_price - self.entry_price) / self.entry_price)
-                close_value = max(0.0, close_value)  
+                close_value = abs(self.position) * (
+                    1.0 - (current_price - self.entry_price) / self.entry_price
+                )
+                close_value = max(0.0, close_value)
                 trade_pnl = (self.entry_price - current_price) / self.entry_price
 
             self.balance += close_value * (1.0 - self.fee)
-            self.last_trade_pnl = trade_pnl 
-            reward += trade_pnl * 100.0     
+            self.last_trade_pnl = trade_pnl
+
+            reward += trade_pnl * R_TRADE_SCALE
+
             self.position = 0.0
             self.entry_price = 0.0
-            self.cooldown = 20
+            self.cooldown = 15
             trade_occurred = True
 
         if self.cooldown > 0:
             self.cooldown -= 1
         elif self.position == 0 and abs(direction) >= TRADE_THRESHOLD and size > 0.01:
             investment = self.balance * size
+            # check this again
             if investment > 10.0:
                 effective_investment = investment * (1.0 - self.fee)
                 self.entry_price = current_price
-                self.position = effective_investment if direction > 0 else -effective_investment
+                self.position = (
+                    effective_investment if direction > 0 else -effective_investment
+                )
                 self.balance -= investment
                 trade_occurred = True
 
-        # Unrealised P&L for open positions
         if self.position != 0 and self.entry_price != 0:
             prev_price = self.prices[max(0, self.current_step - 1)]
             step_return = np.log(current_price / (prev_price + 1e-8))
-            reward += step_return * 100.0 * np.sign(self.position)
+            reward += step_return * R_STEP_SCALE * np.sign(self.position)
         elif not trade_occurred:
-            reward -= 0.001 
+            reward -= R_IDLE_PENALTY
 
         self.current_step += 1
-        
-        # Only terminate early on near-total loss
-        done = (self.current_step >= self.total_steps or 
-                self.net_worth <= self.initial_balance * 0.1)
+
+        current_net_worth = self.net_worth
+
+        if current_net_worth < self.stress_threshold:
+            danger_factor = (self.stress_threshold - current_net_worth) / (
+                self.stress_threshold - self.death_threshold + 1e-8
+            )
+            danger_factor = float(np.clip(danger_factor, 0.0, 1.0))
+            reward -= danger_factor * R_STRESS_SCALE
+
+        survival_done = current_net_worth <= self.death_threshold
+
+        if survival_done:
+            reward -= R_BANKRUPT
+
+        done = self.current_step >= self.total_steps or survival_done
+
+        info = {
+            'is_bankrupt': survival_done,
+            'net_worth':   current_net_worth,
+        }
 
         if not np.isfinite(reward):
             reward = 0.0
-            
+
+        reward = float(np.clip(reward, -R_CLIP, R_CLIP))
+
         self.balance = max(0.0, self.balance)
         next_state = self._get_state() if not done else None
 
-        return next_state, reward, done
-
+        return next_state, reward, done, info
 
     def _get_state(self):
         idx = min(self.current_step, self.total_steps - 1)
-        sample_data = self.X[idx].astype(np.float64) 
+        sample_data = self.X[idx].astype(np.float64)
 
         sample = Tensor(sample_data)
 
@@ -157,11 +196,10 @@ class TradingEnvironment:
         # Regime
         regime_out = self.regime(sample)
 
-        
-        l_f = lstm_out[-1].reshape(1, -1)     
-        c_f = cnn_out.reshape(1, -1)          
-        n_f = Tensor(nlp_out.data.reshape(1, -1))  
-        r_f = regime_out.reshape(1, -1)      
+        l_f = lstm_out[-1].reshape(1, -1)
+        c_f = cnn_out.reshape(1, -1)
+        n_f = Tensor(nlp_out.data.reshape(1, -1))
+        r_f = regime_out.reshape(1, -1)
 
         fused = self.fusion(l_f, c_f, n_f, r_f)
         f_flat = Tensor(fused.data.flatten())
@@ -171,12 +209,14 @@ class TradingEnvironment:
         unrealised_pnl = 0.0
         if self.position != 0 and self.entry_price != 0:
             side = np.sign(self.position)
-            unrealised_pnl = float(side * (current_price - self.entry_price) / (self.entry_price + 1e-8))
+            unrealised_pnl = float(
+                side * (current_price - self.entry_price) / (self.entry_price + 1e-8)
+            )
 
         portfolio = Tensor(np.array([
             self.position / (self.initial_balance + 1e-6),
-            self.balance / (self.initial_balance + 1e-6),
-            unrealised_pnl
+            self.balance  / (self.initial_balance + 1e-6),
+            unrealised_pnl,
         ], dtype=np.float64))
 
         return f_flat.concat(portfolio)

@@ -45,19 +45,6 @@ class DataLoader:
     
     def __len__(self):
         return self.num_batches
-    # def __next__(self):
-    #     if self.current_batch < self.num_batches:
-    #         start = self.current_batch * self.batch_size
-    #         end = min(start + self.batch_size, self.num_samples)
-    #         batch_indices = self.indices[start:end]
-    #         batch_X = self.X[batch_indices]
-    #         batch_y = self.y[batch_indices]
-    #         self.current_batch += 1
-    #         return batch_X, batch_y
-    #     else:
-    #         raise StopIteration
-        
-        
 
 def generate_regime_labels(X, threshold=0.001):
     returns = X[:, :, 3].mean(axis=1)

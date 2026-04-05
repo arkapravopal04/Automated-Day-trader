@@ -10,26 +10,31 @@ import csv
  
 from engine import Tensor
 from Neural_Nets import LSTM, Conv2D, Flatten, Attention, FusionLayers, RegimeDetector
-from losses import CrossEntropyLoss
-from data import load_data, transform_data, build_windows, generate_regime_labels, DataLoader
+from data import load_data, transform_data, build_windows, DataLoader
 from nlp import NLPEncoder
 from env import TradingEnvironment
 from agent import PPOAgent
 from models_utils import save_model, load_model, save_log
 
 def print_step(episode, ticker, step, total_steps, net_worth, position, price):
+    # Show position as % of net worth so it never appears to exceed 100%
+    pos_pct = (abs(position) / (net_worth + 1e-8)) * 100.0
+    pos_sign = "L" if position > 0 else ("S" if position < 0 else "-")
     msg = (f"  [{ticker}] Ep{episode} | Step {step}/{total_steps} "
-           f"| NetWorth: {currency_units}{net_worth:8.2f} | Pos: {currency_units}{position:8.2f} | Price: {currency_units}{price:.2f}")
+           f"| NetWorth: {GREEN if net_worth >= INITIAL_BALANCE else RED}{currency_units}{net_worth:8.2f}{RESET}"
+           f" | Pos: {GREEN if position >= 0 else RED}{pos_sign}{pos_pct:5.1f}%{RESET}"
+           f" | Price: {currency_units}{price:.2f}")
     sys.stdout.write('\r' + msg + ' ' * 10)
     sys.stdout.flush()
  
  
-def print_episode(episode, ticker, net_worth, reward, trades, win_rate, std, best, position):
+def print_episode(episode, ticker, net_worth, reward, trades, win_rate, std, best, position, bankrupt=False):
     sys.stdout.write('\n')
     star = '★' if net_worth >= best else ' '
+    status = " [BANKRUPT]" if bankrupt else ""
     print(
-        f"{star} Ep {episode:3d} | {ticker:6s} | NetWorth: {currency_units}{net_worth:9.2f} "
-        f"| Pos: {currency_units}{position:8.2f} | Reward: {reward:10.2f} "
+        f"{star} Ep {episode:3d} | {ticker:6s} | {GREEN if net_worth >= INITIAL_BALANCE else RED}{currency_units}{net_worth:9.2f}{RESET}{ORANGE}{status}{RESET} "
+        f"| Pos: {GREEN if position >= 0 else RED}{currency_units}{position:8.2f}{RESET} | Reward: {reward:10.2f} "
         f"| Trades: {trades:4d} | WR: {win_rate:.1%} | Std: {std:.3f}",
         flush=True
     )
@@ -69,18 +74,25 @@ LOG_PATH         = f"{BASE_PATH}/logs/training_log.csv"
 
 # $ , ₹, €
 currency_units = "₹"  # use symbol corresponding to currency
-TICKERS        = ["RELIANCE.NS"]   
+TICKERS        = ["RELIANCE.NS" , "TCS.NS", "ICICIBANK.NS", "HINDUNILVR.NS", "LT.NS"]   
 START_DATE     = "2015-01-01"
 END_DATE       = "2025-01-01"
 WINDOW_SIZE    = 10
-EPISODES       = 50
+EPISODES       = 25
 SAVE_EVERY     = 10
+TERMINAL_PRINTER = 10
 # do update initial balance in env.py
 INITIAL_BALANCE = 10000
 
-CNN_FLAT_SIZE  = 128
-STATE_SIZE     = 64 + CNN_FLAT_SIZE + 64 + 3   
+CNN_FLAT_SIZE = 128
 FUSED_STATE_SIZE = 67
+
+
+# styling the things
+RED = "\033[91m"
+GREEN = "\033[92m"
+ORANGE = "\033[38;5;208m"
+RESET = "\033[0m"
 
 print("Loading data for all tickers...")
 datasets = {}
@@ -112,7 +124,7 @@ fusion    = FusionLayers(
     nlp_hidden_size=64,
     hidden_size=64
 )
-# better than before but still not great. The agent can learn some patterns but struggles to consistently outperform the baseline.
+
 agent = PPOAgent(
     state_size=FUSED_STATE_SIZE,
     action_size=2,
@@ -126,6 +138,7 @@ agent = PPOAgent(
 
 
 load_model(agent, CHECKPOINT_PATH)
+# load_model(agent, BEST_MODEL_PATH)
 
 
 extractor_param_count = len(agent._extractor_parameters())
@@ -135,6 +148,7 @@ print(f"Extractor optimizer: {'active' if agent.extractor_optimizer else 'NONE'}
 best_net_worth = load_best_net_worth(LOG_PATH, INITIAL_BALANCE)
 print(f"Resuming with best net worth: {currency_units}{best_net_worth:.2f}")
 print(f"Starting training for {EPISODES} episodes...\n")
+
 for episode in range(1, EPISODES + 1):
     ticker = random.choice(list(datasets.keys()))
     X, y, prices = datasets[ticker]
@@ -153,19 +167,23 @@ for episode in range(1, EPISODES + 1):
     num_trades      = 0
     winning_trades  = 0
     episode_net_worths = [INITIAL_BALANCE]
- 
+    episode_bankrupt = False
+
     while not done:
         action = agent.select_action(state)
-        next_state, reward, done = env.step(action)
+        next_state, reward, done, info = env.step(action)
         agent.rewards.append(reward)
  
+        if info.get('is_bankrupt', False):
+            episode_bankrupt = True
+
         if env.last_trade_pnl is not None:
             num_trades += 1
             if env.last_trade_pnl > 0:
                 winning_trades += 1
             env.last_trade_pnl = None   
  
-        if env.current_step % 25 == 0:
+        if env.current_step % TERMINAL_PRINTER == 0:
             price_idx = min(env.current_step - 1, env.total_steps - 1)
             print_step(episode, ticker, env.current_step,
                        env.total_steps, env.net_worth,
@@ -176,6 +194,7 @@ for episode in range(1, EPISODES + 1):
  
         if next_state is not None:
             state = next_state
+
     agent.update()
  
     final_net_worth = env.net_worth
@@ -194,11 +213,12 @@ for episode in range(1, EPISODES + 1):
         'max_drawdown':  round(max_drawdown, 4),
         'std':           round(agent.std, 4),
         'new_best':      is_new_best,
+        'is_bankrupt':   episode_bankrupt,
     }
     save_log(log_data, LOG_PATH)
  
     print_episode(episode, ticker, final_net_worth, total_reward,
-                  num_trades, win_rate, agent.std, best_net_worth, env.position)
+                  num_trades, win_rate, agent.std, best_net_worth, env.position, episode_bankrupt)
  
     if is_new_best:
         best_net_worth = final_net_worth
@@ -213,4 +233,3 @@ for episode in range(1, EPISODES + 1):
 print(f"\nTraining complete.")
 print(f"Best Net Worth achieved: {currency_units}{best_net_worth:.2f}")
 print(f"Best model saved to:     {BEST_MODEL_PATH}")
- 

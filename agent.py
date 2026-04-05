@@ -11,25 +11,69 @@ import numpy as np
 from engine import Tensor
 from Neural_Nets import LayerNorm, Dropout, Linear, Adam_Optimiser
 
+#normalizes reward
+class RunningMeanStd:
+    """Welford online algorithm for running mean and variance.
+
+    FIX (issue 4): a `min_samples` threshold prevents the normalizer from
+    being applied during the first few episodes when the variance estimate is
+    essentially noise.  Before that threshold is reached, `normalize` returns
+    the input unchanged so early gradients are not scaled by an unreliable
+    estimate.
+    """
+
+    def __init__(self, epsilon: float = 1e-4, min_samples: int = 200):
+        self.mean        = 0.0
+        self.var         = 1.0
+        self.count       = epsilon# small seed so variance is never exactly 0
+        self.min_samples = min_samples
+
+    def update(self, x: np.ndarray) -> None:
+        batch_mean  = float(np.mean(x))
+        batch_var   = float(np.var(x))
+        batch_count = len(x)
+
+        total_count = self.count + batch_count
+        delta       = batch_mean - self.mean
+
+        self.mean  += delta * batch_count / total_count
+        m_a         = self.var * self.count
+        m_b         = batch_var * batch_count
+        M2          = m_a + m_b + delta ** 2 * self.count * batch_count / total_count
+        self.var    = M2 / total_count
+        self.count  = total_count
+
+    def normalize(self, x: np.ndarray) -> np.ndarray:
+        #we skip normalization until we have enough samples for a stable estimate
+        if self.count < self.min_samples:
+            return x
+        return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
+
 
 class PPOAgent:
     def __init__(self, state_size=67, action_size=2,
                  lstm=None, attention=None, cnn=None, flatten=None,
                  regime=None, fusion=None):
 
-        # hyperparams
-        self.gamma = 0.99
-        self.epsilon = 0.2 # increases stability but can slow learning
-        self.epochs = 5 # increases training time but can improve stability
-        self.std = 0.3
-        self.std_min = 0.02
-        self.std_decay = 0.997
+        self.gamma      = 0.98
+        self.epsilon    = 0.18    # clip ratio — increases stability, can slow learning
+        self.epochs     = 5      # update epochs per rollout
+        self.std        = 0.5    # initial exploration noise
+        self.std_min    = 0.02
+        self.std_decay  = 0.997
 
-        self.states = []
-        self.actions = []
-        self.rewards = []
+        # rewards for exploration and risk management  tuned to be in the same range as typical net worth changes per step, so they can influence the policy without overwhelming the signal from actual profits/losses.
+        self.entropy_coef = 0.01
+
+        self.value_clip = 1.0 # prevents excessive value function updates that can destabilize training, tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.
+
+        self.states    = []
+        self.actions   = []
+        self.rewards   = []
         self.log_probs = []
-        self.values = []
+        self.values    = []
+
+        self.return_rms = RunningMeanStd()
 
         self.lstm      = lstm
         self.attention = attention
@@ -55,18 +99,19 @@ class PPOAgent:
         self.critic_out   = Linear(32, 1)
 
         head_params = (
-            self.actor_l1.parameters()    + self.actor_norm1.parameters() +
-            self.actor_l2.parameters()    + self.actor_norm2.parameters() +
-            self.actor_out.parameters()   +
-            self.critic_l1.parameters()   + self.critic_norm1.parameters() +
-            self.critic_l2.parameters()   + self.critic_norm2.parameters() +
+            self.actor_l1.parameters()  + self.actor_norm1.parameters() +
+            self.actor_l2.parameters()  + self.actor_norm2.parameters() +
+            self.actor_out.parameters() +
+            self.critic_l1.parameters() + self.critic_norm1.parameters() +
+            self.critic_l2.parameters() + self.critic_norm2.parameters() +
             self.critic_out.parameters()
         )
         extractor_params = self._extractor_parameters()
 
-        self.optimizer           = Adam_Optimiser(head_params,       lr=3e-4)
-        self.extractor_optimizer = Adam_Optimiser(extractor_params,  lr=1e-4) \
-                                   if extractor_params else None
+        self.optimizer = Adam_Optimiser(head_params, lr=3e-4)
+        self.extractor_optimizer = (
+            Adam_Optimiser(extractor_params, lr=5e-5) if extractor_params else None
+        )
 
 
     def _set_train_mode(self, mode: bool):
@@ -93,20 +138,22 @@ class PPOAgent:
         return self.critic_out(v)
 
     def _log_prob(self, action_val, mean_val):
+        """Gaussian log-probability (constant terms omitted — they cancel in ratio)."""
         return -0.5 * ((action_val - mean_val) / (self.std + 1e-8)) ** 2
+
 
     def select_action(self, state):
         self._set_train_mode(False)
 
         out = self._actor_forward(state)
         direction_mean = float(out[0].tanh().data)
-        size_mean = float(out[1].sigmoid().data)
+        size_mean      = float(out[1].sigmoid().data)
 
         direction = np.clip(direction_mean + np.random.normal(0, self.std), -1, 1)
-        size = np.clip(size_mean + np.random.normal(0, self.std), 0, 1)
+        size      = np.clip(size_mean      + np.random.normal(0, self.std),  0, 1)
 
-        log_prob = self._log_prob(direction, direction_mean) + \
-                   self._log_prob(size, size_mean)
+        log_prob = (self._log_prob(direction, direction_mean) +
+                    self._log_prob(size,      size_mean))
 
         value = float(self._critic_forward(state).data.flat[0])
 
@@ -119,27 +166,31 @@ class PPOAgent:
 
 
     def compute_returns(self, next_value=0.0):
+        """Discount rewards into returns.  No normalization here — that is
+        done externally in update() AFTER discounting so the temporal
+        structure is preserved (fix for issue 3)."""
         R = float(next_value)
         returns = []
         for r in reversed(self.rewards):
             R = float(r) + self.gamma * R
             returns.insert(0, R)
-        returns = np.array(returns, dtype=np.float64)
-        if len(returns) > 1:
-            returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-        return returns
+        return np.array(returns, dtype=np.float64)
 
     def update(self):
         if not self.states:
             return
 
-        states = self.states
-        actions = self.actions
+        states        = self.states
+        actions       = self.actions
         old_log_probs = np.array(self.log_probs, dtype=np.float64)
+        old_values    = np.array(self.values,    dtype=np.float64)
 
         returns = self.compute_returns(next_value=0.0)
-        advantages = returns - np.array(self.values, dtype=np.float64)
+        if len(returns) > 1:
+            self.return_rms.update(returns)
+            returns = self.return_rms.normalize(returns)
 
+        advantages = returns - old_values
         if len(advantages) > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
@@ -148,27 +199,53 @@ class PPOAgent:
         for _ in range(self.epochs):
             indices = np.random.permutation(len(states))
             for i in indices:
-                state = states[i]
-                action = actions[i]
+                state     = states[i]
+                action    = actions[i]
                 old_log_p = float(old_log_probs[i])
-                adv = float(advantages[i])
-                ret = float(returns[i])
+                adv       = float(advantages[i])
+                ret       = float(returns[i])
 
-                out = self._actor_forward(state)
+                out            = self._actor_forward(state)
                 direction_mean = out[0].tanh()
-                size_mean = out[1].sigmoid()
+                size_mean      = out[1].sigmoid()
 
-                new_log_p = (self._log_prob(action[0], float(direction_mean.data)) +
-                             self._log_prob(action[1], float(size_mean.data)))
-                ratio = np.exp(float(new_log_p) - old_log_p)
+                diff_dir  = Tensor(np.array([action[0]])) - direction_mean
+                diff_size = Tensor(np.array([action[1]])) - size_mean
+                inv_std2  = Tensor(np.array([1.0 / (self.std + 1e-8) ** 2]))
+                new_log_p_tensor = (
+                    Tensor(np.array([-0.5])) * diff_dir  * diff_dir  * inv_std2 +
+                    Tensor(np.array([-0.5])) * diff_size * diff_size * inv_std2
+                )
+                new_log_p = float(new_log_p_tensor.data.flat[0])
+
+                ratio         = np.exp(new_log_p - old_log_p)
                 clipped_ratio = np.clip(ratio, 1 - self.epsilon, 1 + self.epsilon)
+                surr          = min(ratio * adv, clipped_ratio * adv)
 
-                surr = min(ratio * adv, clipped_ratio * adv)
-                actor_loss = Tensor(np.array([-surr]))
+                actor_loss = (
+                    Tensor(np.array([-surr])) -
+                    Tensor(np.array([self.entropy_coef])) * new_log_p_tensor
+                )
 
-                new_value = self._critic_forward(state)
-                ret_tensor = Tensor(np.array([ret]))
-                critic_loss = (ret_tensor - new_value) ** 2
+                new_value   = self._critic_forward(state)
+                new_value_f = float(new_value.data.flat[0])
+                old_value_f = float(old_values[i])
+                ret_tensor  = Tensor(np.array([ret]))
+
+                critic_loss_unclipped_f = (ret - new_value_f) ** 2
+                value_clipped_f = np.clip(
+                    new_value_f,
+                    old_value_f - self.value_clip,
+                    old_value_f + self.value_clip,
+                )
+                critic_loss_clipped_f = (ret - value_clipped_f) ** 2
+
+                if critic_loss_clipped_f >= critic_loss_unclipped_f:
+                    # Clipped loss is worse  use it to prevent over-optimisation
+                    critic_loss = Tensor(np.array([critic_loss_clipped_f]))
+                else:
+                    # Normal case: gradient flows through new_value
+                    critic_loss = (ret_tensor - new_value) ** 2
 
                 loss = (actor_loss + Tensor(np.array([0.5])) * critic_loss).sum()
 
@@ -187,6 +264,9 @@ class PPOAgent:
                         np.clip(p.grad, -0.5, 0.5, out=p.grad)
                     self.extractor_optimizer.step()
 
+        # Decay exploration noise
         self.std = max(self.std_min, self.std * self.std_decay)
 
-        self.states, self.actions, self.rewards, self.log_probs, self.values = [], [], [], [], []
+        # Clear rollout buffers
+        self.states, self.actions, self.rewards, self.log_probs, self.values = \
+            [], [], [], [], []
