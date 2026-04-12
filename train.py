@@ -74,13 +74,14 @@ LOG_PATH         = f"{BASE_PATH}/logs/training_log.csv"
 
 # $ , ₹, €
 currency_units = "₹"  # use symbol corresponding to currency
-TICKERS        = ["RELIANCE.NS" , "TCS.NS", "ICICIBANK.NS", "HINDUNILVR.NS", "LT.NS"]   
+TICKERS        = ["ICICIBANK.NS","HINDUNILVR.NS"]   
+# , "TCS.NS",, ,  "LT.NS""RELIANCE.NS" 
 START_DATE     = "2015-01-01"
 END_DATE       = "2025-01-01"
 WINDOW_SIZE    = 10
-EPISODES       = 25
+EPISODES       = 20
 SAVE_EVERY     = 10
-TERMINAL_PRINTER = 10
+TERMINAL_PRINTER = 25
 # do update initial balance in env.py
 INITIAL_BALANCE = 10000
 
@@ -91,7 +92,7 @@ FUSED_STATE_SIZE = 67
 # styling the things
 RED = "\033[91m"
 GREEN = "\033[92m"
-ORANGE = "\033[38;5;208m"
+ORANGE = "\033[33m"
 RESET = "\033[0m"
 
 print("Loading data for all tickers...")

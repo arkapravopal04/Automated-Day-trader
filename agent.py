@@ -55,17 +55,17 @@ class PPOAgent:
                  lstm=None, attention=None, cnn=None, flatten=None,
                  regime=None, fusion=None):
 
-        self.gamma      = 0.98
-        self.epsilon    = 0.18    # clip ratio — increases stability, can slow learning
+        self.gamma      = 0.99
+        self.epsilon    = 0.2    # clip ratio — increases stability, can slow learning
         self.epochs     = 5      # update epochs per rollout
-        self.std        = 0.5    # initial exploration noise
-        self.std_min    = 0.02
-        self.std_decay  = 0.997
+        self.std        = 0.20    # initial exploration noise
+        self.std_min    = 0.05
+        self.std_decay  = 0.998
 
         # rewards for exploration and risk management  tuned to be in the same range as typical net worth changes per step, so they can influence the policy without overwhelming the signal from actual profits/losses.
-        self.entropy_coef = 0.01
+        self.entropy_coef = 0.005
 
-        self.value_clip = 1.0 # prevents excessive value function updates that can destabilize training, tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.
+        self.value_clip = 0.5 # prevents excessive value function updates that can destabilize training, tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.
 
         self.states    = []
         self.actions   = []
@@ -110,7 +110,7 @@ class PPOAgent:
 
         self.optimizer = Adam_Optimiser(head_params, lr=3e-4)
         self.extractor_optimizer = (
-            Adam_Optimiser(extractor_params, lr=5e-5) if extractor_params else None
+            Adam_Optimiser(extractor_params, lr=1e-4) if extractor_params else None
         )
 
 

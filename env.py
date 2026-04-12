@@ -8,13 +8,13 @@ from engine import Tensor
 from Neural_Nets import LSTM, Conv2D, Flatten, Linear, Attention, FusionLayers, RegimeDetector
 from nlp import NLPEncoder
 
-TRADE_THRESHOLD = 0.6   # direction must exceed this to open / flip
-NEUTRAL_ZONE    = 0.4   # direction below this triggers a close
-R_TRADE_SCALE   = 10.0   #tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.  At 10.0 (10× original) the agent learned to make profitable trades but was less consistent and more prone to large drawdowns, likely because the strong reward signal encouraged riskier behavior.  5.0 seems to strike a better balance between rewarding good trades and encouraging more cautious risk management.
+TRADE_THRESHOLD = 0.51   # direction must exceed this to open / flip
+NEUTRAL_ZONE    = 0.30   # direction below this triggers a close
+R_TRADE_SCALE   = 8.0   #tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.  At 10.0 (10× original) the agent learned to make profitable trades but was less consistent and more prone to large drawdowns, likely because the strong reward signal encouraged riskier behavior.  5.0 seems to strike a better balance between rewarding good trades and encouraging more cautious risk management.
 R_STEP_SCALE    = 3.0  # encourages the agent to manage open positions effectively, tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.
 R_IDLE_PENALTY  = 0.005 # small penalty for taking no action, encourages the agent to trade and learn from the environment rather than sitting idle.  Tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.
-R_STRESS_SCALE  = 2.5   # net worth stress penalty scale — increases as net worth approaches the death threshold, encouraging the agent to take more risk to escape drawdown traps but not so strong that it causes reckless behavior.  At 5.0 (5× original) the agent was more likely to take large risky trades in an attempt to escape drawdowns, which sometimes paid off but often led to faster bankruptcies.  2.0 seems to strike a better balance between encouraging recovery attempts and avoiding reckless gambles.
-R_BANKRUPT      = 10.0  # bankruptcy penalty large but not very big,  to allow recovery
+R_STRESS_SCALE  =1.0   # net worth stress penalty scale — increases as net worth approaches the death threshold, encouraging the agent to take more risk to escape drawdown traps but not so strong that it causes reckless behavior.  At 5.0 (5× original) the agent was more likely to take large risky trades in an attempt to escape drawdowns, which sometimes paid off but often led to faster bankruptcies.  2.0 seems to strike a better balance between encouraging recovery attempts and avoiding reckless gambles.
+R_BANKRUPT      = 12.0  # bankruptcy penalty large but not very big,  to allow recovery
 R_CLIP          = 10.0  # prevents extreme outliers that could destabilise training
 
 
@@ -30,7 +30,7 @@ class TradingEnvironment:
         self.regime = regime
         self.fusion = fusion
         self.nlp = nlp
-        self.prices = prices
+        self.prices = prices.copy().astype(np.float64)
         self.initial_balance = float(initial_balance)
         self.fee = 0.001
         self.total_steps = len(X)
@@ -45,8 +45,8 @@ class TradingEnvironment:
         self.precomputed_nlp = None
         self.current_text = "market news headline"
 
-        self.stress_threshold = 0.9 * self.initial_balance   
-        self.death_threshold  = 0.7 * self.initial_balance   
+        self.stress_threshold = 0.85 * self.initial_balance   
+        self.death_threshold  = 0.65 * self.initial_balance   
 
     @property
     def net_worth(self):
@@ -114,7 +114,7 @@ class TradingEnvironment:
 
             self.position = 0.0
             self.entry_price = 0.0
-            self.cooldown = 15
+            self.cooldown = 20
             trade_occurred = True
 
         if self.cooldown > 0:
@@ -202,7 +202,8 @@ class TradingEnvironment:
         r_f = regime_out.reshape(1, -1)
 
         fused = self.fusion(l_f, c_f, n_f, r_f)
-        f_flat = Tensor(fused.data.flatten())
+        # Stay in-graph: reshape (1,64) → (64,) without wrapping .data
+        f_flat = fused.reshape(64)
 
         # Portfolio features
         current_price = self.prices[idx]
