@@ -74,13 +74,13 @@ LOG_PATH         = f"{BASE_PATH}/logs/training_log.csv"
 
 # $ , ₹, €
 currency_units = "₹"  # use symbol corresponding to currency
-TICKERS        = ["ICICIBANK.NS","HINDUNILVR.NS"]   
-# , "TCS.NS",, ,  "LT.NS""RELIANCE.NS" 
+TICKERS = ["YESBANK.NS", "ICICIBANK.NS", "HINDUNILVR.NS", "TCS.NS", "RELIANCE.NS", "LT.NS", "ADANIPORTS.NS", "ITC.NS", "INFY.NS", "ZEEL.NS"]
+# , "TCS.NS","YESBANK.NS",, "RELIANCE.NS",  "LT.NS""RELIANCE.NS"  "ICICIBANK.NS","HINDUNILVR.NS"
 START_DATE     = "2015-01-01"
 END_DATE       = "2025-01-01"
 WINDOW_SIZE    = 10
-EPISODES       = 20
-SAVE_EVERY     = 10
+EPISODES       = 10
+SAVE_EVERY     = 5
 TERMINAL_PRINTER = 25
 # do update initial balance in env.py
 INITIAL_BALANCE = 10000
@@ -97,20 +97,25 @@ RESET = "\033[0m"
 
 print("Loading data for all tickers...")
 datasets = {}
-for ticker in TICKERS:
+for ticker in TICKERS[:]:
     try:
         raw = load_data(ticker, START_DATE, END_DATE)
+        if raw is None or len(raw) == 0:
+            raise ValueError("Empty data returned")
         transformed = transform_data(raw)
         X, y, prices = build_windows(transformed, WINDOW_SIZE, raw_data=raw)
+        if len(X) == 0:
+            raise ValueError("No windows could be built")
         datasets[ticker] = (X, y, prices)
         print(f"  {ticker}: {X.shape}")
     except Exception as e:
-        print(f"  {ticker}: failed — {e}")
- 
+        print(f"  {ticker}: failed — {e}, removing from ticker list")
+        TICKERS.remove(ticker)
+
 if not datasets:
     raise RuntimeError("No tickers loaded successfully. Aborting.")
- 
-print(f"Loaded {len(datasets)} ticker(s)\n")
+
+print(f"Loaded {len(datasets)} ticker(s): {TICKERS}\n")
 
 print("Building models...")
 lstm      = LSTM(input_size=5, hidden_size=64, num_layers=2)

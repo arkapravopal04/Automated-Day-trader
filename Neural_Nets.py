@@ -226,30 +226,28 @@ class Attention(Module):
         if isinstance(hidden_states, list):
             normed = []
             for h in hidden_states:
-                d = h.data.squeeze()   
-                normed.append(Tensor(d.reshape(-1)))   
-            h_stack = Tensor.stack(normed, axis=0)     
+                normed.append(h.reshape(-1))               # FIX: stay in graph
+            h_stack = Tensor.stack(normed, axis=0)
         else:
-            h_stack = hidden_states   
+            h_stack = hidden_states
 
-        Q = h_stack.matmul(self.W_q)   
-        K = h_stack.matmul(self.W_k)   
-        V = h_stack.matmul(self.W_v)   
+        Q = h_stack.matmul(self.W_q)
+        K = h_stack.matmul(self.W_k)
+        V = h_stack.matmul(self.W_v)
 
         d_k = Q.data.shape[-1]
-        K_T = Tensor(K.data.T)                         
-        scores = Q.matmul(K_T) * (d_k ** -0.5)         
+        K_T = K.transpose((1, 0))                          # FIX: stay in graph
+        scores = Q.matmul(K_T) * (d_k ** -0.5)
 
-        # Stable softmax
         max_val = Tensor(np.max(scores.data, axis=-1, keepdims=True))
         stable_scores = scores - max_val
         exp_scores = stable_scores.exp()
         sum_scores = exp_scores.sum(axis=-1, keepdims=True)
-        weights = exp_scores / sum_scores               
+        weights = exp_scores / sum_scores
 
-        out = weights.matmul(V)                         
+        out = weights.matmul(V)
         return out
-
+    
     def parameters(self):
         return [self.W_q, self.W_k, self.W_v]
 
@@ -269,23 +267,18 @@ class FusionLayers(Module):
         self.regime_norm = LayerNorm(hidden_size)
 
         self.attention = Attention(hidden_size)
-
+        
     def forward(self, lstm_out, cnn_out, nlp_out, regime_out):
-        """
-        All inputs are expected as (1, dim) 2-D row vectors.
-        env._get_state() is responsible for preparing them in that shape.
-        """
-        # avoiding constantlly using the same variable again and again
-        lstm_hidden   = self.lstm_norm(self.lstm_proj(lstm_out))       
-        cnn_hidden    = self.cnn_norm(self.cnn_proj(cnn_out))          
-        nlp_hidden    = self.nlp_norm(self.nlp_proj(nlp_out))       
-        exp_r = regime_out.exp()
-        regime_probs  = Tensor((exp_r / exp_r.sum()).data)         
-        regime_hidden = self.regime_norm(self.regime_proj(regime_probs)) 
-        signals = [lstm_hidden, cnn_hidden, nlp_hidden, regime_hidden]  
-        fused = self.attention(signals)
-        fused_mean = Tensor(fused.data.mean(axis=0, keepdims=True))
-        out = self.out_proj(fused_mean) 
+        lstm_hidden   = self.lstm_norm(self.lstm_proj(lstm_out))
+        cnn_hidden    = self.cnn_norm(self.cnn_proj(cnn_out))
+        nlp_hidden    = self.nlp_norm(self.nlp_proj(nlp_out))
+        exp_r         = regime_out.exp()
+        regime_probs  = exp_r / exp_r.sum()                # FIX: stay in graph
+        regime_hidden = self.regime_norm(self.regime_proj(regime_probs))
+        signals       = [lstm_hidden, cnn_hidden, nlp_hidden, regime_hidden]
+        fused         = self.attention(signals)
+        fused_mean    = fused.mean(axis=0, keepdims=True)  # FIX: stay in graph
+        out           = self.out_proj(fused_mean)
         return out
 
     def parameters(self):

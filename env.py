@@ -8,12 +8,12 @@ from engine import Tensor
 from Neural_Nets import LSTM, Conv2D, Flatten, Linear, Attention, FusionLayers, RegimeDetector
 from nlp import NLPEncoder
 
-TRADE_THRESHOLD = 0.51   # direction must exceed this to open / flip
-NEUTRAL_ZONE    = 0.30   # direction below this triggers a close
+TRADE_THRESHOLD = 0.505   # direction must exceed this to open / flip
+NEUTRAL_ZONE    = 0.10   # direction below this triggers a close
 R_TRADE_SCALE   = 8.0   #tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.  At 10.0 (10× original) the agent learned to make profitable trades but was less consistent and more prone to large drawdowns, likely because the strong reward signal encouraged riskier behavior.  5.0 seems to strike a better balance between rewarding good trades and encouraging more cautious risk management.
 R_STEP_SCALE    = 3.0  # encourages the agent to manage open positions effectively, tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.
 R_IDLE_PENALTY  = 0.005 # small penalty for taking no action, encourages the agent to trade and learn from the environment rather than sitting idle.  Tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.
-R_STRESS_SCALE  =1.0   # net worth stress penalty scale — increases as net worth approaches the death threshold, encouraging the agent to take more risk to escape drawdown traps but not so strong that it causes reckless behavior.  At 5.0 (5× original) the agent was more likely to take large risky trades in an attempt to escape drawdowns, which sometimes paid off but often led to faster bankruptcies.  2.0 seems to strike a better balance between encouraging recovery attempts and avoiding reckless gambles.
+R_STRESS_SCALE  =2.0   # net worth stress penalty scale — increases as net worth approaches the death threshold, encouraging the agent to take more risk to escape drawdown traps but not so strong that it causes reckless behavior.  At 5.0 (5× original) the agent was more likely to take large risky trades in an attempt to escape drawdowns, which sometimes paid off but often led to faster bankruptcies.  2.0 seems to strike a better balance between encouraging recovery attempts and avoiding reckless gambles.
 R_BANKRUPT      = 12.0  # bankruptcy penalty large but not very big,  to allow recovery
 R_CLIP          = 10.0  # prevents extreme outliers that could destabilise training
 
@@ -78,7 +78,7 @@ class TradingEnvironment:
             self.prices = self.prices / first_price * 100.0
 
         return self._get_state()
-
+    
     def step(self, action):
         direction = float(action[0])
         size = float(np.clip(action[1], 0.0, 1.0))
@@ -114,14 +114,13 @@ class TradingEnvironment:
 
             self.position = 0.0
             self.entry_price = 0.0
-            self.cooldown = 20
+            self.cooldown = 8
             trade_occurred = True
 
         if self.cooldown > 0:
             self.cooldown -= 1
         elif self.position == 0 and abs(direction) >= TRADE_THRESHOLD and size > 0.01:
             investment = self.balance * size
-            # check this again
             if investment > 10.0:
                 effective_investment = investment * (1.0 - self.fee)
                 self.entry_price = current_price
@@ -138,9 +137,16 @@ class TradingEnvironment:
         elif not trade_occurred:
             reward -= R_IDLE_PENALTY
 
-        self.current_step += 1
+        # DATA LEAK FIX: compute net worth using current_price BEFORE incrementing step
+        if self.position == 0 or self.entry_price == 0:
+            current_net_worth = self.balance
+        elif self.position > 0:
+            current_net_worth = self.balance + self.position * (current_price / self.entry_price)
+        else:
+            price_ratio = (current_price - self.entry_price) / self.entry_price
+            current_net_worth = self.balance + abs(self.position) * (1.0 - price_ratio)
 
-        current_net_worth = self.net_worth
+        self.current_step += 1  # increment AFTER net worth is computed
 
         if current_net_worth < self.stress_threshold:
             danger_factor = (self.stress_threshold - current_net_worth) / (
@@ -170,7 +176,6 @@ class TradingEnvironment:
         next_state = self._get_state() if not done else None
 
         return next_state, reward, done, info
-
     def _get_state(self):
         idx = min(self.current_step, self.total_steps - 1)
         sample_data = self.X[idx].astype(np.float64)

@@ -58,9 +58,9 @@ class PPOAgent:
         self.gamma      = 0.99
         self.epsilon    = 0.2    # clip ratio — increases stability, can slow learning
         self.epochs     = 5      # update epochs per rollout
-        self.std        = 0.20    # initial exploration noise
+        self.std        = 0.30  # initial exploration noise
         self.std_min    = 0.05
-        self.std_decay  = 0.998
+        self.std_decay  = 0.999
 
         # rewards for exploration and risk management  tuned to be in the same range as typical net worth changes per step, so they can influence the policy without overwhelming the signal from actual profits/losses.
         self.entropy_coef = 0.005
