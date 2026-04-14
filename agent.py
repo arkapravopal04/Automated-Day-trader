@@ -249,11 +249,18 @@ class PPOAgent:
 
                 loss = (actor_loss + Tensor(np.array([0.5])) * critic_loss).sum()
 
+                if not np.isfinite(loss.data).all():
+                    self.optimizer.zero_grad()
+                    if self.extractor_optimizer:
+                        self.extractor_optimizer.zero_grad()
+                    continue  # skip this sample, don't corrupt weights
+
                 self.optimizer.zero_grad()
                 if self.extractor_optimizer:
                     self.extractor_optimizer.zero_grad()
 
                 loss.backward()
+
 
                 for p in self.optimizer.parameters:
                     np.clip(p.grad, -1.0, 1.0, out=p.grad)

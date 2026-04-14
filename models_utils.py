@@ -25,6 +25,16 @@ def _extractor_weights(agent):
 
 
 def save_model(agent, filepath):
+    # sanity check before saving
+    for name, module in [('lstm', agent.lstm), ('cnn', agent.cnn),
+                         ('fusion', agent.fusion), ('regime', agent.regime)]:
+        if module is None:
+            continue
+        for p in module.parameters():
+            if not np.isfinite(p.data).all():
+                print(f"  [WARNING] NaN/inf detected in {name} — skipping save to protect checkpoint")
+                return False
+
     os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
     weights = {
         # actor

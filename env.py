@@ -8,12 +8,12 @@ from engine import Tensor
 from Neural_Nets import LSTM, Conv2D, Flatten, Linear, Attention, FusionLayers, RegimeDetector
 from nlp import NLPEncoder
 
-TRADE_THRESHOLD = 0.505   # direction must exceed this to open / flip
-NEUTRAL_ZONE    = 0.10   # direction below this triggers a close
-R_TRADE_SCALE   = 8.0   #tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.  At 10.0 (10× original) the agent learned to make profitable trades but was less consistent and more prone to large drawdowns, likely because the strong reward signal encouraged riskier behavior.  5.0 seems to strike a better balance between rewarding good trades and encouraging more cautious risk management.
-R_STEP_SCALE    = 3.0  # encourages the agent to manage open positions effectively, tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.
-R_IDLE_PENALTY  = 0.005 # small penalty for taking no action, encourages the agent to trade and learn from the environment rather than sitting idle.  Tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.
-R_STRESS_SCALE  =2.0   # net worth stress penalty scale — increases as net worth approaches the death threshold, encouraging the agent to take more risk to escape drawdown traps but not so strong that it causes reckless behavior.  At 5.0 (5× original) the agent was more likely to take large risky trades in an attempt to escape drawdowns, which sometimes paid off but often led to faster bankruptcies.  2.0 seems to strike a better balance between encouraging recovery attempts and avoiding reckless gambles.
+TRADE_THRESHOLD = 0.501   # direction must exceed this to open / flip
+NEUTRAL_ZONE    = 0.12   # direction below this triggers a close
+R_TRADE_SCALE   = 11.0   #tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.  At 10.0 (10× original) the agent learned to make profitable trades but was less consistent and more prone to large drawdowns, likely because the strong reward signal encouraged riskier behavior.  5.0 seems to strike a better balance between rewarding good trades and encouraging more cautious risk management.
+R_STEP_SCALE    = 3.5  # encourages the agent to manage open positions effectively, tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.
+R_IDLE_PENALTY  = 0.007 # small penalty for taking no action, encourages the agent to trade and learn from the environment rather than sitting idle.  Tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.
+R_STRESS_SCALE  =1.5   # net worth stress penalty scale — increases as net worth approaches the death threshold, encouraging the agent to take more risk to escape drawdown traps but not so strong that it causes reckless behavior.  At 5.0 (5× original) the agent was more likely to take large risky trades in an attempt to escape drawdowns, which sometimes paid off but often led to faster bankruptcies.  2.0 seems to strike a better balance between encouraging recovery attempts and avoiding reckless gambles.
 R_BANKRUPT      = 12.0  # bankruptcy penalty large but not very big,  to allow recovery
 R_CLIP          = 10.0  # prevents extreme outliers that could destabilise training
 
@@ -176,9 +176,14 @@ class TradingEnvironment:
         next_state = self._get_state() if not done else None
 
         return next_state, reward, done, info
+    
     def _get_state(self):
         idx = min(self.current_step, self.total_steps - 1)
         sample_data = self.X[idx].astype(np.float64)
+
+        # Guard: replace any NaN/inf in input before feeding extractors
+        if not np.isfinite(sample_data).all():
+            sample_data = np.nan_to_num(sample_data, nan=0.0, posinf=0.0, neginf=0.0)
 
         sample = Tensor(sample_data)
 
