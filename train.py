@@ -75,7 +75,7 @@ LOG_PATH         = f"{BASE_PATH}/logs/training_log.csv"
 # $ , ₹, €
 currency_units = "₹"  # use symbol corresponding to currency
 TICKERS = ["YESBANK.NS", "ICICIBANK.NS", "HINDUNILVR.NS", "TCS.NS", "RELIANCE.NS", "LT.NS", "ADANIPORTS.NS", "ITC.NS", "INFY.NS", "ZEEL.NS"]
-# , "TCS.NS","YESBANK.NS",, "RELIANCE.NS",  "LT.NS""RELIANCE.NS"  "ICICIBANK.NS","HINDUNILVR.NS"
+#TICKERS = ["YESBANK.NS", "ICICIBANK.NS", "HINDUNILVR.NS", "TCS.NS", "RELIANCE.NS", "LT.NS", "ADANIPORTS.NS", "ITC.NS", "INFY.NS", "ZEEL.NS"]
 START_DATE     = "2015-01-01"
 END_DATE       = "2025-01-01"
 WINDOW_SIZE    = 10
