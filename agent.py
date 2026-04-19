@@ -59,8 +59,8 @@ class PPOAgent:
         self.epsilon    = 0.2    # clip ratio — increases stability, can slow learning
         self.epochs     = 5      # update epochs per rollout
         self.std        = 0.30  # initial exploration noise
-        self.std_min    = 0.283
-        self.std_decay  = 0.0
+        self.std_min    = 0.08
+        self.std_decay  = 0.999
 
         # rewards for exploration and risk management  tuned to be in the same range as typical net worth changes per step, so they can influence the policy without overwhelming the signal from actual profits/losses.
         self.entropy_coef = 0.01
@@ -272,7 +272,10 @@ class PPOAgent:
                     self.extractor_optimizer.step()
 
         # Decay exploration noise
-        self.std = max(self.std_min, self.std * self.std_decay)
+        if self.std * self.std_decay < 0.200:
+            self.std = max(self.std_min, self.std * self.std_decay + 0.05)
+        else:
+            self.std = max(self.std_min, self.std * self.std_decay)
         #added a small constant to prevent std from decaying too quickly at the start, which can lead to premature convergence on suboptimal policies due to insufficient exploration in the early stages of training.
         # Clear rollout buffers
         self.states, self.actions, self.rewards, self.log_probs, self.values = \

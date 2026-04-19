@@ -79,8 +79,8 @@ TICKERS = ["ICICIBANK.NS", "HINDUNILVR.NS", "TCS.NS", "RELIANCE.NS", "LT.NS", "A
 START_DATE     = "2015-01-01"
 END_DATE       = "2025-01-01"
 WINDOW_SIZE    = 10
-EPISODES       = 1
-SAVE_EVERY     = 1
+EPISODES       = 5
+SAVE_EVERY     = 5
 TERMINAL_PRINTER = 25
 # do update initial balance in env.py
 INITIAL_BALANCE = 10000

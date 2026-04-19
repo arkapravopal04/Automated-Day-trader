@@ -12,7 +12,7 @@ from nlp import NLPEncoder
 TRADE_THRESHOLD = 0.515
 NEUTRAL_ZONE    = 0.10
 R_TRADE_SCALE   = 6.0
-R_STEP_SCALE    = 1.0
+R_STEP_SCALE    = 2.5
 R_STRESS_SCALE  = 0.5
 R_BANKRUPT      = 12.0
 R_CLIP          = 10.0
@@ -50,13 +50,13 @@ class TradingEnvironment:
         self.precomputed_nlp = None
         self.current_text = "market news headline"
 
-        self.stress_threshold = 0.85 * self.initial_balance
-        self.death_threshold  = 0.65 * self.initial_balance
+        self.stress_threshold = 0.80 * self.initial_balance
+        self.death_threshold  = 0.70 * self.initial_balance
 
-#verification
-        print(f"[ENV] R_STEP_SCALE={R_STEP_SCALE} | R_TRADE_SCALE={R_TRADE_SCALE} | "
-        f"R_CLIP={R_CLIP} | R_GROWTH_SCALE={R_GROWTH_SCALE} | "
-        f"R_STRESS_SCALE={R_STRESS_SCALE}")
+# #verification
+#         print(f"[ENV] R_STEP_SCALE={R_STEP_SCALE} | R_TRADE_SCALE={R_TRADE_SCALE} | "
+#         f"R_CLIP={R_CLIP} | R_GROWTH_SCALE={R_GROWTH_SCALE} | "
+#         f"R_STRESS_SCALE={R_STRESS_SCALE}")
 
     @property
     def net_worth(self):
@@ -174,6 +174,34 @@ class TradingEnvironment:
 
         episode_end = self.current_step >= self.total_steps
         done = episode_end or survival_done
+
+
+
+        # # DEBUG — remove once bug is identified
+        # step_reward_components = {
+        #     'trade':   round(trade_pnl * trade_scale, 4) if trade_occurred and self.last_trade_pnl is not None else 0.0,
+        #     'step':    round(step_return * R_STEP_SCALE * np.sign(self.position), 4) if self.position != 0 else 0.0,
+        #     'stress':  0.0,  # filled below
+        #     'bankrupt': 0.0,
+        # }
+
+        # if current_net_worth < self.stress_threshold:
+        #     danger_factor = (self.stress_threshold - current_net_worth) / (
+        #         self.stress_threshold - self.death_threshold + 1e-8
+        #     )
+        #     danger_factor = float(np.clip(danger_factor, 0.0, 1.0))
+        #     step_reward_components['stress'] = round(-danger_factor * R_STRESS_SCALE, 4)
+
+        # if abs(reward) > 0.5:
+        #     print(f"  [REWARD DEBUG] step={self.current_step} | "
+        #           f"trade={step_reward_components['trade']} | "
+        #           f"step_r={step_reward_components['step']} | "
+        #           f"stress={step_reward_components['stress']} | "
+        #           f"total_before_clip={round(reward, 4)} | "
+        #           f"pos={round(self.position, 2)} | "
+        #           f"R_STEP_SCALE={R_STEP_SCALE}")
+            
+        # #     #debug
 
         if not np.isfinite(reward):
             reward = 0.0
