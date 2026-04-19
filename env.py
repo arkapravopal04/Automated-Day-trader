@@ -8,14 +8,17 @@ from engine import Tensor
 from Neural_Nets import LSTM, Conv2D, Flatten, Linear, Attention, FusionLayers, RegimeDetector
 from nlp import NLPEncoder
 
-TRADE_THRESHOLD = 0.501   # direction must exceed this to open / flip
-NEUTRAL_ZONE    = 0.12   # direction below this triggers a close
-R_TRADE_SCALE   = 11.0   #tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.  At 10.0 (10× original) the agent learned to make profitable trades but was less consistent and more prone to large drawdowns, likely because the strong reward signal encouraged riskier behavior.  5.0 seems to strike a better balance between rewarding good trades and encouraging more cautious risk management.
-R_STEP_SCALE    = 3.5  # encourages the agent to manage open positions effectively, tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.
-R_IDLE_PENALTY  = 0.007 # small penalty for taking no action, encourages the agent to trade and learn from the environment rather than sitting idle.  Tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.
-R_STRESS_SCALE  =1.5   # net worth stress penalty scale — increases as net worth approaches the death threshold, encouraging the agent to take more risk to escape drawdown traps but not so strong that it causes reckless behavior.  At 5.0 (5× original) the agent was more likely to take large risky trades in an attempt to escape drawdowns, which sometimes paid off but often led to faster bankruptcies.  2.0 seems to strike a better balance between encouraging recovery attempts and avoiding reckless gambles.
-R_BANKRUPT      = 12.0  # bankruptcy penalty large but not very big,  to allow recovery
-R_CLIP          = 10.0  # prevents extreme outliers that could destabilise training
+
+TRADE_THRESHOLD = 0.515
+NEUTRAL_ZONE    = 0.10
+R_TRADE_SCALE   = 6.0
+R_STEP_SCALE    = 1.0
+R_STRESS_SCALE  = 0.5
+R_BANKRUPT      = 12.0
+R_CLIP          = 10.0
+R_GROWTH_SCALE  = 10.0
+MILESTONES        = [15000, 20000, 30000, 50000]
+MILESTONE_REWARDS = [10.0,  30.0,  60.0,  80.0]
 
 
 class TradingEnvironment:
@@ -41,12 +44,19 @@ class TradingEnvironment:
         self.cooldown = 0
 
         self.last_trade_pnl = None
+        self.n_trades_this_episode = 0
+        self.milestones_crossed = set()
 
         self.precomputed_nlp = None
         self.current_text = "market news headline"
 
-        self.stress_threshold = 0.85 * self.initial_balance   
-        self.death_threshold  = 0.65 * self.initial_balance   
+        self.stress_threshold = 0.85 * self.initial_balance
+        self.death_threshold  = 0.65 * self.initial_balance
+
+#verification
+        print(f"[ENV] R_STEP_SCALE={R_STEP_SCALE} | R_TRADE_SCALE={R_TRADE_SCALE} | "
+        f"R_CLIP={R_CLIP} | R_GROWTH_SCALE={R_GROWTH_SCALE} | "
+        f"R_STRESS_SCALE={R_STRESS_SCALE}")
 
     @property
     def net_worth(self):
@@ -71,14 +81,15 @@ class TradingEnvironment:
         self.entry_price = 0.0
         self.cooldown = 0
         self.last_trade_pnl = None
+        self.n_trades_this_episode = 0
+        self.milestones_crossed = set()
 
-        #Dataleak fix 
         first_price = self.prices[0]
         if first_price > 0:
             self.prices = self.prices / first_price * 100.0
 
         return self._get_state()
-    
+
     def step(self, action):
         direction = float(action[0])
         size = float(np.clip(action[1], 0.0, 1.0))
@@ -110,12 +121,15 @@ class TradingEnvironment:
             self.balance += close_value * (1.0 - self.fee)
             self.last_trade_pnl = trade_pnl
 
-            reward += trade_pnl * R_TRADE_SCALE
+            # trade count decay — later trades in episode are worth progressively less
+            trade_scale = R_TRADE_SCALE * max(0.3, 1.0 - 0.01 * max(0, self.n_trades_this_episode - 70))
+            reward += trade_pnl * trade_scale
 
             self.position = 0.0
             self.entry_price = 0.0
-            self.cooldown = 15
+            self.cooldown = 8
             trade_occurred = True
+            self.n_trades_this_episode += 1
 
         if self.cooldown > 0:
             self.cooldown -= 1
@@ -134,8 +148,6 @@ class TradingEnvironment:
             prev_price = self.prices[max(0, self.current_step - 1)]
             step_return = np.log(current_price / (prev_price + 1e-8))
             reward += step_return * R_STEP_SCALE * np.sign(self.position)
-        elif not trade_occurred:
-            reward -= R_IDLE_PENALTY
 
         # DATA LEAK FIX: compute net worth using current_price BEFORE incrementing step
         if self.position == 0 or self.entry_price == 0:
@@ -146,7 +158,7 @@ class TradingEnvironment:
             price_ratio = (current_price - self.entry_price) / self.entry_price
             current_net_worth = self.balance + abs(self.position) * (1.0 - price_ratio)
 
-        self.current_step += 1  # increment AFTER net worth is computed
+        self.current_step += 1
 
         if current_net_worth < self.stress_threshold:
             danger_factor = (self.stress_threshold - current_net_worth) / (
@@ -160,28 +172,43 @@ class TradingEnvironment:
         if survival_done:
             reward -= R_BANKRUPT
 
-        done = self.current_step >= self.total_steps or survival_done
+        episode_end = self.current_step >= self.total_steps
+        done = episode_end or survival_done
+
+        if not np.isfinite(reward):
+            reward = 0.0
+
+        # clip step-level rewards only
+        reward = float(np.clip(reward, -R_CLIP, R_CLIP))
+
+        # milestone and terminal rewards added AFTER clip so they are never truncated
+        milestone_reward = 0.0
+        for milestone, bonus in zip(MILESTONES, MILESTONE_REWARDS):
+            if milestone not in self.milestones_crossed and current_net_worth >= milestone:
+                milestone_reward += bonus
+                self.milestones_crossed.add(milestone)
+
+        terminal_reward = 0.0
+        if episode_end and not survival_done:
+            growth = (current_net_worth / self.initial_balance) - 1.0
+            terminal_reward = R_GROWTH_SCALE * growth
+
+        reward += milestone_reward + terminal_reward
 
         info = {
             'is_bankrupt': survival_done,
             'net_worth':   current_net_worth,
         }
 
-        if not np.isfinite(reward):
-            reward = 0.0
-
-        reward = float(np.clip(reward, -R_CLIP, R_CLIP))
-
         self.balance = max(0.0, self.balance)
         next_state = self._get_state() if not done else None
 
         return next_state, reward, done, info
-    
+
     def _get_state(self):
         idx = min(self.current_step, self.total_steps - 1)
         sample_data = self.X[idx].astype(np.float64)
 
-        # Guard: replace any NaN/inf in input before feeding extractors
         if not np.isfinite(sample_data).all():
             sample_data = np.nan_to_num(sample_data, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -212,10 +239,8 @@ class TradingEnvironment:
         r_f = regime_out.reshape(1, -1)
 
         fused = self.fusion(l_f, c_f, n_f, r_f)
-        # Stay in-graph: reshape (1,64) → (64,) without wrapping .data
         f_flat = fused.reshape(64)
 
-        # Portfolio features
         current_price = self.prices[idx]
         unrealised_pnl = 0.0
         if self.position != 0 and self.entry_price != 0:

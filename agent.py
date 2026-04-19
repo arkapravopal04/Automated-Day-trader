@@ -55,17 +55,17 @@ class PPOAgent:
                  lstm=None, attention=None, cnn=None, flatten=None,
                  regime=None, fusion=None):
 
-        self.gamma      = 0.99
+        self.gamma      = 0.995
         self.epsilon    = 0.2    # clip ratio — increases stability, can slow learning
         self.epochs     = 5      # update epochs per rollout
         self.std        = 0.30  # initial exploration noise
-        self.std_min    = 0.05
-        self.std_decay  = 0.999
+        self.std_min    = 0.283
+        self.std_decay  = 0.0
 
         # rewards for exploration and risk management  tuned to be in the same range as typical net worth changes per step, so they can influence the policy without overwhelming the signal from actual profits/losses.
-        self.entropy_coef = 0.005
+        self.entropy_coef = 0.01
 
-        self.value_clip = 0.5 # prevents excessive value function updates that can destabilize training, tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.
+        self.value_clip = 0.2 # prevents excessive value function updates that can destabilize training, tuned to be in the same range as typical net worth changes per step, so it can influence the policy without overwhelming the signal from actual profits/losses.
 
         self.states    = []
         self.actions   = []
@@ -273,7 +273,28 @@ class PPOAgent:
 
         # Decay exploration noise
         self.std = max(self.std_min, self.std * self.std_decay)
-
+        #added a small constant to prevent std from decaying too quickly at the start, which can lead to premature convergence on suboptimal policies due to insufficient exploration in the early stages of training.
         # Clear rollout buffers
         self.states, self.actions, self.rewards, self.log_probs, self.values = \
             [], [], [], [], []
+        
+    def reset_critic(self):
+        """Reset critic weights only — actor and extractor weights are preserved."""
+        self.critic_l1    = Linear(self.critic_l1.W.data.shape[0], self.critic_l1.W.data.shape[1])
+        self.critic_norm1 = LayerNorm(self.critic_norm1.num_features)
+        self.critic_l2    = Linear(self.critic_l2.W.data.shape[0], self.critic_l2.W.data.shape[1])
+        self.critic_norm2 = LayerNorm(self.critic_norm2.num_features)
+        self.critic_out   = Linear(self.critic_out.W.data.shape[0], self.critic_out.W.data.shape[1])
+
+        # rebuild optimizer with fresh critic params
+        head_params = (
+            self.actor_l1.parameters()  + self.actor_norm1.parameters() +
+            self.actor_l2.parameters()  + self.actor_norm2.parameters() +
+            self.actor_out.parameters() +
+            self.critic_l1.parameters() + self.critic_norm1.parameters() +
+            self.critic_l2.parameters() + self.critic_norm2.parameters() +
+            self.critic_out.parameters()
+        )
+        self.optimizer = Adam_Optimiser(head_params, lr=3e-4)
+        print("Critic weights reset — actor and extractors preserved.")
+        

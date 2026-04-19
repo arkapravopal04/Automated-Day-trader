@@ -74,16 +74,18 @@ LOG_PATH         = f"{BASE_PATH}/logs/training_log.csv"
 
 # $ , ₹, €
 currency_units = "₹"  # use symbol corresponding to currency
-TICKERS = ["YESBANK.NS", "ICICIBANK.NS", "HINDUNILVR.NS", "TCS.NS", "RELIANCE.NS", "LT.NS", "ADANIPORTS.NS", "ITC.NS", "INFY.NS", "ZEEL.NS"]
+TICKERS = ["ICICIBANK.NS", "HINDUNILVR.NS", "TCS.NS", "RELIANCE.NS", "LT.NS", "ADANIPORTS.NS", "ITC.NS", "INFY.NS"]
 #TICKERS = ["YESBANK.NS", "ICICIBANK.NS", "HINDUNILVR.NS", "TCS.NS", "RELIANCE.NS", "LT.NS", "ADANIPORTS.NS", "ITC.NS", "INFY.NS", "ZEEL.NS"]
 START_DATE     = "2015-01-01"
 END_DATE       = "2025-01-01"
 WINDOW_SIZE    = 10
-EPISODES       = 5
-SAVE_EVERY     = 5
+EPISODES       = 1
+SAVE_EVERY     = 1
 TERMINAL_PRINTER = 25
 # do update initial balance in env.py
 INITIAL_BALANCE = 10000
+RESET_CRITIC = False 
+#remomvber to change this
 
 CNN_FLAT_SIZE = 128
 FUSED_STATE_SIZE = 67
@@ -145,6 +147,8 @@ agent = PPOAgent(
 
 load_model(agent, CHECKPOINT_PATH)
 # load_model(agent, BEST_MODEL_PATH)
+if RESET_CRITIC:
+    agent.reset_critic()
 
 
 extractor_param_count = len(agent._extractor_parameters())
@@ -210,16 +214,17 @@ for episode in range(1, EPISODES + 1):
     is_new_best = final_net_worth > best_net_worth
  
     log_data = {
-        'episode':       episode,
-        'ticker':        ticker,
-        'total_reward':  round(total_reward, 4),
-        'final_balance': round(final_net_worth, 2),
-        'num_trades':    num_trades,
-        'win_rate':      round(win_rate, 4),
-        'max_drawdown':  round(max_drawdown, 4),
-        'std':           round(agent.std, 4),
-        'new_best':      is_new_best,
-        'is_bankrupt':   episode_bankrupt,
+    'episode':       episode,
+    'ticker':        ticker,
+    'total_reward':  round(total_reward, 4),
+    'final_balance': round(final_net_worth, 2),
+    'growth_pct':    round((final_net_worth / INITIAL_BALANCE - 1) * 100, 2),
+    'num_trades':    num_trades,
+    'win_rate':      round(win_rate, 4),
+    'max_drawdown':  round(max_drawdown, 4),
+    'std':           round(agent.std, 4),
+    'new_best':      is_new_best,
+    'is_bankrupt':   episode_bankrupt,
     }
     save_log(log_data, LOG_PATH)
  
