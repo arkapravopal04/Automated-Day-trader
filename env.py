@@ -12,7 +12,7 @@ from nlp import NLPEncoder
 TRADE_THRESHOLD = 0.515
 NEUTRAL_ZONE    = 0.10
 R_TRADE_SCALE   = 6.0
-R_STEP_SCALE    = 2.5
+R_STEP_SCALE    = 1
 R_STRESS_SCALE  = 0.5
 R_BANKRUPT      = 12.0
 R_CLIP          = 10.0
@@ -75,6 +75,7 @@ class TradingEnvironment:
         return self.balance + pos_value
 
     def reset(self):
+        print(f"[ENV RESET] R_STEP_SCALE={R_STEP_SCALE} | file={__file__}")
         self.current_step = 0
         self.balance = self.initial_balance
         self.position = 0.0

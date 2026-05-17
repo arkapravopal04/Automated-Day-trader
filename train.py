@@ -16,6 +16,10 @@ from env import TradingEnvironment
 from agent import PPOAgent
 from models_utils import save_model, load_model, save_log
 
+import env as _env_check
+print(f"[IMPORT CHECK] env loaded from: {_env_check.__file__}")
+print(f"[IMPORT CHECK] R_STEP_SCALE={_env_check.R_STEP_SCALE}")
+
 def print_step(episode, ticker, step, total_steps, net_worth, position, price):
     # Show position as % of net worth so it never appears to exceed 100%
     pos_pct = (abs(position) / (net_worth + 1e-8)) * 100.0
@@ -74,12 +78,12 @@ LOG_PATH         = f"{BASE_PATH}/logs/training_log.csv"
 
 # $ , ₹, €
 currency_units = "₹"  # use symbol corresponding to currency
-TICKERS = ["ICICIBANK.NS", "HINDUNILVR.NS", "TCS.NS", "RELIANCE.NS", "LT.NS", "ADANIPORTS.NS", "ITC.NS", "INFY.NS"]
+TICKERS = ["ICICIBANK.NS", "ZEEL.NS", "TCS.NS", "LT.NS", "ADANIPORTS.NS", "ITC.NS", "INFY.NS"]
 #TICKERS = ["YESBANK.NS", "ICICIBANK.NS", "HINDUNILVR.NS", "TCS.NS", "RELIANCE.NS", "LT.NS", "ADANIPORTS.NS", "ITC.NS", "INFY.NS", "ZEEL.NS"]
 START_DATE     = "2015-01-01"
 END_DATE       = "2025-01-01"
 WINDOW_SIZE    = 10
-EPISODES       = 5
+EPISODES       = 15
 SAVE_EVERY     = 5
 TERMINAL_PRINTER = 25
 # do update initial balance in env.py

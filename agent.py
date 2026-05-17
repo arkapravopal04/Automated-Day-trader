@@ -272,7 +272,7 @@ class PPOAgent:
                     self.extractor_optimizer.step()
 
         # Decay exploration noise
-        if self.std * self.std_decay < 0.200:
+        if self.std * self.std_decay < 0.280:
             self.std = max(self.std_min, self.std * self.std_decay + 0.05)
         else:
             self.std = max(self.std_min, self.std * self.std_decay)
