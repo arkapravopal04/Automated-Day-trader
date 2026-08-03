@@ -1,0 +1,6 @@
+/.env
+/__pycache__
+/alpaca_cache
+/models
+/legacy 
+/info.txt
