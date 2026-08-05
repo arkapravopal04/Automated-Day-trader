@@ -1,0 +1,46 @@
+# =========================
+# 1. Secrets & Config
+# =========================
+.env*
+
+# =========================
+# 2. Data & Caches
+# =========================
+data/parquet/
+data/processed/
+*.parquet
+*.log
+logs/
+
+# =========================
+# 3. Model Weights & Logging
+# =========================
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.onnx
+*.bin
+checkpoints/
+wandb/
+runs/
+
+# =========================
+# 4. Python Environment & Caches
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# =========================
+# 5. OS & Editor Files
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

@@ -16,7 +16,14 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 # Make sure this script's own folder is importable (needed on Kaggle where
 # the working directory during notebook execution isn't always the script dir)
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd())
+# sys.path.append(os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd())
+
+# Get project root directory (Version_2/) instead of data/ subfolder
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if "__file__" in globals() else os.getcwd()
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from paths import RAW_DIR as DATA_DIR, is_kaggle
 from paths import RAW_DIR as DATA_DIR, is_kaggle
 
 TICKERS= [
@@ -70,6 +77,7 @@ def get_alpaca_credentials():
         script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
         candidate_paths = [
             os.path.join(os.getcwd(), ".env"),
+            os.path.join(project_root, ".env"),  # Fix: search Version_2/.env
             os.path.join(script_dir, ".env"),
         ]
 

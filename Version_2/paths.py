@@ -20,7 +20,12 @@ Override anything explicitly with environment variables:
 
 import os
 import shutil
+# import os
+# import shutil
+from dotenv import load_dotenv
 
+# Load variables from .env into os.environ
+load_dotenv()
 
 def is_kaggle() -> bool:
     """True if running inside a Kaggle Notebook/Script session."""
@@ -117,6 +122,36 @@ if TRAIN_FRAC + VAL_FRAC >= 1.0:
 
 os.makedirs(RAW_DIR, exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
+
+# --- Directional-bias mitigation (see directional_bias_fix notes) ---
+# Fraction of episodes that get price-mirrored (returns sign-flipped) so the
+# agent can't exploit "long = free money" on an inherently bullish 6-year
+# equity dataset. Decided INDEPENDENTLY per ticker/stream each episode (not
+# one global flag for the whole batch), so a single episode can have some
+# tickers mirrored and others not. 0.5 = each stream has a 50/50 chance.
+# Set to 0.0 to disable entirely.
+MIRROR_PROB = float(os.environ.get("TRADING_MIRROR_PROB", "0.5"))
+
+# Rolling-window opponent-aware diversity bonus: penalizes a persistently
+# one-sided direction history over the last DIVERSITY_WINDOW steps.
+# DIVERSITY_COEF=0.0 disables it.
+DIVERSITY_WINDOW = int(os.environ.get("TRADING_DIVERSITY_WINDOW", "50"))
+DIVERSITY_COEF = float(os.environ.get("TRADING_DIVERSITY_COEF", "0.05"))
+
+# --- Overtrading surcharge & platform fee ---
+# Extra adverse slippage applied once a stream has traded more than
+# OVERTRADE_FREE_TRADES times within the last OVERTRADE_WINDOW bars (5-min
+# bars by default, so 12 bars ~= 1 hour). Discourages churning the position
+# every step just to farm the vol-normalized step reward. Set
+# OVERTRADE_SURCHARGE_BPS=0.0 to disable.
+OVERTRADE_WINDOW = int(os.environ.get("TRADING_OVERTRADE_WINDOW", "12"))
+OVERTRADE_FREE_TRADES = int(os.environ.get("TRADING_OVERTRADE_FREE_TRADES", "3"))
+OVERTRADE_SURCHARGE_BPS = float(os.environ.get("TRADING_OVERTRADE_SURCHARGE_BPS", "3.0"))
+
+# Flat $ ticket fee charged by the broker/platform on any non-zero fill,
+# independent of size (separate from commission_bps/commission_per_share,
+# which model exchange/broker commission proper). Set to 0.0 to disable.
+PLATFORM_FEE_PER_TRADE = float(os.environ.get("TRADING_PLATFORM_FEE_PER_TRADE", "1.0"))
 
 # On Kaggle, opportunistically seed from an attached input dataset the first
 # time these directories are touched. Cheap no-op everywhere else.
