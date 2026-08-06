@@ -148,16 +148,6 @@ class RunConfig:
     checkpoint_every_n_rollouts: int = 25
     log_every_n_rollouts: int = 1
 
-    # monitoring/dashboard.py -- kept as a plain string here (not a
-    # monitoring.dashboard.DisplayMode enum) so training/config.py doesn't
-    # have to import rich/dashboard machinery just to declare a config
-    # field. "auto" | "kaggle" | "local"; monitoring.dashboard.resolve_mode()
-    # is what actually interprets it (and lets an explicit --kaggle/--local
-    # CLI flag override this value).
-    display_mode: str = "auto"
-    metrics_path: str = "metrics.jsonl"
-    dashboard_refresh_every_n_steps: int = 10
-
 
 @dataclass
 class TrainingConfig:

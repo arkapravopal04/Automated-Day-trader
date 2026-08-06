@@ -295,10 +295,6 @@ class VecTradingEnv:
         total_fees = commission + platform_fee
 
         fill = Fill(ticker_idx=0, qty=sim_fill.filled_qty, price=sim_fill.fill_price, commission=total_fees)
-        # NOTE: step_apply()'s return value (realized_delta) is captured and
-        # exposed in `info` below -- risk/kelly_sizing.py's KellySizer needs
-        # it to track closed-trade win/loss history. Don't go back to
-        # discarding it.
         realized_delta = self.portfolio.step_apply(fill)
 
         # --- update rolling trade-direction history (overtrading + diversity)
@@ -326,6 +322,7 @@ class VecTradingEnv:
 
         info = {
             "equity": equity_after,
+            "realized_delta": realized_delta,
             "cash": self.portfolio.cash.clone(),
             "position": self.portfolio.positions[:, 0].clone(),
             "realized_pnl": self.portfolio.realized_pnl.clone(),
@@ -335,7 +332,6 @@ class VecTradingEnv:
             "commission": commission,
             "platform_fee": platform_fee,
             "overtrading_factor": overtrading_factor,
-            "realized_delta": realized_delta,
             **reward_info,
         }
 

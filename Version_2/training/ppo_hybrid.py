@@ -205,79 +205,91 @@ def collect_rollout(
     reward_buf: List[torch.Tensor] = []
     done_buf: List[torch.Tensor] = []
 
-    initial_hidden = (hidden[0].clone(), hidden[1].clone())
+    initial_hidden = (hidden[0].clone().detach(), hidden[1].clone().detach())
 
-    for _ in range(T):
-        mid_price = env._current_prices()  # noqa: SLF001 -- same accessor env.step() itself uses internally
-        equity_before = env.portfolio.equity(mid_price.unsqueeze(1))
-        position_before = torch.sign(env.portfolio.positions[:, 0])
-        current_position_notional = env.portfolio.positions[:, 0] * mid_price
+    # Rollout collection never needs gradients -- only ppo_update()'s replay
+    # does. Without this, every act()/forward_features() call below builds a
+    # live autograd graph across all T steps, and initial_hidden (captured
+    # just above) stays wired into it despite the .clone(). ppo_update()'s
+    # first PPO epoch would then call .backward() through that graph and
+    # free it; the second epoch, replaying from the same initial_hidden,
+    # would hit "Trying to backward through the graph a second time" --
+    # confirmed by reproducing it before adding this no_grad wrapper. This
+    # is a distinct bug from Berserker's forward-pass-mismatch bug the
+    # module docstring warns about, but the same family: collect_rollout's
+    # graph must be fully isolated from ppo_update()'s replay graph.
+    with torch.no_grad():
+        for _ in range(T):
+            mid_price = env._current_prices()  # noqa: SLF001 -- same accessor env.step() itself uses internally
+            equity_before = env.portfolio.equity(mid_price.unsqueeze(1))
+            position_before = torch.sign(env.portfolio.positions[:, 0])
+            current_position_notional = env.portfolio.positions[:, 0] * mid_price
 
-        trunk, new_hidden = actor_critic.forward_features(obs, hidden)
-        action_sample: HybridActionSample = actor_critic.policy_head.act(trunk, deterministic=False)
-        values = actor_critic.critic_head(trunk)
-        value_selected = DualCriticHead.select(values, position_before)
+            trunk, new_hidden = actor_critic.forward_features(obs, hidden)
+            action_sample: HybridActionSample = actor_critic.policy_head.act(trunk, deterministic=False)
+            values = actor_critic.critic_head(trunk)
+            value_selected = DualCriticHead.select(values, position_before)
 
-        # --- action pipeline: normalized policy output -> raw shares/ticks -> soft cap -> hard caps -> halt
-        size_shares_uncapped = HybridPolicyHead.rescale_size(
-            action_sample.size, torch.full_like(action_sample.size, cfg.risk.max_order_shares)
-        )
-        limit_offset_ticks = HybridPolicyHead.rescale_limit_offset(
-            action_sample.limit_offset, cfg.risk.max_limit_offset_ticks
-        )
+            # --- action pipeline: normalized policy output -> raw shares/ticks -> soft cap -> hard caps -> halt
+            size_shares_uncapped = HybridPolicyHead.rescale_size(
+                action_sample.size, torch.full_like(action_sample.size, cfg.risk.max_order_shares)
+            )
+            limit_offset_ticks = HybridPolicyHead.rescale_limit_offset(
+                action_sample.limit_offset, cfg.risk.max_limit_offset_ticks
+            )
 
-        kelly_result = kelly_sizer.apply(
-            size=size_shares_uncapped,
-            direction=action_sample.direction,
-            mid_price=mid_price,
-            equity=equity_before,
-            current_position_notional=current_position_notional,
-        )
-        risk_result = risk_manager.apply(
-            direction=action_sample.direction,
-            size=kelly_result.size,
-            limit_offset=limit_offset_ticks,
-            mid_price=mid_price,
-            portfolio=env.portfolio,
-            ticker_idx=0,
-        )
-        final_direction, final_size = kill_switch.apply(risk_result.direction, risk_result.size)
+            kelly_result = kelly_sizer.apply(
+                size=size_shares_uncapped,
+                direction=action_sample.direction,
+                mid_price=mid_price,
+                equity=equity_before,
+                current_position_notional=current_position_notional,
+            )
+            risk_result = risk_manager.apply(
+                direction=action_sample.direction,
+                size=kelly_result.size,
+                limit_offset=limit_offset_ticks,
+                mid_price=mid_price,
+                portfolio=env.portfolio,
+                ticker_idx=0,
+            )
+            final_direction, final_size = kill_switch.apply(risk_result.direction, risk_result.size)
 
-        step_result: StepResult = env.step(
-            direction=final_direction, size=final_size, limit_offset=risk_result.limit_offset
-        )
+            step_result: StepResult = env.step(
+                direction=final_direction, size=final_size, limit_offset=risk_result.limit_offset
+            )
 
-        kelly_sizer.record_realized_pnl(step_result.info["realized_delta"])
-        kill_switch.check_daily_loss(step_result.info["equity"])
+            kelly_sizer.record_realized_pnl(step_result.info["realized_delta"])
+            kill_switch.check_daily_loss(step_result.info["equity"])
 
-        step_return = step_result.info["step_pnl"] / equity_before.clamp(min=1e-6)
-        dsr_reward = reward_shaper.step(step_return)
-        shaped_reward = cfg.reward.sharpe_weight * dsr_reward + cfg.reward.raw_weight * step_result.reward
+            step_return = step_result.info["step_pnl"] / equity_before.clamp(min=1e-6)
+            dsr_reward = reward_shaper.step(step_return)
+            shaped_reward = cfg.reward.sharpe_weight * dsr_reward + cfg.reward.raw_weight * step_result.reward
 
-        obs_buf.append(obs)
-        direction_idx_buf.append(action_sample.direction_idx)
-        size_buf.append(action_sample.size)
-        limit_offset_buf.append(action_sample.limit_offset)
-        log_prob_buf.append(action_sample.log_prob)
-        value_buf.append(value_selected)
-        position_before_buf.append(position_before)
-        reward_buf.append(shaped_reward)
-        done_buf.append(step_result.done)
+            obs_buf.append(obs)
+            direction_idx_buf.append(action_sample.direction_idx)
+            size_buf.append(action_sample.size)
+            limit_offset_buf.append(action_sample.limit_offset)
+            log_prob_buf.append(action_sample.log_prob)
+            value_buf.append(value_selected)
+            position_before_buf.append(position_before)
+            reward_buf.append(shaped_reward)
+            done_buf.append(step_result.done)
 
-        # NOTE: vec_trading_env.py currently signals `done` globally (the
-        # whole dataset pass ends at once, not per-stream) -- this handles
-        # the general case anyway so it keeps working if that ever changes.
-        if step_result.done.any():
-            done_mask = step_result.done
-            new_hidden = actor_critic.lstm.reset_hidden(new_hidden, done_mask)
-            kelly_sizer.reset(done_mask)
-            reward_shaper.reset(done_mask)
-            # kill_switch is deliberately NOT reset here -- a halt persists
-            # across episode boundaries until someone calls reset()
-            # explicitly (see kill_switch.py's module docstring).
+            # NOTE: vec_trading_env.py currently signals `done` globally (the
+            # whole dataset pass ends at once, not per-stream) -- this handles
+            # the general case anyway so it keeps working if that ever changes.
+            if step_result.done.any():
+                done_mask = step_result.done
+                new_hidden = actor_critic.lstm.reset_hidden(new_hidden, done_mask)
+                kelly_sizer.reset(done_mask)
+                reward_shaper.reset(done_mask)
+                # kill_switch is deliberately NOT reset here -- a halt persists
+                # across episode boundaries until someone calls reset()
+                # explicitly (see kill_switch.py's module docstring).
 
-        obs = step_result.obs
-        hidden = new_hidden
+            obs = step_result.obs
+            hidden = new_hidden
 
     buffer = RolloutBuffer(
         obs=torch.stack(obs_buf, dim=0),
