@@ -32,7 +32,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "env"))
 
 from dataset import MultiTickerRolloutDataset  # noqa: E402 -- see module docstring's assumption note
 from paths import is_kaggle
-from vec_trading_env import VecTradingEnv
+from env.vec_trading_env import VecTradingEnv
 
 from training.config import TrainingConfig
 from training.ppo_hybrid import HybridActorCritic, collect_rollout, compute_gae, ppo_update
