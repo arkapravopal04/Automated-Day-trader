@@ -124,8 +124,29 @@ class ExecutionSimulator:
         history and passing it in. If omitted, no surcharge is applied.
 
         Direction == 0 means "no order this step" -> filled_qty is 0.
+
+        CONTRACT: direction must contain only exact values in {-1, 0, 1}.
+        This is enforced here (raises ValueError on violation) rather than
+        left as a documented-but-unchecked assumption -- env_digonastics.py
+        previously only WARNed that a fractional direction (e.g. 0.7 from
+        an un-rounded policy output) gets silently treated as a continuous
+        scaling factor instead of raising. hybrid_policy.py's discrete head
+        can only ever emit exact {-1,0,1} via IDX_TO_DIRECTION, so this
+        should never trip in normal use -- it exists to catch a
+        policy/action-postprocessing bug loudly instead of letting it train
+        (or trade) on a silently wrong action semantics.
         """
         direction = direction.to(self.device).float()
+        valid_direction = torch.isclose(direction, torch.round(direction)) & (direction.abs() <= 1.0 + 1e-6)
+        if not bool(valid_direction.all()):
+            bad = direction[~valid_direction].tolist()
+            raise ValueError(
+                f"ExecutionSimulator.simulate_fill(): direction must be exactly in {{-1, 0, 1}}, "
+                f"got out-of-contract value(s) {bad}. Discretize the policy's direction head "
+                f"(e.g. torch.sign() after rounding, or an argmax/Categorical index mapped through "
+                f"IDX_TO_DIRECTION) before calling this."
+            )
+
         size = size.to(self.device).float().clamp(min=0.0)
         limit_offset = limit_offset.to(self.device).float()
         mid_price = mid_price.to(self.device).float()

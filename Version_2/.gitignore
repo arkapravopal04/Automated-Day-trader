@@ -1,46 +1,46 @@
-# =========================
-# 1. Secrets & Config
-# =========================
-.env*
+# --- Secrets ---
+.env
+*.env
+!.env.example
 
-# =========================
-# 2. Data & Caches
-# =========================
-data/parquet/
-data/processed/
-*.parquet
-*.log
-logs/
-
-# =========================
-# 3. Model Weights & Logging
-# =========================
-*.pt
-*.pth
-*.safetensors
-*.ckpt
-*.onnx
-*.bin
+# --- Runtime data (regenerated locally / on Kaggle, never committed) ---
+data/
 checkpoints/
-wandb/
-runs/
+logs/
+backtest_output/
+backtest_output_*/
 
-# =========================
-# 4. Python Environment & Caches
-# =========================
+# --- Python ---
 __pycache__/
 *.py[cod]
 *$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual environments ---
 venv/
 .venv/
-.pytest_cache/
-.ipynb_checkpoints/
+env/bin/
+env/lib/
+env/pyvenv.cfg
 
-# =========================
-# 5. OS & Editor Files
-# =========================
+# --- Jupyter / Kaggle notebooks ---
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# --- OS / editor cruft ---
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# --- Model artifacts that shouldn't live in git (use Kaggle Datasets / releases instead) ---
+*.pt
+*.pth
+*.ckpt

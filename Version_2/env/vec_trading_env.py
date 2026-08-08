@@ -91,6 +91,34 @@ def load_aligned_close_prices(tickers, aligned_dates: pd.DatetimeIndex) -> np.nd
     return price_df[tickers].values.astype(np.float32)
 
 
+def load_aligned_volumes(tickers, aligned_dates: pd.DatetimeIndex) -> np.ndarray:
+    """
+    Same alignment as load_aligned_close_prices(), but for raw bar volume --
+    used as the real liquidity proxy for execution_sim.py's partial-fill
+    sizing (see _bar_liquidity_proxy() below), replacing the earlier fixed
+    1e6 placeholder.
+
+    Deliberately fillna(0), NOT ffill like price: a missing/halted bar
+    genuinely traded zero shares in that window, it did not trade "the same
+    volume as the last real bar." Zero volume correctly makes
+    max_participation * 0 = 0 fillable shares that bar in execution_sim.py,
+    which is the right behavior for a halt, not an artifact to paper over.
+
+    Returns: np.ndarray of shape [T, n_tickers], float32.
+    """
+    volumes = {}
+    for ticker in tickers:
+        path = os.path.join(RAW_DIR, f"{ticker}.parquet")
+        df = pd.read_parquet(path, columns=["volume"])
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        volumes[ticker] = df["volume"]
+
+    volume_df = pd.DataFrame(volumes)
+    volume_df = volume_df.reindex(aligned_dates).fillna(0.0)
+    return volume_df[tickers].values.astype(np.float32)
+
+
 @dataclass
 class StepResult:
     obs: torch.Tensor       # [n_envs, window, features] - next observation window
@@ -152,6 +180,12 @@ class VecTradingEnv:
         # --- Raw prices, aligned to the dataset's own date index
         prices_np = load_aligned_close_prices(self.tickers, dataset.aligned_dates)
         self.prices = torch.tensor(prices_np, device=self.device, dtype=torch.float32)  # [T, n_envs]
+
+        # --- Raw bar volume, aligned the same way -- real liquidity proxy
+        # for execution_sim.py's partial-fill sizing (see
+        # _bar_liquidity_proxy()), replacing the earlier fixed placeholder.
+        volumes_np = load_aligned_volumes(self.tickers, dataset.aligned_dates)
+        self.volumes = torch.tensor(volumes_np, device=self.device, dtype=torch.float32)  # [T, n_envs]
 
         # --- Synthetic mirrored price path per ticker: negate log-returns,
         # keep the same starting price, so a mirrored bull ticker behaves like
@@ -256,13 +290,15 @@ class VecTradingEnv:
 
     def _bar_liquidity_proxy(self) -> torch.Tensor:
         """
-        Cheap liquidity proxy without needing raw volume loaded separately:
-        uses a fixed large notional cap scaled by price so partial fills only
-        kick in for outsized orders. If you want true volume-based partial
-        fills, pass real bar volume in here instead (see docstring note in
-        execution_sim.py: bar_liquidity_proxy is meant to be bar volume).
+        Real per-bar liquidity proxy: this stream's actual traded volume for
+        the current bar (same time index _current_prices() uses), fed into
+        execution_sim.py's max_participation cap for genuine volume-based
+        partial fills. A zero-volume bar (halt/gap -- see
+        load_aligned_volumes()) correctly yields zero fillable shares that
+        step via execution_sim's max_fillable = max_participation * proxy.
         """
-        return torch.full((self.n_envs,), 1e6, device=self.device, dtype=torch.float32)
+        t = self.current_idx + self.window_size - 1
+        return self.volumes[t]  # [n_envs]
 
     def step(
         self,

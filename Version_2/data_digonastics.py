@@ -26,11 +26,11 @@ class Colors:
 
 def print_status(step: str, success: bool, message: str = ""):
     if success:
-        print(f"{Colors.OKGREEN}[PASS]{Colors.ENDC} {step}")
+        print(f"{Colors.OKGREEN}✅ [PASS]{Colors.ENDC} {step}")
         if message:
             print(f"   └─ {message}")
     else:
-        print(f"{Colors.FAIL}[FAIL]{Colors.ENDC} {step}")
+        print(f"{Colors.FAIL}❌ [FAIL]{Colors.ENDC} {step}")
         if message:
             print(f"   └─ {message}")
 

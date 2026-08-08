@@ -176,26 +176,28 @@ def run_diagnostics():
         mid = torch.tensor([100.])
         liq = torch.tensor([10_000.])
 
-        # Contract violation: a fractional direction (e.g. un-rounded policy output)
+        # Contract violation: a fractional direction (e.g. un-rounded policy output).
+        # execution_sim.py now HARD-ENFORCES direction ∈ {-1,0,1} and raises
+        # ValueError on violation (previously this silently scaled the fill
+        # by the fractional value instead — see the earlier WARN this
+        # replaced). This step confirms the raise actually happens.
         bad_direction = torch.tensor([0.7])
         clean_direction = torch.tensor([1.0])
         size = torch.tensor([100.])
         limit_offset = torch.tensor([0.])
 
-        bad_fill = sim.simulate_fill(bad_direction, size, limit_offset, mid, liq)
-        clean_fill = sim.simulate_fill(clean_direction, size, limit_offset, mid, liq)
-
-        if not torch.allclose(bad_fill.filled_qty, clean_fill.filled_qty):
-            print_warn(
-                "direction=0.7 was NOT rejected",
-                f"filled_qty became {bad_fill.filled_qty.item():.2f} instead of {clean_fill.filled_qty.item():.2f} "
-                f"(scaled by the fractional direction instead of erroring). "
-                f"Your policy's direction head MUST discretize to exactly {{-1, 0, 1}} "
-                f"(e.g. torch.sign() after a tanh, or argmax over a 3-way Categorical) "
-                f"before calling env.step() — this simulator does not validate that for you."
+        try:
+            sim.simulate_fill(bad_direction, size, limit_offset, mid, liq)
+            print_status(
+                "Fractional direction rejected", False,
+                "direction=0.7 was silently accepted instead of raising -- the contract enforcement regressed."
             )
-        else:
-            print_status("Fractional direction handled safely", True)
+        except ValueError:
+            print_status("Fractional direction correctly rejected (raises ValueError)", True)
+
+        clean_fill = sim.simulate_fill(clean_direction, size, limit_offset, mid, liq)
+        assert clean_fill.filled_qty.item() > 0, "a valid direction should still fill normally"
+        print_status("Valid direction still fills normally after the contract check", True)
 
         # Negative size should be clamped, not produce a negative fill
         neg_size_fill = sim.simulate_fill(torch.tensor([1.0]), torch.tensor([-50.]), limit_offset, mid, liq)
@@ -249,22 +251,25 @@ def run_diagnostics():
                          f"{n_steps} steps, obs_shape={tuple(obs.shape)}, "
                          f"final equity={result.info['equity'].tolist()}")
 
-            # Same rollout but with a fractional/malformed direction, to confirm the
-            # earlier WARN in step [4/6] also manifests at the full-env level.
+            # Same rollout but with a fractional/malformed direction, to confirm
+            # the hardened contract from step [4/6] also propagates up through
+            # VecTradingEnv.step() -> ExecutionSimulator.simulate_fill(), not
+            # just when execution_sim.py is called directly.
             ds2 = MultiTickerRolloutDataset(window_size=20, split='train', device=device)
             env2 = VecTradingEnv(ds2, initial_cash=10_000.0)
             env2.reset()
             bad_direction = torch.full((env2.n_envs,), 0.35)
             size = torch.full((env2.n_envs,), 10.0)
             limit_offset = torch.zeros(env2.n_envs)
-            bad_result = env2.step(bad_direction, size, limit_offset)
-            if not torch.allclose(bad_result.info["position"], torch.full((env2.n_envs,), 3.5)):
-                print_status("Malformed direction rejected at full-env level", True)
-            else:
-                print_warn("Malformed direction silently accepted at full-env level",
-                            "Confirmed: VecTradingEnv.step() does not itself validate the "
-                            "direction ∈ {-1,0,1} contract. Enforce discretization in your "
-                            "policy/action-postprocessing layer before calling step().")
+            try:
+                env2.step(bad_direction, size, limit_offset)
+                print_status(
+                    "Malformed direction rejected at full-env level", False,
+                    "env2.step() silently accepted direction=0.35 instead of raising -- the contract "
+                    "enforcement isn't reaching all the way through VecTradingEnv.step()."
+                )
+            except ValueError:
+                print_status("Malformed direction correctly rejected at full-env level (raises ValueError)", True)
 
     except Exception as e:
         print_status("VecTradingEnv rollout", False, f"Unexpected error: {e}")

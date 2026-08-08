@@ -1,0 +1,7 @@
+torch
+pandas
+pyarrow
+alpaca-py
+python-dotenv
+rich
+matplotlib

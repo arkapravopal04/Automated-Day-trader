@@ -20,12 +20,7 @@ Override anything explicitly with environment variables:
 
 import os
 import shutil
-# import os
-# import shutil
-from dotenv import load_dotenv
 
-# Load variables from .env into os.environ
-load_dotenv()
 
 def is_kaggle() -> bool:
     """True if running inside a Kaggle Notebook/Script session."""
