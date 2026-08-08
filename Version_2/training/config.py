@@ -120,9 +120,32 @@ class EnvConfig:
     """Mirrors vec_trading_env.VecTradingEnv's constructor -- keep these in sync if that file's defaults change."""
 
     tickers: List[str] = field(default_factory=lambda: [
-        "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA",
-        "SPY", "QQQ", "JPM", "XOM", "UNH", "HD", "V",
-    ])  # 14 tickers -- placeholder universe, replace with your actual Alpaca list
+        # Broad ETFs (10)
+        "SPY", "QQQ", "IWM", "DIA", "XLK", "XLF", "XLE", "XLV", "XLY", "XLP",
+        # # Technology & Software (18)
+        # "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AVGO", "AMD",
+        # "QCOM", "INTC", "MU", "TXN", "ORCL", "CRM", "ADBE", "NOW", "PANW",
+        # # Financials & FinTech (15)
+        # "JPM", "BAC", "GS", "MS", "C", "WFC", "BLK", "SCHW", "V", "MA",
+        # "AXP", "PYPL", "SQ", "COIN", "BRK.B",
+        # # Healthcare & Biotechnology (14)
+        # "JNJ", "PFE", "UNH", "LLY", "ABBV", "MRK", "TMO", "ABT", "DHR",
+        # "BMY", "AMGN", "GILD", "ISRG", "VRTX",
+        # # Consumer Discretionary & Staples (15)
+        # "WMT", "COST", "PG", "KO", "PEP", "NKE", "HD", "MCD", "SBUX",
+        # "TGT", "LOW", "PM", "MO", "CL", "MDLZ",
+        # # Energy & Utilities (10)
+        # "XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "NEE", "DUK",
+        # # Industrials, Aerospace & Defense (12)
+        # "CAT", "GE", "BA", "LMT", "RTX", "HON", "DE", "UNP", "UPS",
+        # "FDX", "MMM", "GD",
+        # # Communications & Entertainment (6)
+        # "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS",
+    ])  # MUST match fetch_alpaca.py's TICKERS list. Only used by dataset.py/training
+        # indirectly (auto-discovered from metadata.json instead); but
+        # live_loop.py's LiveLoop/AlpacaBarPoller read THIS list directly
+        # (no dataset object exists in live mode) -- keep the two lists in
+        # sync manually whenever either changes, nothing enforces it automatically.
     window_size: int = 60
     initial_cash: float = 10_000.0
     max_position_frac: float = 1.0
@@ -270,6 +293,16 @@ class RunConfig:
     metrics_path: str = "logs/metrics.jsonl"
     display_mode: str = "auto"   # "auto" | "kaggle" | "local" -- see monitoring/dashboard.py's DisplayMode
     dashboard_refresh_every_n_steps: int = 10
+
+    # Best-checkpoint tracking (train.py) -- in addition to the periodic
+    # checkpoint_every_n_rollouts saves, train.py separately tracks an
+    # EMA-smoothed rollout reward and overwrites checkpoint_best.pt whenever
+    # it improves. Raw per-rollout reward (only rollout_length steps) is too
+    # noisy to compare directly -- the EMA smooths that out before deciding
+    # "best," so a single lucky rollout doesn't get crowned and overwrite a
+    # genuinely better policy from a few rollouts earlier.
+    best_metric_ema_alpha: float = 0.05          # smoothing factor: higher = reacts faster, noisier
+    best_metric_warmup_rollouts: int = 10         # don't start comparing "best" until the EMA has settled
 
 
 @dataclass

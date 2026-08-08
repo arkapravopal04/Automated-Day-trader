@@ -25,6 +25,13 @@ import sys
 
 import torch
 
+# See train.py's matching comment: force line-buffered stdout so print()
+# calls show up immediately in a Kaggle/Jupyter `!python main.py ...` cell
+# instead of sitting in CPython's default full-buffering for a piped stdout
+# until the buffer fills or the process exits (looks exactly like a hang).
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+
 # See train.py's module-level comment: vec_trading_env.py / portfolio_state.py
 # live in env/, which needs to be on sys.path before anything imports them --
 # done once, here, so it covers every subcommand (train delegates to train.py
