@@ -124,7 +124,7 @@ class EnvConfig:
         "SPY", "QQQ", "JPM", "XOM", "UNH", "HD", "V",
     ])  # 14 tickers -- placeholder universe, replace with your actual Alpaca list
     window_size: int = 60
-    initial_cash: float = 100_000.0
+    initial_cash: float = 10_000.0
     max_position_frac: float = 1.0
     tick_size: float = 0.01
     friction_level: str = "realistic"   # "low" | "realistic" | "high" -- see FRICTION_PRESETS above.
