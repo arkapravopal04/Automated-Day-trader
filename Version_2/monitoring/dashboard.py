@@ -42,6 +42,7 @@ once, here, not re-checked all over the codebase.
 """
 
 import enum
+import io
 import json
 import os
 import sys
@@ -52,6 +53,24 @@ from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
+
+# Optional, notebook-only: IPython's display_id update mechanism lets a
+# specific cell's output be replaced in place, without redrawing via ANSI
+# cursor movement. This is a DIFFERENT mechanism from Live()'s
+# auto_refresh -- it's Jupyter's own comm-protocol output update, which is
+# exactly what tqdm.notebook and similar tools use for the same reason we
+# need it here. It does not reintroduce the v1 bug this module's docstring
+# describes (that was specifically about a background thread's ANSI
+# redraws racing with stdout buffering -- there's no ANSI and no
+# background thread involved here at all).
+try:
+    from IPython.display import HTML as _IPyHTML
+    from IPython.display import display as _ipy_display
+    from IPython.display import update_display as _ipy_update_display
+    from IPython import get_ipython as _get_ipython
+    _HAS_IPYTHON = True
+except ImportError:
+    _HAS_IPYTHON = False
 
 
 # --------------------------------------------------------------------------
@@ -208,14 +227,20 @@ class TrainingDashboard:
             "dashboard crashing can't touch training" guarantee, since
             there isn't even a shared Python process to crash.
 
-    Mode differences are cosmetic ONLY (the auto_refresh=False fix in
-    __init__ applies to both):
-        LOCAL:  Live() in-place redraw -- the same table updates in place,
-                same as v1's intended experience.
-        KAGGLE: no Live() at all -- render_once() reprints a fresh
-                Table/Panel every call, appended to scrollback instead of
-                overwriting. Noisier output, but there's no redraw
-                machinery left to race against, even in principle.
+    Rendering path, chosen once at construction and never re-checked mid-run:
+        LOCAL:                   Live() in-place redraw, for a real terminal.
+        KAGGLE + real notebook:  IPython display_id in-place update -- the
+                                  actual fix for "dashboard prints a new
+                                  frame below instead of updating." Detected
+                                  via get_ipython() being non-None, which is
+                                  only true inside an actual running
+                                  IPython/Jupyter kernel (Kaggle, Colab,
+                                  local Jupyter) -- never true in a plain
+                                  `python script.py` process.
+        KAGGLE + no notebook:    falls back to the original static
+                                  print-per-frame behavior (e.g. a headless
+                                  script tailing metrics_path to a log file,
+                                  per run_polling_loop()'s own docstring).
     """
 
     def __init__(
@@ -235,6 +260,11 @@ class TrainingDashboard:
             # auto_refresh=False is the actual bug fix -- see module and
             # class docstrings. Never set this True.
             self._live = Live(console=self.console, auto_refresh=False, transient=False)
+
+        self._notebook_capable = _HAS_IPYTHON and _get_ipython() is not None
+        self._display_id = f"training_dashboard_{id(self)}"
+        self._displayed_once = False
+        self._prev_net_worth: Optional[float] = None  # for trend-coloring net worth between frames
 
     def start(self) -> None:
         if self._live is not None:
@@ -267,10 +297,32 @@ class TrainingDashboard:
         if self.mode == DisplayMode.LOCAL:
             self._live.update(renderable)
             self._live.refresh()  # explicit -- never rely on Live's own timer
+        elif self._notebook_capable:
+            # Render through a recording Console to get styled HTML (so the
+            # green/red coloring below survives into the notebook output),
+            # then push it to the SAME output slot via display_id instead of
+            # appending a new one.
+            html = self._render_html(renderable)
+            if not self._displayed_once:
+                _ipy_display(_IPyHTML(html), display_id=self._display_id)
+                self._displayed_once = True
+            else:
+                _ipy_update_display(_IPyHTML(html), display_id=self._display_id)
         else:
-            # KAGGLE (and any future non-LOCAL mode): plain static print,
-            # appended to scrollback, never redrawn in place.
+            # Headless / no notebook kernel detected: original behavior --
+            # plain static print, appended to scrollback, never redrawn in
+            # place. There's no in-place mechanism available outside a
+            # notebook without reintroducing the ANSI race.
             self.console.print(renderable)
+
+    def _render_html(self, renderable) -> str:
+        buf = io.StringIO()
+        tmp_console = Console(file=buf, record=True, width=100, force_terminal=False)
+        tmp_console.print(renderable)
+        return tmp_console.export_html(
+            inline_styles=True,
+            code_format='<pre style="white-space:pre-wrap;font-family:monospace">{code}</pre>',
+        )
 
     def run_polling_loop(self, poll_interval_seconds: float = 2.0, max_iterations: Optional[int] = None) -> None:
         """
@@ -290,12 +342,33 @@ class TrainingDashboard:
             self.stop()
 
     def _build_renderable(self, latest: Dict[str, Any], history: List[Dict[str, Any]]) -> Group:
+        reward = latest.get("reward")
+        reward_ema = latest.get("reward_ema")
+        drawdown = latest.get("drawdown")
+        net_worth = latest.get("net_worth")
+
+        # Net worth is colored by TREND (up since the last frame = green,
+        # down = red), not by an absolute threshold -- there's no fixed
+        # "good" net worth in isolation, only "did it move the right way."
+        net_worth_color = None
+        if net_worth is not None and self._prev_net_worth is not None:
+            if net_worth > self._prev_net_worth:
+                net_worth_color = "green"
+            elif net_worth < self._prev_net_worth:
+                net_worth_color = "red"
+        if net_worth is not None:
+            self._prev_net_worth = net_worth
+
         panel_lines = [
-            f"step:     {latest.get('step')}",
-            f"episode:  {latest.get('episode')}",
-            f"reward:   {_fmt(latest.get('reward'))}",
-            f"sharpe:   {_fmt(latest.get('sharpe'))}",
-            f"drawdown: {_fmt(latest.get('drawdown'), pct=True)}",
+            f"step:              {latest.get('step')}",
+            f"episode:           {latest.get('episode')}",
+            f"reward:            {_fmt_colored(reward, good_is='positive')}",
+            f"reward (EMA):      {_fmt_colored(reward_ema, good_is='positive')}",
+            f"net worth:         {_fmt_colored(net_worth, good_is=None, color=net_worth_color, dollar=True)}",
+            f"sharpe:            {_fmt(latest.get('sharpe'))}",
+            f"drawdown:          {_fmt_colored(drawdown, good_is='small_pct', pct=True)}",
+            f"trades (rollout):  {_fmt_int(latest.get('trades_this_rollout'))}",
+            f"trades (total):    {_fmt_int(latest.get('total_trades'))}",
         ]
         header = Panel("\n".join(panel_lines), title="Training Status", expand=False)
 
@@ -311,7 +384,7 @@ class TrainingDashboard:
             unrealized = latest.get("unrealized_pnl")
             unrealized = unrealized if isinstance(unrealized, list) else [None] * len(tickers)
             for ticker, pos, upnl in zip(tickers, position, unrealized):
-                table.add_row(str(ticker), _fmt(pos), _fmt(upnl))
+                table.add_row(str(ticker), _fmt(pos), _fmt_colored(upnl, good_is="positive"))
         else:
             table.add_row("(no per-ticker breakdown in this record)", "", "")
 
@@ -326,3 +399,57 @@ def _fmt(value: Any, pct: bool = False) -> str:
     except (TypeError, ValueError):
         return str(value)
     return f"{v:.2%}" if pct else f"{v:.4f}"
+
+
+def _fmt_int(value: Any) -> str:
+    if value is None:
+        return "-"
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _fmt_colored(
+    value: Any,
+    good_is: Optional[str] = "positive",
+    color: Optional[str] = None,
+    pct: bool = False,
+    dollar: bool = False,
+) -> str:
+    """
+    Wraps a formatted value in Rich color markup based on a simple,
+    explicit good/bad rule -- not a general-purpose styling system, just
+    the handful of cases this dashboard actually needs:
+
+        good_is="positive"  -> green if value >= 0, red if value < 0
+                                (reward, per-ticker unrealized PnL: up is good)
+        good_is="small_pct" -> green if value <= 0.10 (10%), red otherwise
+                                (drawdown: small is good; value is a raw
+                                fraction, e.g. 0.05 == 5%, not already *100)
+        good_is=None         -> no automatic rule; only an explicit `color`
+                                argument applies (net worth: trend-colored
+                                by the caller against the previous frame,
+                                since there's no fixed "good" net worth in
+                                isolation, only whether it moved the right way)
+
+    None or non-numeric values are never colored -- there's nothing to
+    judge. `color`, when given, always wins over the good_is rule.
+    """
+    if value is None:
+        return "-"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+    text = f"${v:,.2f}" if dollar else (f"{v:.2%}" if pct else f"{v:.4f}")
+
+    resolved_color = color
+    if resolved_color is None:
+        if good_is == "positive":
+            resolved_color = "green" if v >= 0 else "red"
+        elif good_is == "small_pct":
+            resolved_color = "green" if v <= 0.10 else "red"
+
+    return f"[{resolved_color}]{text}[/{resolved_color}]" if resolved_color else text
