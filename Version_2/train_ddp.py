@@ -168,6 +168,7 @@ def _worker(
     best_metric = float("-inf")
     ema_reward = None
     total_trades = 0
+    total_trades_per_ticker = [0] * env.n_envs
     checkpoint = None
     if resume is not None:
         # Every rank loads the SAME checkpoint onto ITS OWN device. DDP
@@ -181,6 +182,9 @@ def _worker(
         best_metric = checkpoint.get("best_metric", float("-inf"))
         ema_reward = checkpoint.get("ema_reward", None)
         total_trades = checkpoint.get("total_trades", 0)
+        saved_per_ticker = checkpoint.get("total_trades_per_ticker", None)
+        if isinstance(saved_per_ticker, list) and len(saved_per_ticker) == env.n_envs:
+            total_trades_per_ticker = saved_per_ticker
         if rank == 0:
             print(f"[train_ddp] resumed from {resume} at rollout {start_rollout} "
                   f"(best_metric so far: {best_metric if best_metric != float('-inf') else 'none yet'})")
@@ -228,9 +232,19 @@ def _worker(
         ema_reward = rollout_reward_mean if ema_reward is None else (
             alpha * rollout_reward_mean + (1 - alpha) * ema_reward
         )
-        net_worth = env.portfolio.equity(env._current_prices().unsqueeze(1)).sum().item()  # noqa: SLF001
-        trades_this_rollout = int((buffer.filled_qty != 0).sum().item())
+        current_prices_unsq = env._current_prices().unsqueeze(1)  # noqa: SLF001
+        equity_per_ticker = env.portfolio.equity(current_prices_unsq)
+        unrealized_per_ticker = env.portfolio.unrealized_pnl(current_prices_unsq)
+        peak = env.portfolio.peak_equity.clamp(min=1e-6)
+        drawdown_per_ticker = (peak - equity_per_ticker).clamp(min=0.0) / peak
+        net_worth = float(equity_per_ticker.sum().item())
+
+        trades_per_ticker_this_rollout = (buffer.filled_qty != 0).sum(dim=0).tolist()
+        trades_this_rollout = int(sum(trades_per_ticker_this_rollout))
         total_trades += trades_this_rollout
+        total_trades_per_ticker = [
+            total_trades_per_ticker[i] + trades_per_ticker_this_rollout[i] for i in range(env.n_envs)
+        ]
 
         if rank == 0 and rollout_idx % cfg.run.log_every_n_rollouts == 0:
             metrics_writer.log(
@@ -239,10 +253,15 @@ def _worker(
                 reward=rollout_reward_mean,
                 reward_ema=ema_reward,
                 sharpe=None,
-                drawdown=None,
+                drawdown=float(drawdown_per_ticker.mean().item()),
+                drawdown_per_ticker=drawdown_per_ticker.tolist(),
                 net_worth=net_worth,
+                net_worth_per_ticker=equity_per_ticker.tolist(),
+                unrealized_pnl=unrealized_per_ticker.tolist(),
                 trades_this_rollout=trades_this_rollout,
                 total_trades=total_trades,
+                trades_per_ticker_this_rollout=trades_per_ticker_this_rollout,
+                total_trades_per_ticker=total_trades_per_ticker,
                 tickers=env.tickers,
                 position=env.portfolio.positions[:, 0].tolist(),
                 world_size=world_size,  # tag records so you can tell DDP runs apart from single-GPU ones in the log
@@ -257,6 +276,7 @@ def _worker(
                 "best_metric": best_metric,
                 "ema_reward": ema_reward,
                 "total_trades": total_trades,
+                "total_trades_per_ticker": total_trades_per_ticker,
             }
             if rollout_idx % cfg.run.checkpoint_every_n_rollouts == 0:
                 path = os.path.join(cfg.run.checkpoint_dir, f"checkpoint_{rollout_idx}.pt")

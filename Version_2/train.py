@@ -5,22 +5,12 @@ Entry point for Phase 4: loads config, builds the env + model + risk
 pipeline, runs training/ppo_hybrid.py's rollout/GAE/update loop, and
 checkpoints periodically.
 
-Assumption flagged up front: this file imports `MultiTickerRolloutDataset`
-from `dataset.py`, which was never shared with the assistant that wrote
-this. The constructor call below (`MultiTickerRolloutDataset(split=...,
-tickers=..., window_size=..., device=...)`) is a best-guess against the
-attributes every other file in this project already relies on
-(window_size, n_envs, tickers, feature_names, aligned_dates, device,
-__len__, __getitem__) -- adjust the call to match your actual signature if
-it differs; nothing else here depends on the constructor's exact argument
-names.
-
 This file NEVER imports monitoring.dashboard's Rich-dependent pieces --
 only MetricsWriter, which is dependency-light and crash-isolated from
 training by design (see monitoring/dashboard.py's module docstring). If you
-want a live view while training, run
-`python main.py monitor --metrics-path <path>` in a second terminal/cell;
-that process is the one that imports Rich.
+want a live view while training, run the dashboard against the same
+metrics_path from a separate cell/process; that process is the one that
+imports Rich/IPython.
 """
 
 import argparse
@@ -30,47 +20,29 @@ from typing import List, Optional
 
 import torch
 
-# Force line-buffered stdout. When this script runs as a subprocess (e.g. a
-# Kaggle/Jupyter `!python train.py` cell), stdout is a pipe, not a real
-# terminal -- CPython fully-buffers a piped stdout by default, so every
-# print() below sits in an internal buffer and never reaches the notebook
-# cell until that buffer fills (a few KB) or the process exits. That's what
-# "no output on the terminal" during a long training run almost always is,
-# not a hang. reconfigure(line_buffering=True) forces each print() to flush
-# immediately instead, regardless of how this script is invoked. (Available
-# on Python 3.7+; the hasattr guard is defensive, not because this project
-# targets anything older.)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 
-# vec_trading_env.py / portfolio_state.py live in env/, not project root, and
-# (unlike model/, risk/, training/, eval/, monitoring/) that folder isn't a
-# dotted package import -- this project's convention treats it as a flat
-# sibling-import directory instead (see vec_trading_env.py's own internal
-# sys.path handling for paths.py/execution_sim.py/portfolio_state.py). That
-# only works once env/ is actually on sys.path, which nothing does
-# automatically for a plain `python train.py` invocation -- add it here,
-# once, at the actual entrypoint.
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "env"))
 
-from dataset import MultiTickerRolloutDataset  # noqa: E402 -- see module docstring's assumption note
-from paths import is_kaggle
-from vec_trading_env import VecTradingEnv
+from dataset import MultiTickerRolloutDataset  # noqa: E402
+from paths import is_kaggle  # noqa: E402
+from vec_trading_env import VecTradingEnv  # noqa: E402
 
-from training.config import TrainingConfig
-from training.ppo_hybrid import HybridActorCritic, collect_rollout, compute_gae, ppo_update
-from training.reward import DifferentialSharpeReward
+from training.config import TrainingConfig  # noqa: E402
+from training.ppo_hybrid import HybridActorCritic, collect_rollout, compute_gae, ppo_update  # noqa: E402
+from training.reward import DifferentialSharpeReward  # noqa: E402
 
-from risk.kelly_sizing import KellySizer
-from risk.kill_switch import KillSwitch
-from risk.risk_manager import RiskLimits, RiskManager
+from risk.kelly_sizing import KellySizer  # noqa: E402
+from risk.kill_switch import KillSwitch  # noqa: E402
+from risk.risk_manager import RiskLimits, RiskManager  # noqa: E402
 
-from monitoring.dashboard import MetricsWriter
+from monitoring.dashboard import MetricsWriter  # noqa: E402
 
 
 def build_risk_pipeline(cfg: TrainingConfig, n_envs: int, device: torch.device):
     """
-    Shared construction, kept in one place because train.py,
+    Shared construction, kept in one place because train.py, train_ddp.py,
     eval/backtest_report.py, and live/live_loop.py all build the exact same
     three objects from the exact same cfg.risk fields -- this is the one
     spot to update if RiskConfig ever grows a field the others forget to
@@ -106,21 +78,6 @@ def build_risk_pipeline(cfg: TrainingConfig, n_envs: int, device: torch.device):
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    """
-    argv=None (the default) reads sys.argv[1:] as normal -- correct for a
-    real `python train.py ...` shell invocation.
-
-    Pass an explicit list (e.g. [] or ["--total-rollouts", "2000"]) when
-    calling main() in-process from a notebook cell instead of via a shell
-    command. Notebook kernels (Jupyter/Colab/Kaggle) run this Python
-    process with their OWN launch arguments in sys.argv (typically
-    `-f /path/to/kernel-xxxx.json`) -- if main() reads sys.argv by default
-    in that context, argparse chokes on the kernel's own flags with
-    "unrecognized arguments: -f ...". Passing argv explicitly sidesteps
-    sys.argv entirely, which is the robust fix -- monkeypatching
-    `sys.argv = [...]` before calling main() also works, but is fragile
-    (easy to do in the wrong cell, or have it silently overwritten).
-    """
     parser = argparse.ArgumentParser(description="Train the hybrid PPO trading policy.")
     parser.add_argument("--kaggle", action="store_true", help="Force Kaggle-safe paths/checkpointing.")
     parser.add_argument("--local", action="store_true", help="Force local paths/checkpointing.")
@@ -138,8 +95,6 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     on_kaggle = args.kaggle or (is_kaggle() and not args.local)
     if on_kaggle and cfg.run.checkpoint_dir == "checkpoints":
-        # keep the default relative path off Kaggle's read-only working dir
-        # root when it wasn't explicitly overridden by the caller
         cfg.run.checkpoint_dir = "/kaggle/working/checkpoints"
 
     device = torch.device(cfg.run.device if torch.cuda.is_available() else "cpu")
@@ -147,13 +102,6 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     os.makedirs(cfg.run.checkpoint_dir, exist_ok=True)
 
-    # --- dataset + env -- see module docstring's assumption note. Actual
-    # MultiTickerRolloutDataset signature (verified against dataset.py):
-    # (window_size, split='train', device=None) -- it does NOT take a
-    # `tickers` kwarg, since it auto-discovers tickers from whichever
-    # *_features.parquet files exist alongside metadata.json (see
-    # preprocess.py). cfg.env.tickers still drives fetch_alpaca.py's
-    # TICKERS list upstream; it's just not a dataset constructor argument.
     train_dataset = MultiTickerRolloutDataset(
         window_size=cfg.env.window_size,
         split="train",
@@ -183,7 +131,6 @@ def main(argv: Optional[List[str]] = None) -> None:
         device=str(device),
     )
 
-    # --- model + optimizer
     actor_critic = HybridActorCritic(n_features=len(train_dataset.feature_names), cfg=cfg).to(device)
     optimizer = torch.optim.Adam(actor_critic.parameters(), lr=cfg.ppo.learning_rate, eps=cfg.ppo.adam_eps)
 
@@ -191,23 +138,27 @@ def main(argv: Optional[List[str]] = None) -> None:
     best_metric = float("-inf")
     ema_reward = None
     total_trades = 0
+    total_trades_per_ticker = [0] * env.n_envs
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location=device)
         actor_critic.load_state_dict(checkpoint["actor_critic"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         start_rollout = checkpoint["rollout_idx"] + 1
-        # .get() with a default so resuming from a checkpoint saved BEFORE
-        # best-tracking / trade-counting existed doesn't crash -- it just
-        # restarts that tracking from scratch instead of carrying over
-        # unknown state.
         best_metric = checkpoint.get("best_metric", float("-inf"))
         ema_reward = checkpoint.get("ema_reward", None)
         total_trades = checkpoint.get("total_trades", 0)
+        # .get() with a default + length guard so resuming from a checkpoint
+        # saved before per-ticker trade counting existed (or against a
+        # different ticker count) doesn't crash -- it just restarts
+        # per-ticker tracking from zero rather than carrying over
+        # mismatched-length state.
+        saved_per_ticker = checkpoint.get("total_trades_per_ticker", None)
+        if isinstance(saved_per_ticker, list) and len(saved_per_ticker) == env.n_envs:
+            total_trades_per_ticker = saved_per_ticker
         print(f"[train] resumed from {args.resume} at rollout {start_rollout} "
               f"(best_metric so far: {best_metric if best_metric != float('-inf') else 'none yet'}, "
               f"total_trades so far: {total_trades})")
 
-    # --- risk pipeline + reward shaper
     kelly_sizer, risk_manager, kill_switch = build_risk_pipeline(cfg, env.n_envs, device)
     reward_shaper = DifferentialSharpeReward(
         n_envs=env.n_envs,
@@ -218,7 +169,6 @@ def main(argv: Optional[List[str]] = None) -> None:
         device=str(device),
     )
 
-    # --- metrics (structured log only -- see module docstring)
     metrics_writer = MetricsWriter(cfg.run.metrics_path)
 
     obs = env.reset()
@@ -233,27 +183,21 @@ def main(argv: Optional[List[str]] = None) -> None:
         stats = ppo_update(actor_critic, optimizer, buffer, cfg)
 
         if buffer.done.any():
-            # end of a full pass through the training split -- start a fresh
-            # pass (see training/ppo_hybrid.py's collect_rollout() docstring:
-            # resetting is a session-boundary decision made HERE, not inside
-            # the rollout collector).
             obs = env.reset()
             hidden = actor_critic.init_hidden(env.n_envs, device)
             kelly_sizer.reset()
             reward_shaper.reset()
             # KillSwitch.reset() clears any halt tripped during the pass
-            # that just ended. This is a deliberate departure from
+            # that just ended -- a deliberate departure from
             # kill_switch.py's live-trading semantics (halt persists until
-            # a human explicitly clears it) -- during TRAINING, a halt
-            # tripped early (near-inevitable: random-init policy + real
-            # transaction costs vs a modest per-stream starting balance)
-            # would otherwise silently zero out ALL real trading signal for
-            # every rollout for the rest of the run, since nothing else
-            # ever clears it. Confirmed directly: without this, a halt at
-            # rollout 0 produced exactly 0.0 reward for 150+ subsequent
-            # rollouts with zero real fills, while the policy still
-            # "trained" on that empty signal -- not a crash, just silent,
-            # wasted compute with no real learning happening.
+            # a human explicitly clears it). During TRAINING, an early halt
+            # (near-inevitable: random-init policy + real transaction costs
+            # vs a modest per-stream starting balance) would otherwise
+            # silently zero out ALL real trading signal for the rest of the
+            # run. Confirmed directly: without this, a halt at rollout 0
+            # produced exactly 0.0 reward for 150+ subsequent rollouts with
+            # zero real fills, while the policy still "trained" on that
+            # empty signal.
             kill_switch.reset()
             kill_switch.start_new_day(env.portfolio.equity(env._current_prices().unsqueeze(1)))  # noqa: SLF001
 
@@ -263,17 +207,31 @@ def main(argv: Optional[List[str]] = None) -> None:
             alpha * rollout_reward_mean + (1 - alpha) * ema_reward
         )
 
-        # Net worth: aggregate equity across all streams (tickers) as of
-        # right now -- each stream started this episode at cfg.env.initial_cash
-        # independently (see project notes: NOT one shared pool), so this is
-        # the sum across all of them, not a single-account balance.
-        net_worth = env.portfolio.equity(env._current_prices().unsqueeze(1)).sum().item()  # noqa: SLF001
+        # Per-ticker net worth / unrealized PnL / drawdown -- each stream
+        # started this episode at cfg.env.initial_cash independently (NOT
+        # one shared pool), so these are genuinely per-env numbers, not a
+        # single account balance split up after the fact. net_worth (the
+        # scalar) is just their sum, kept for the dashboard's header total.
+        current_prices_unsq = env._current_prices().unsqueeze(1)  # noqa: SLF001
+        equity_per_ticker = env.portfolio.equity(current_prices_unsq)              # [n_envs]
+        unrealized_per_ticker = env.portfolio.unrealized_pnl(current_prices_unsq)  # [n_envs]
+        # Read-only: portfolio.peak_equity was already advanced inside
+        # env.step() via update_drawdown_tracking() -- do NOT call that
+        # again here, it would double-advance the peak.
+        peak = env.portfolio.peak_equity.clamp(min=1e-6)
+        drawdown_per_ticker = (peak - equity_per_ticker).clamp(min=0.0) / peak
+        net_worth = float(equity_per_ticker.sum().item())
 
-        # Trade count: a step counts as a trade wherever filled_qty != 0 for
-        # ANY stream that step (buffer.filled_qty is [T, n_envs], signed,
-        # zero where nothing filled -- see vec_trading_env.py's info dict).
-        trades_this_rollout = int((buffer.filled_qty != 0).sum().item())
+        # Trade counts, both aggregate (unchanged) and per-ticker (new --
+        # this is what lets the dashboard show each env's own trade count
+        # updating independently instead of one system-wide number).
+        # buffer.filled_qty is [T, n_envs], signed, 0 where nothing filled.
+        trades_per_ticker_this_rollout = (buffer.filled_qty != 0).sum(dim=0).tolist()  # length n_envs
+        trades_this_rollout = int(sum(trades_per_ticker_this_rollout))
         total_trades += trades_this_rollout
+        total_trades_per_ticker = [
+            total_trades_per_ticker[i] + trades_per_ticker_this_rollout[i] for i in range(env.n_envs)
+        ]
 
         if rollout_idx % cfg.run.log_every_n_rollouts == 0:
             metrics_writer.log(
@@ -282,10 +240,15 @@ def main(argv: Optional[List[str]] = None) -> None:
                 reward=rollout_reward_mean,
                 reward_ema=ema_reward,
                 sharpe=None,  # per-rollout Sharpe isn't meaningful over 256 steps; see eval/metrics.py for the real thing at eval time
-                drawdown=None,
+                drawdown=float(drawdown_per_ticker.mean().item()),
+                drawdown_per_ticker=drawdown_per_ticker.tolist(),
                 net_worth=net_worth,
+                net_worth_per_ticker=equity_per_ticker.tolist(),
+                unrealized_pnl=unrealized_per_ticker.tolist(),
                 trades_this_rollout=trades_this_rollout,
                 total_trades=total_trades,
+                trades_per_ticker_this_rollout=trades_per_ticker_this_rollout,
+                total_trades_per_ticker=total_trades_per_ticker,
                 tickers=env.tickers,
                 position=env.portfolio.positions[:, 0].tolist(),
                 **stats,
@@ -298,6 +261,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             "best_metric": best_metric,
             "ema_reward": ema_reward,
             "total_trades": total_trades,
+            "total_trades_per_ticker": total_trades_per_ticker,
         }
 
         if rollout_idx % cfg.run.checkpoint_every_n_rollouts == 0:
@@ -307,7 +271,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
         if rollout_idx >= cfg.run.best_metric_warmup_rollouts and ema_reward > best_metric:
             best_metric = ema_reward
-            checkpoint_state["best_metric"] = best_metric  # keep the saved dict's own record in sync
+            checkpoint_state["best_metric"] = best_metric
             best_path = os.path.join(cfg.run.checkpoint_dir, "checkpoint_best.pt")
             torch.save(checkpoint_state, best_path)
             print(f"[train] rollout {rollout_idx}: new best (EMA reward {best_metric:.6f}) -> {best_path}")

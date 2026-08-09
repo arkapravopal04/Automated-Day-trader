@@ -3,18 +3,35 @@ monitoring/dashboard.py
 
 Metrics/visualization layer, built Kaggle-safe from the start.
 
-Decoupling:
-    The training loop NEVER renders anything and NEVER imports Rich. It
-    only calls MetricsWriter.log(step, **metrics) every N steps.
+v1's bug wasn't Rich itself -- it was Rich's Live(auto_refresh=True), which
+runs a background thread doing in-place ANSI cursor redraws that raced
+against Kaggle's own stdout buffering and corrupted the display. Live() is
+still only ever constructed with auto_refresh=False here, refreshed by an
+explicit .refresh() tied to the same cadence as everything else.
 
-JSONL over SQLite, on purpose: SQLite's file-locking semantics are a known
-footgun on containerized/network-mounted filesystems. JSONL appends have 
-no locking to get wrong.
+v2 threaded-notebook bug (fixed in this revision): IPython's
+display(display_id=...) / update_display() pairing is NOT guaranteed to
+target the right output cell when called from a background polling thread
+-- in practice on Kaggle this showed up as "the dashboard just keeps
+printing itself again" instead of updating in place, because the comm
+message from a background thread doesn't reliably land against the cell
+that's still executing. The fix: when ipywidgets is available, render into
+a persistent `ipywidgets.Output` widget and .clear_output(wait=True) inside
+it every frame -- Output widgets are explicitly designed to capture output
+from any thread and route it to the right place, which display_id/
+update_display are not. Falls back to IPython.display.clear_output(wait=True)
++ display() (still same-cell in-place, just without the widget) if
+ipywidgets isn't installed, and to Rich's Live() outside any notebook.
 
-Overhaul Features:
-    - htop-style Full-screen Layout for local mode to prevent terminal scroll.
-    - Real-time sparklines and animated last-updated timestamps.
-    - Dedicated rendering for per-environment worker metrics.
+Decoupling (unchanged): the training loop NEVER renders anything and NEVER
+imports Rich. It only calls MetricsWriter.log(step, **metrics) every N
+steps, appending one JSON line to a flat file. Whether a dashboard is
+watching that file, crashed, or was never started has zero effect on
+training.
+
+JSONL over SQLite, on purpose: no file-locking to get wrong on a
+containerized/network-mounted filesystem -- a half-written last line just
+gets skipped by MetricsReader.tail().
 """
 
 import enum
@@ -23,26 +40,33 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
-from rich.layout import Layout
-from rich.align import Align
 from rich.text import Text
 
 try:
     from IPython.display import HTML as _IPyHTML
     from IPython.display import display as _ipy_display
-    from IPython.display import update_display as _ipy_update_display
+    from IPython.display import clear_output as _ipy_clear_output
     from IPython import get_ipython as _get_ipython
     _HAS_IPYTHON = True
 except ImportError:
     _HAS_IPYTHON = False
 
+try:
+    import ipywidgets as _ipywidgets
+    _HAS_IPYWIDGETS = True
+except ImportError:
+    _HAS_IPYWIDGETS = False
+
+
+# --------------------------------------------------------------------------
+# Metrics writer -- the training loop calls THIS, never the dashboard directly.
+# --------------------------------------------------------------------------
 
 class MetricsWriter:
     """
@@ -57,13 +81,6 @@ class MetricsWriter:
         self._fh = open(path, "a", buffering=1)
 
     def log(self, step: int, **metrics: Any) -> None:
-        """
-        step: the training step/rollout index this record belongs to.
-        **metrics: 
-            Can include overall metrics (reward, net_worth) AND 
-            a list of dicts for per-environment tracking, e.g.:
-            env_metrics=[{"env_id": 0, "trades": 5, "reward": 0.2}, ...]
-        """
         record = {"step": step, "wall_time": time.time(), **metrics}
         self._fh.write(json.dumps(record, default=_json_default) + "\n")
         if self.flush_every_call:
@@ -96,6 +113,10 @@ def _json_default(obj: Any) -> Any:
     return str(obj)
 
 
+# --------------------------------------------------------------------------
+# Metrics reader
+# --------------------------------------------------------------------------
+
 class MetricsReader:
     def __init__(self, path: str):
         self.path = path
@@ -116,6 +137,10 @@ class MetricsReader:
                 continue
         return records
 
+
+# --------------------------------------------------------------------------
+# Display mode
+# --------------------------------------------------------------------------
 
 class DisplayMode(str, enum.Enum):
     AUTO = "auto"
@@ -146,7 +171,39 @@ def resolve_mode(cfg_display_mode: str = "auto", argv: Optional[List[str]] = Non
     return resolve_display_mode(cfg_mode)
 
 
+_SPINNER_FRAMES = ["\u28f7", "\u28ef", "\u28df", "\u287f", "\u28bf", "\u28fb", "\u28fd", "\u28fe"]  # braille spinner
+
+
+def _fmt_uptime(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+# --------------------------------------------------------------------------
+# Dashboard
+# --------------------------------------------------------------------------
+
 class TrainingDashboard:
+    """
+    Renders structured metrics written by MetricsWriter.
+
+    Rendering path, chosen once at construction:
+        notebook + ipywidgets installed:  a persistent Output widget,
+                                           .clear_output(wait=True) each
+                                           frame -- the robust in-place
+                                           update for a background-thread
+                                           poller (see module docstring).
+        notebook, no ipywidgets:          IPython.display.clear_output +
+                                           display(), same-cell in-place.
+        real terminal (isatty), no notebook: Rich Live(auto_refresh=False).
+        headless, no tty, no notebook:    manual ANSI cursor-up rewrite --
+                                           genuinely redraws in place
+                                           instead of appending a new frame
+                                           to scrollback every call.
+    """
+
     def __init__(
         self,
         metrics_path: str,
@@ -158,25 +215,35 @@ class TrainingDashboard:
         self.mode = resolve_display_mode(mode)
         self.history_window = history_window
         self.console = console if console is not None else Console()
-        self._tick_counter = 0
-
-        self._live: Optional[Live] = None
-        if self.mode == DisplayMode.LOCAL:
-            # screen=True puts the terminal in an alternate buffer (like htop).
-            # This completely solves the "re-printing/scrolling" issue.
-            self._live = Live(
-                console=self.console, 
-                auto_refresh=False, 
-                transient=False,
-                screen=True  
-            )
 
         self._notebook_capable = _HAS_IPYTHON and _get_ipython() is not None
-        self._display_id = f"training_dashboard_{id(self)}"
-        self._displayed_once = False
+        self._widget_capable = self._notebook_capable and _HAS_IPYWIDGETS
+        self._is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+        self._live: Optional[Live] = None
+        self._output_widget = None
+        if self._widget_capable:
+            self._output_widget = _ipywidgets.Output()
+        elif self.mode == DisplayMode.LOCAL and self._is_tty and not self._notebook_capable:
+            self._live = Live(console=self.console, auto_refresh=False, transient=False)
+
+        self._displayed_widget = False
+        self._headless_lines_printed = 0  # for the manual ANSI rewrite path
+
+        self._start_time = time.time()
+        self._last_render_time: Optional[float] = None
+        self._last_step: Optional[int] = None
+        self._frame_count = 0
+
+        # trend state, all keyed by ticker (or None for the portfolio total)
         self._prev_net_worth: Optional[float] = None
+        self._prev_net_worth_per_ticker: Dict[str, float] = {}
+        self._prev_trades_per_ticker: Dict[str, int] = {}
 
     def start(self) -> None:
+        if self._output_widget is not None and not self._displayed_widget:
+            _ipy_display(self._output_widget)
+            self._displayed_widget = True
         if self._live is not None:
             self._live.__enter__()
 
@@ -195,35 +262,71 @@ class TrainingDashboard:
         history = self.reader.tail(self.history_window)
         if not history:
             return
-        
         latest = history[-1]
-        self._tick_counter += 1
-        
-        renderable = self._build_layout(latest, history)
 
-        if self.mode == DisplayMode.LOCAL:
+        # "is this actually new data, or the same last line as before" --
+        # drives both the spinner (only animates on real progress) and the
+        # rollouts/sec throughput estimate below.
+        step = latest.get("step")
+        now = time.time()
+        is_new_step = step != self._last_step
+        if is_new_step:
+            self._frame_count += 1
+        self._last_step = step
+        self._last_render_time = now
+
+        renderable = self._build_renderable(latest, history, now, is_new_step)
+
+        if self._output_widget is not None:
+            self.start()
+            with self._output_widget:
+                self._output_widget.clear_output(wait=True)
+                self.console.print(renderable)
+        elif self._live is not None:
             self._live.update(renderable)
             self._live.refresh()
         elif self._notebook_capable:
             html = self._render_html(renderable)
-            if not self._displayed_once:
-                _ipy_display(_IPyHTML(html), display_id=self._display_id)
-                self._displayed_once = True
-            else:
-                _ipy_update_display(_IPyHTML(html), display_id=self._display_id)
+            _ipy_clear_output(wait=True)
+            _ipy_display(_IPyHTML(html))
         else:
-            self.console.print(renderable)
+            self._render_headless_inplace(renderable)
 
     def _render_html(self, renderable) -> str:
         buf = io.StringIO()
-        tmp_console = Console(file=buf, record=True, width=120, force_terminal=False)
+        tmp_console = Console(file=buf, record=True, width=100, force_terminal=False)
         tmp_console.print(renderable)
         return tmp_console.export_html(
             inline_styles=True,
-            code_format='<pre style="white-space:pre-wrap;font-family:monospace;background:#1e1e1e;color:#d4d4d4;padding:10px">{code}</pre>',
+            code_format='<pre style="white-space:pre-wrap;font-family:monospace">{code}</pre>',
         )
 
-    def run_polling_loop(self, poll_interval_seconds: float = 1.0, max_iterations: Optional[int] = None) -> None:
+    def _render_headless_inplace(self, renderable) -> None:
+        """
+        No tty, no notebook -- there's no ANSI Live()-style redraw available
+        without risking the exact race v1 hit, but a PLAIN scrolling print
+        (the old behavior) reads as "frozen, just reprinting itself" even
+        when it's actually updating, because nothing visually distinguishes
+        one frame from the next in a long log. This moves the cursor back
+        up over the previous frame's lines and overwrites them in place --
+        a single-threaded, synchronous ANSI move (cursor-up + clear-line),
+        not Live()'s background-thread redraw, so it doesn't reintroduce the
+        v1 race.
+        """
+        buf = io.StringIO()
+        tmp_console = Console(file=buf, force_terminal=True, width=self.console.width or 100)
+        tmp_console.print(renderable)
+        text = buf.getvalue()
+        n_lines = text.count("\n")
+
+        if self._headless_lines_printed > 0:
+            sys.stdout.write(f"\x1b[{self._headless_lines_printed}A")  # cursor up
+            sys.stdout.write("\x1b[J")  # clear from cursor to end of screen
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        self._headless_lines_printed = n_lines
+
+    def run_polling_loop(self, poll_interval_seconds: float = 2.0, max_iterations: Optional[int] = None) -> None:
         i = 0
         try:
             self.start()
@@ -234,31 +337,14 @@ class TrainingDashboard:
         finally:
             self.stop()
 
-    def _build_layout(self, latest: Dict[str, Any], history: List[Dict[str, Any]]) -> Layout:
-        """Constructs a responsive UI grid layout."""
-        layout = Layout()
-        layout.split_column(
-            Layout(name="header", size=9),
-            Layout(name="body")
-        )
-        layout["body"].split_row(
-            Layout(name="portfolio", ratio=1),
-            Layout(name="envs", ratio=1)
-        )
+    # ----------------------------------------------------------------
 
-        # 1. Header (Overall Status & Sparklines)
-        layout["header"].update(self._build_header(latest, history))
-        
-        # 2. Portfolio / Tickers
-        layout["portfolio"].update(self._build_portfolio_table(latest))
-        
-        # 3. Environment Workers
-        layout["envs"].update(self._build_envs_table(latest))
-
-        return layout
-
-    def _build_header(self, latest: Dict[str, Any], history: List[Dict[str, Any]]) -> Panel:
+    def _build_renderable(
+        self, latest: Dict[str, Any], history: List[Dict[str, Any]], now: float, is_new_step: bool
+    ) -> Group:
         reward = latest.get("reward")
+        reward_ema = latest.get("reward_ema")
+        drawdown = latest.get("drawdown")
         net_worth = latest.get("net_worth")
 
         net_worth_color = None
@@ -270,101 +356,99 @@ class TrainingDashboard:
         if net_worth is not None:
             self._prev_net_worth = net_worth
 
-        # Dynamic alive indicator (rotates characters based on tick)
-        spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-        spinner = spinners[self._tick_counter % len(spinners)]
-        now = datetime.now().strftime("%H:%M:%S")
-        status_line = f"[bold cyan]{spinner} LIVE[/bold cyan] | Updated: [dim]{now}[/dim]"
+        # throughput -- rollouts/sec over the visible history window, a
+        # cheap "is this actually moving" signal independent of any single
+        # metric's own trend
+        rollouts_per_sec = None
+        if len(history) >= 2:
+            span_steps = (history[-1].get("step") or 0) - (history[0].get("step") or 0)
+            span_time = (history[-1].get("wall_time") or now) - (history[0].get("wall_time") or now)
+            if span_time > 0 and span_steps > 0:
+                rollouts_per_sec = span_steps / span_time
 
-        # Sparklines for historical feel
-        rewards_hist = [h.get("reward", 0) for h in history if h.get("reward") is not None]
-        sparkline = _generate_sparkline(rewards_hist[-50:]) if rewards_hist else "N/A"
+        spinner = _SPINNER_FRAMES[self._frame_count % len(_SPINNER_FRAMES)] if is_new_step else "\u25cf"
+        spinner_color = "green" if is_new_step else "yellow"
+        staleness = now - (latest.get("wall_time") or now)
+        live_note = "" if staleness < 30 else f"  [red](no new data for {int(staleness)}s -- check the training process)[/red]"
 
-        grid = Table.grid(expand=True)
-        grid.add_column(justify="left", ratio=1)
-        grid.add_column(justify="left", ratio=1)
-        
-        left_lines = [
-            f"Step:            [bold]{latest.get('step')}[/bold]",
-            f"Net Worth:       [bold]{_fmt_colored(net_worth, good_is=None, color=net_worth_color, dollar=True)}[/bold]",
-            f"Reward (Latest): {_fmt_colored(reward, good_is='positive')}",
-            f"Sharpe:          {_fmt(latest.get('sharpe'))}"
+        panel_lines = [
+            f"[{spinner_color}]{spinner}[/{spinner_color}] live  |  uptime {_fmt_uptime(now - self._start_time)}"
+            f"  |  {rollouts_per_sec:.2f} rollouts/s" if rollouts_per_sec is not None else
+            f"[{spinner_color}]{spinner}[/{spinner_color}] live  |  uptime {_fmt_uptime(now - self._start_time)}",
+            f"step:              {latest.get('step')}{live_note}",
+            f"episode:           {latest.get('episode')}",
+            f"reward:            {_fmt_colored(reward, good_is='positive')}",
+            f"reward (EMA):      {_fmt_colored(reward_ema, good_is='positive')}",
+            f"net worth (total): {_fmt_colored(net_worth, good_is=None, color=net_worth_color, dollar=True)}",
+            f"sharpe:            {_fmt(latest.get('sharpe'))}",
+            f"drawdown (avg):    {_fmt_colored(drawdown, good_is='small_pct', pct=True)}",
+            f"trades (rollout):  {_fmt_int(latest.get('trades_this_rollout'))}",
+            f"trades (total):    {_fmt_int(latest.get('total_trades'))}",
         ]
-        
-        right_lines = [
-            f"Drawdown:        {_fmt_colored(latest.get('drawdown'), good_is='small_pct', pct=True)}",
-            f"Total Trades:    {_fmt_int(latest.get('total_trades'))}",
-            f"Reward Trend:    [magenta]{sparkline}[/magenta]",
-            status_line
-        ]
+        header = Panel("\n".join(panel_lines), title="Training Status", expand=False)
 
-        grid.add_row("\n".join(left_lines), "\n".join(right_lines))
-        return Panel(grid, title="[bold white]Global Agent Metrics[/bold white]", border_style="cyan")
-
-    def _build_portfolio_table(self, latest: Dict[str, Any]) -> Panel:
-        table = Table(expand=True, show_edge=False, header_style="bold yellow")
+        table = Table(title=f"Per-Environment State  (frame #{self._frame_count})")
         table.add_column("Ticker")
         table.add_column("Position", justify="right")
+        table.add_column("Net Worth", justify="right")
         table.add_column("Unrealized PnL", justify="right")
+        table.add_column("Drawdown", justify="right")
+        table.add_column("Trades (rollout)", justify="right")
+        table.add_column("Trades (total)", justify="right")
 
         tickers = latest.get("tickers")
         position = latest.get("position")
 
         if isinstance(tickers, list) and isinstance(position, list):
-            unrealized = latest.get("unrealized_pnl")
-            unrealized = unrealized if isinstance(unrealized, list) else [None] * len(tickers)
-            for ticker, pos, upnl in zip(tickers, position, unrealized):
-                table.add_row(str(ticker), _fmt(pos), _fmt_colored(upnl, good_is="positive"))
-        else:
-            table.add_row("(No positions)", "-", "-")
+            n = len(tickers)
+            net_worth_per_ticker = _as_list(latest.get("net_worth_per_ticker"), n)
+            unrealized = _as_list(latest.get("unrealized_pnl"), n)
+            drawdown_per_ticker = _as_list(latest.get("drawdown_per_ticker"), n)
+            trades_rollout_per_ticker = _as_list(latest.get("trades_per_ticker_this_rollout"), n)
+            trades_total_per_ticker = _as_list(latest.get("total_trades_per_ticker"), n)
 
-        return Panel(table, title="[bold yellow]Portfolio State[/bold yellow]", border_style="yellow")
+            for i, ticker in enumerate(tickers):
+                nw = net_worth_per_ticker[i]
+                nw_color = None
+                if nw is not None:
+                    prev = self._prev_net_worth_per_ticker.get(ticker)
+                    if prev is not None:
+                        if nw > prev:
+                            nw_color = "green"
+                        elif nw < prev:
+                            nw_color = "red"
+                    self._prev_net_worth_per_ticker[ticker] = nw
+                nw_text = _fmt_colored(nw, good_is=None, color=nw_color, dollar=True)
+                if nw_color == "green":
+                    nw_text = "\u25b2 " + nw_text
+                elif nw_color == "red":
+                    nw_text = "\u25bc " + nw_text
 
-    def _build_envs_table(self, latest: Dict[str, Any]) -> Panel:
-        table = Table(expand=True, show_edge=False, header_style="bold green")
-        table.add_column("Env ID", justify="left")
-        table.add_column("Trades", justify="right")
-        table.add_column("Reward", justify="right")
-        table.add_column("Status", justify="center")
+                trades_this = trades_rollout_per_ticker[i]
+                trades_total = trades_total_per_ticker[i]
+                # highlight (bold cyan) any env that actually traded THIS
+                # rollout, so per-env activity is visible at a glance
+                # instead of having to compare numbers frame to frame.
+                just_traded = trades_this is not None and trades_this not in (0, "0")
+                trades_this_text = f"[bold cyan]{_fmt_int(trades_this)}[/bold cyan]" if just_traded else _fmt_int(trades_this)
 
-        env_metrics = latest.get("env_metrics", [])
-        
-        if isinstance(env_metrics, list) and env_metrics:
-            # Sort environments by ID to keep the display stable
-            env_metrics = sorted(env_metrics, key=lambda x: x.get("env_id", 0))
-            for env in env_metrics:
-                trades = env.get("trades", 0)
-                reward = env.get("reward", 0)
-                # Dynamic visual status logic based on trades
-                status = "[green]Active[/green]" if trades > 0 else "[dim]Idle[/dim]"
                 table.add_row(
-                    f"Worker-{env.get('env_id', '?')}",
-                    _fmt_int(trades),
-                    _fmt_colored(reward, good_is="positive"),
-                    status
+                    str(ticker),
+                    _fmt(position[i]),
+                    nw_text,
+                    _fmt_colored(unrealized[i], good_is="positive"),
+                    _fmt_colored(drawdown_per_ticker[i], good_is="small_pct", pct=True),
+                    trades_this_text,
+                    _fmt_int(trades_total),
                 )
         else:
-            table.add_row("(No environment metrics provided)", "-", "-", "-")
+            table.add_row("(no per-ticker breakdown in this record)", "", "", "", "", "", "")
 
-        return Panel(table, title="[bold green]Environment Workers[/bold green]", border_style="green")
+        return Group(header, table)
 
 
-def _generate_sparkline(values: List[float]) -> str:
-    """Creates a text-based sparkline for a list of floats."""
-    if not values:
-        return ""
-    bars = "  ▂▃▄▅▆▇█"
-    min_v, max_v = min(values), max(values)
-    range_v = max_v - min_v
-    if range_v == 0:
-        return bars[4] * len(values)
-    
-    spark = []
-    for v in values:
-        idx = int((v - min_v) / range_v * 8)
-        idx = max(0, min(idx, 8))
-        spark.append(bars[idx])
-    return "".join(spark)
+def _as_list(value: Any, n: int) -> List[Any]:
+    return value if isinstance(value, list) and len(value) == n else [None] * n
 
 
 def _fmt(value: Any, pct: bool = False) -> str:
@@ -393,6 +477,12 @@ def _fmt_colored(
     pct: bool = False,
     dollar: bool = False,
 ) -> str:
+    """
+    good_is="positive"  -> green if value >= 0, red if value < 0
+    good_is="small_pct" -> green if value <= 0.10 (10%), red otherwise
+    good_is=None         -> no automatic rule; only an explicit `color` applies
+    `color`, when given, always wins over the good_is rule.
+    """
     if value is None:
         return "-"
     try:
