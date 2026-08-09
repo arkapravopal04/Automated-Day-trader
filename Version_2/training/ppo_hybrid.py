@@ -155,6 +155,8 @@ class RolloutBuffer:
     log_prob_old: torch.Tensor     # [T, n_envs]
     value_old: torch.Tensor        # [T, n_envs] -- dual-critic-selected value at rollout time
     position_before: torch.Tensor  # [T, n_envs] -- sign of position entering each step, for value-head selection
+    filled_qty: torch.Tensor       # [T, n_envs] -- signed shares actually filled that step (0 = no trade), for
+                                     # trade-count/turnover metrics -- see vec_trading_env.py's info["filled_qty"]
     reward: torch.Tensor           # [T, n_envs] -- shaped reward actually used for GAE
     done: torch.Tensor             # [T, n_envs] bool
     initial_hidden: Hidden         # (h0, c0) at the START of this rollout -- replayed from fresh each PPO epoch
@@ -202,6 +204,7 @@ def collect_rollout(
     log_prob_buf: List[torch.Tensor] = []
     value_buf: List[torch.Tensor] = []
     position_before_buf: List[torch.Tensor] = []
+    filled_qty_buf: List[torch.Tensor] = []
     reward_buf: List[torch.Tensor] = []
     done_buf: List[torch.Tensor] = []
 
@@ -273,6 +276,7 @@ def collect_rollout(
             log_prob_buf.append(action_sample.log_prob)
             value_buf.append(value_selected)
             position_before_buf.append(position_before)
+            filled_qty_buf.append(step_result.info["filled_qty"])
             reward_buf.append(shaped_reward)
             done_buf.append(step_result.done)
 
@@ -299,6 +303,7 @@ def collect_rollout(
         log_prob_old=torch.stack(log_prob_buf, dim=0),
         value_old=torch.stack(value_buf, dim=0),
         position_before=torch.stack(position_before_buf, dim=0),
+        filled_qty=torch.stack(filled_qty_buf, dim=0),
         reward=torch.stack(reward_buf, dim=0),
         done=torch.stack(done_buf, dim=0),
         initial_hidden=initial_hidden,

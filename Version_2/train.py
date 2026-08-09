@@ -190,18 +190,22 @@ def main(argv: Optional[List[str]] = None) -> None:
     start_rollout = 0
     best_metric = float("-inf")
     ema_reward = None
+    total_trades = 0
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location=device)
         actor_critic.load_state_dict(checkpoint["actor_critic"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         start_rollout = checkpoint["rollout_idx"] + 1
         # .get() with a default so resuming from a checkpoint saved BEFORE
-        # best-tracking existed doesn't crash -- it just restarts "best"
-        # tracking from scratch instead of carrying over unknown state.
+        # best-tracking / trade-counting existed doesn't crash -- it just
+        # restarts that tracking from scratch instead of carrying over
+        # unknown state.
         best_metric = checkpoint.get("best_metric", float("-inf"))
         ema_reward = checkpoint.get("ema_reward", None)
+        total_trades = checkpoint.get("total_trades", 0)
         print(f"[train] resumed from {args.resume} at rollout {start_rollout} "
-              f"(best_metric so far: {best_metric if best_metric != float('-inf') else 'none yet'})")
+              f"(best_metric so far: {best_metric if best_metric != float('-inf') else 'none yet'}, "
+              f"total_trades so far: {total_trades})")
 
     # --- risk pipeline + reward shaper
     kelly_sizer, risk_manager, kill_switch = build_risk_pipeline(cfg, env.n_envs, device)
@@ -237,6 +241,20 @@ def main(argv: Optional[List[str]] = None) -> None:
             hidden = actor_critic.init_hidden(env.n_envs, device)
             kelly_sizer.reset()
             reward_shaper.reset()
+            # KillSwitch.reset() clears any halt tripped during the pass
+            # that just ended. This is a deliberate departure from
+            # kill_switch.py's live-trading semantics (halt persists until
+            # a human explicitly clears it) -- during TRAINING, a halt
+            # tripped early (near-inevitable: random-init policy + real
+            # transaction costs vs a modest per-stream starting balance)
+            # would otherwise silently zero out ALL real trading signal for
+            # every rollout for the rest of the run, since nothing else
+            # ever clears it. Confirmed directly: without this, a halt at
+            # rollout 0 produced exactly 0.0 reward for 150+ subsequent
+            # rollouts with zero real fills, while the policy still
+            # "trained" on that empty signal -- not a crash, just silent,
+            # wasted compute with no real learning happening.
+            kill_switch.reset()
             kill_switch.start_new_day(env.portfolio.equity(env._current_prices().unsqueeze(1)))  # noqa: SLF001
 
         rollout_reward_mean = buffer.reward.mean().item()
@@ -244,6 +262,18 @@ def main(argv: Optional[List[str]] = None) -> None:
         ema_reward = rollout_reward_mean if ema_reward is None else (
             alpha * rollout_reward_mean + (1 - alpha) * ema_reward
         )
+
+        # Net worth: aggregate equity across all streams (tickers) as of
+        # right now -- each stream started this episode at cfg.env.initial_cash
+        # independently (see project notes: NOT one shared pool), so this is
+        # the sum across all of them, not a single-account balance.
+        net_worth = env.portfolio.equity(env._current_prices().unsqueeze(1)).sum().item()  # noqa: SLF001
+
+        # Trade count: a step counts as a trade wherever filled_qty != 0 for
+        # ANY stream that step (buffer.filled_qty is [T, n_envs], signed,
+        # zero where nothing filled -- see vec_trading_env.py's info dict).
+        trades_this_rollout = int((buffer.filled_qty != 0).sum().item())
+        total_trades += trades_this_rollout
 
         if rollout_idx % cfg.run.log_every_n_rollouts == 0:
             metrics_writer.log(
@@ -253,6 +283,9 @@ def main(argv: Optional[List[str]] = None) -> None:
                 reward_ema=ema_reward,
                 sharpe=None,  # per-rollout Sharpe isn't meaningful over 256 steps; see eval/metrics.py for the real thing at eval time
                 drawdown=None,
+                net_worth=net_worth,
+                trades_this_rollout=trades_this_rollout,
+                total_trades=total_trades,
                 tickers=env.tickers,
                 position=env.portfolio.positions[:, 0].tolist(),
                 **stats,
@@ -264,6 +297,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             "rollout_idx": rollout_idx,
             "best_metric": best_metric,
             "ema_reward": ema_reward,
+            "total_trades": total_trades,
         }
 
         if rollout_idx % cfg.run.checkpoint_every_n_rollouts == 0:

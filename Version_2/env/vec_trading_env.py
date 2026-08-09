@@ -340,7 +340,7 @@ class VecTradingEnv:
         self._bias_hist[:, self._bias_hist_ptr % self.bias_window] = trade_sign
         self._bias_hist_ptr += 1
 
-        self.current_idx += 1
+        self.current_idx = min(self.current_idx + 1, self.max_idx)
         done_time = self.current_idx >= self.max_idx
         next_mid_price = self._current_prices() if not done_time else mid_price
 
@@ -359,6 +359,7 @@ class VecTradingEnv:
         info = {
             "equity": equity_after,
             "realized_delta": realized_delta,
+            "filled_qty": sim_fill.filled_qty.clone(),
             "cash": self.portfolio.cash.clone(),
             "position": self.portfolio.positions[:, 0].clone(),
             "realized_pnl": self.portfolio.realized_pnl.clone(),

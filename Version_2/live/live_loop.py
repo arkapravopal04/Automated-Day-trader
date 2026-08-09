@@ -186,6 +186,7 @@ class LiveLoop:
         self.hidden = actor_critic.init_hidden(self.n_envs, self.device)
         self._step = 0
         self._day_started = False
+        self._total_trades = 0
 
     def step_once(self) -> None:
         # --- 1. poll bars first -- everything else this cycle needs a price
@@ -256,11 +257,15 @@ class LiveLoop:
         # this process never renders anything itself)
         if self.metrics_writer is not None:
             equity_after = self.portfolio.equity(mid_price.unsqueeze(1))
+            unrealized = self.portfolio.unrealized_pnl(mid_price.unsqueeze(1))
             self.metrics_writer.log(
                 step=self._step,
                 tickers=self.tickers,
                 position=self.portfolio.positions[:, 0].tolist(),
-                equity=float(equity_after.sum().item()),
+                unrealized_pnl=unrealized.tolist(),
+                equity=float(equity_after.sum().item()),      # kept for backward compat
+                net_worth=float(equity_after.sum().item()),   # dashboard.py's expected key -- see train.py's matching field
+                total_trades=self._total_trades,
                 halted=self.kill_switch.is_halted().tolist(),
                 broker_reachable=report.broker_reachable,
                 mismatched_tickers=report.mismatched_tickers,
@@ -302,6 +307,7 @@ class LiveLoop:
 
         fill = Fill(ticker_idx=0, qty=qty_vec, price=price_vec, commission=commission_vec)
         self.portfolio.step_apply(fill)
+        self._total_trades += 1
 
     def _extract_mid_price(self, raw_windows: Dict[str, RawBarWindow]) -> torch.Tensor:
         prices = []
