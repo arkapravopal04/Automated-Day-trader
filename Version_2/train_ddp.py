@@ -80,7 +80,7 @@ from model.dual_critic import DualCriticHead  # noqa: E402
 
 from monitoring.dashboard import MetricsWriter  # noqa: E402
 
-from train import build_risk_pipeline  # noqa: E402 -- reuse, don't duplicate the shared kelly/risk/kill_switch constructor
+from train import build_risk_pipeline, _TickState, make_tick_callback  # noqa: E402 -- reuse, don't duplicate
 
 
 def ddp_available() -> bool:
@@ -167,8 +167,10 @@ def _worker(
     start_rollout = 0
     best_metric = float("-inf")
     ema_reward = None
-    total_trades = 0
-    total_trades_per_ticker = [0] * env.n_envs
+    # Same _TickState / tick-callback machinery train.py uses -- imported
+    # rather than duplicated, so the two entrypoints can't drift apart on
+    # what a "tick" record looks like.
+    state = _TickState(n_envs=env.n_envs)
     checkpoint = None
     if resume is not None:
         # Every rank loads the SAME checkpoint onto ITS OWN device. DDP
@@ -181,13 +183,15 @@ def _worker(
         start_rollout = checkpoint["rollout_idx"] + 1
         best_metric = checkpoint.get("best_metric", float("-inf"))
         ema_reward = checkpoint.get("ema_reward", None)
-        total_trades = checkpoint.get("total_trades", 0)
+        state.global_tick = checkpoint.get("global_tick", 0)
+        state.episode_idx = checkpoint.get("episode_idx", 0)
         saved_per_ticker = checkpoint.get("total_trades_per_ticker", None)
         if isinstance(saved_per_ticker, list) and len(saved_per_ticker) == env.n_envs:
-            total_trades_per_ticker = saved_per_ticker
+            state.total_trades_per_ticker = saved_per_ticker
         if rank == 0:
             print(f"[train_ddp] resumed from {resume} at rollout {start_rollout} "
-                  f"(best_metric so far: {best_metric if best_metric != float('-inf') else 'none yet'})")
+                  f"(global_tick={state.global_tick}, episode={state.episode_idx}, "
+                  f"best_metric so far: {best_metric if best_metric != float('-inf') else 'none yet'})")
 
     ddp_model = DDP(actor_critic, device_ids=[rank], output_device=rank)
 
@@ -195,31 +199,48 @@ def _worker(
     if checkpoint is not None and "optimizer" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer"])
 
+    scaler = torch.cuda.amp.GradScaler(enabled=cfg.run.use_amp)
+    if checkpoint is not None and "scaler" in checkpoint:
+        scaler.load_state_dict(checkpoint["scaler"])
+
     kelly_sizer, risk_manager, kill_switch = build_risk_pipeline(cfg, env.n_envs, device)
     reward_shaper = DifferentialSharpeReward(
         n_envs=env.n_envs, eta=cfg.reward.dsr_eta, eps=cfg.reward.dsr_eps,
         warmup_steps=cfg.reward.dsr_warmup_steps, clip=cfg.reward.dsr_clip, device=str(device),
     )
 
+    # Only rank 0 writes metrics -- two ranks both calling MetricsWriter.log()
+    # against the same file would interleave JSONL lines. tick_callback is
+    # None on every other rank, and collect_rollout() treats None as "don't
+    # bother" (see its own docstring), so non-zero ranks pay zero tick-logging
+    # overhead, not just a suppressed write.
     metrics_writer = MetricsWriter(cfg.run.metrics_path) if rank == 0 else None
+    tick_callback = make_tick_callback(env, metrics_writer, state) if rank == 0 else None
 
     obs = env.reset()
     hidden = ddp_model.module.init_hidden(env.n_envs, device)
     kill_switch.start_new_day(env.portfolio.equity(env._current_prices().unsqueeze(1)))  # noqa: SLF001
 
     for rollout_idx in range(start_rollout, cfg.run.total_rollouts):
+        state.rollout_idx = rollout_idx
+        if rank == 0:
+            state.start_new_rollout()
+
         # collect_rollout() takes a HybridActorCritic and calls its
         # submodules directly (no gradients needed for rollout collection,
         # see ppo_hybrid.py's own no_grad note) -- passing ddp_model.module
         # here is correct and does NOT skip any DDP hook, since no
         # backward() happens during collection.
         buffer, obs, final_value, hidden = collect_rollout(
-            env, ddp_model.module, kelly_sizer, risk_manager, kill_switch, reward_shaper, obs, hidden, cfg
+            env, ddp_model.module, kelly_sizer, risk_manager, kill_switch, reward_shaper, obs, hidden, cfg,
+            tick_callback=tick_callback,
         )
         compute_gae(buffer, final_value, cfg.ppo.gamma, cfg.ppo.gae_lambda)
-        stats = _ddp_ppo_update(ddp_model, optimizer, buffer, cfg)
+        stats = _ddp_ppo_update(ddp_model, optimizer, buffer, cfg, scaler=scaler)
 
         if buffer.done.any():
+            if rank == 0:
+                state.episode_idx += 1
             obs = env.reset()
             hidden = ddp_model.module.init_hidden(env.n_envs, device)
             kelly_sizer.reset()
@@ -232,24 +253,20 @@ def _worker(
         ema_reward = rollout_reward_mean if ema_reward is None else (
             alpha * rollout_reward_mean + (1 - alpha) * ema_reward
         )
-        current_prices_unsq = env._current_prices().unsqueeze(1)  # noqa: SLF001
-        equity_per_ticker = env.portfolio.equity(current_prices_unsq)
-        unrealized_per_ticker = env.portfolio.unrealized_pnl(current_prices_unsq)
-        peak = env.portfolio.peak_equity.clamp(min=1e-6)
-        drawdown_per_ticker = (peak - equity_per_ticker).clamp(min=0.0) / peak
-        net_worth = float(equity_per_ticker.sum().item())
-
-        trades_per_ticker_this_rollout = (buffer.filled_qty != 0).sum(dim=0).tolist()
-        trades_this_rollout = int(sum(trades_per_ticker_this_rollout))
-        total_trades += trades_this_rollout
-        total_trades_per_ticker = [
-            total_trades_per_ticker[i] + trades_per_ticker_this_rollout[i] for i in range(env.n_envs)
-        ]
 
         if rank == 0 and rollout_idx % cfg.run.log_every_n_rollouts == 0:
+            current_prices_unsq = env._current_prices().unsqueeze(1)  # noqa: SLF001
+            equity_per_ticker = env.portfolio.equity(current_prices_unsq)
+            unrealized_per_ticker = env.portfolio.unrealized_pnl(current_prices_unsq)
+            peak = env.portfolio.peak_equity.clamp(min=1e-6)
+            drawdown_per_ticker = (peak - equity_per_ticker).clamp(min=0.0) / peak
+            net_worth = float(equity_per_ticker.sum().item())
+
             metrics_writer.log(
-                step=rollout_idx,
-                episode=rollout_idx,
+                step=state.global_tick,
+                rollout=rollout_idx,
+                episode=state.episode_idx,
+                record_type="rollout",
                 reward=rollout_reward_mean,
                 reward_ema=ema_reward,
                 sharpe=None,
@@ -258,10 +275,10 @@ def _worker(
                 net_worth=net_worth,
                 net_worth_per_ticker=equity_per_ticker.tolist(),
                 unrealized_pnl=unrealized_per_ticker.tolist(),
-                trades_this_rollout=trades_this_rollout,
-                total_trades=total_trades,
-                trades_per_ticker_this_rollout=trades_per_ticker_this_rollout,
-                total_trades_per_ticker=total_trades_per_ticker,
+                trades_this_rollout=int(sum(state.trades_this_rollout_per_ticker)),
+                trades_per_ticker_this_rollout=list(state.trades_this_rollout_per_ticker),
+                total_trades=int(sum(state.total_trades_per_ticker)),
+                total_trades_per_ticker=list(state.total_trades_per_ticker),
                 tickers=env.tickers,
                 position=env.portfolio.positions[:, 0].tolist(),
                 world_size=world_size,  # tag records so you can tell DDP runs apart from single-GPU ones in the log
@@ -275,8 +292,10 @@ def _worker(
                 "rollout_idx": rollout_idx,
                 "best_metric": best_metric,
                 "ema_reward": ema_reward,
-                "total_trades": total_trades,
-                "total_trades_per_ticker": total_trades_per_ticker,
+                "global_tick": state.global_tick,
+                "episode_idx": state.episode_idx,
+                "total_trades_per_ticker": state.total_trades_per_ticker,
+                "scaler": scaler.state_dict(),
             }
             if rollout_idx % cfg.run.checkpoint_every_n_rollouts == 0:
                 path = os.path.join(cfg.run.checkpoint_dir, f"checkpoint_{rollout_idx}.pt")
@@ -294,23 +313,34 @@ def _worker(
     _cleanup()
 
 
-def _ddp_ppo_update(ddp_model: DDP, optimizer: torch.optim.Optimizer, buffer, cfg: TrainingConfig) -> dict:
+
+
+def _ddp_ppo_update(
+    ddp_model: DDP,
+    optimizer: torch.optim.Optimizer,
+    buffer,
+    cfg: TrainingConfig,
+    scaler: "Optional[torch.cuda.amp.GradScaler]" = None,
+) -> dict:
     """
-    Line-for-line the same math as training/ppo_hybrid.py's ppo_update() --
-    the ONLY difference is that this calls submodules via `actor_critic =
+    Same math as training/ppo_hybrid.py's ppo_update() -- the ONLY
+    difference is that this calls submodules via `actor_critic =
     ddp_model.module` exactly as ppo_update() does (DDP does not intercept
     submodule calls), but the resulting `loss.backward()` call below is what
     actually triggers DDP's cross-GPU gradient all-reduce, because the
-    tensors in that graph were produced by parameters DDP is watching. See
-    this file's module docstring for why routing this through ddp_model at
-    all still matters even though we never call ddp_model.forward()
-    directly: DDP registers its hooks on the parameters, not on a specific
-    call path. If this drifts from ppo_hybrid.py's ppo_update() in anything
-    other than this docstring, that's a bug -- diff them.
+    tensors in that graph were produced by parameters DDP is watching.
+    Includes the same cfg.run.use_amp / cfg.model.use_gradient_checkpointing
+    handling as ppo_update() -- see that function's docstring for the full
+    rationale (autocast scoped to the CNN/LSTM/attention trunk only, never
+    the Beta-distribution policy math). If this drifts from
+    ppo_hybrid.py's ppo_update() in anything other than the DDP-specific
+    comments, that's a bug -- diff them.
     """
     actor_critic = ddp_model.module
     T, n_envs, window, n_features = buffer.obs.shape
     p = cfg.ppo
+    use_amp = bool(getattr(cfg.run, "use_amp", False)) and torch.cuda.is_available()
+    use_checkpoint = bool(getattr(cfg.model, "use_gradient_checkpointing", False))
 
     flat_direction_idx = buffer.direction_idx.reshape(T * n_envs)
     flat_size = buffer.size.reshape(T * n_envs)
@@ -328,18 +358,29 @@ def _ddp_ppo_update(ddp_model: DDP, optimizer: torch.optim.Optimizer, buffer, cf
     for _ in range(p.ppo_epochs):
         hidden = (buffer.initial_hidden[0].clone(), buffer.initial_hidden[1].clone())
 
-        cnn_seq_all = actor_critic.cnn(buffer.obs.reshape(T * n_envs, window, n_features))
-        cnn_seq_all = cnn_seq_all.reshape(T, n_envs, window, -1)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            flat_obs = buffer.obs.reshape(T * n_envs, window, n_features)
+            if use_checkpoint and torch.is_grad_enabled():
+                cnn_seq_all = torch.utils.checkpoint.checkpoint(
+                    actor_critic.cnn, flat_obs, use_reentrant=False
+                )
+            else:
+                cnn_seq_all = actor_critic.cnn(flat_obs)
+            cnn_seq_all = cnn_seq_all.reshape(T, n_envs, window, -1)
 
-        trunks = []
-        for t in range(T):  # MUST stay sequential -- see ppo_hybrid.py's module docstring
-            lstm_seq_t, hidden = actor_critic.lstm(cnn_seq_all[t], hidden)
-            lstm_last_t = lstm_seq_t[:, -1, :]
-            cnn_last_t = cnn_seq_all[t][:, -1, :]
-            attn_out_t = actor_critic.cross_attn(lstm_last_t)
-            trunks.append(actor_critic.fusion(cnn_last_t, attn_out_t))
-        trunk_all = torch.stack(trunks, dim=0)
-        flat_trunk = trunk_all.reshape(T * n_envs, -1)
+            trunks = []
+            for t in range(T):  # MUST stay sequential -- see ppo_hybrid.py's module docstring
+                lstm_seq_t, hidden = actor_critic.lstm(cnn_seq_all[t], hidden)
+                lstm_last_t = lstm_seq_t[:, -1, :]
+                cnn_last_t = cnn_seq_all[t][:, -1, :]
+                attn_out_t = actor_critic.cross_attn(lstm_last_t)
+                trunks.append(actor_critic.fusion(cnn_last_t, attn_out_t))
+            trunk_all = torch.stack(trunks, dim=0)
+            flat_trunk = trunk_all.reshape(T * n_envs, -1)
+
+        # Deliberately fp32 from here down -- see this function's and
+        # ppo_hybrid.py's ppo_update()'s docstrings.
+        flat_trunk = flat_trunk.float()
 
         log_prob_new, discrete_entropy, continuous_entropy = actor_critic.policy_head.evaluate_actions_split(
             flat_trunk, flat_direction_idx, flat_size, flat_limit_offset
@@ -365,9 +406,16 @@ def _ddp_ppo_update(ddp_model: DDP, optimizer: torch.optim.Optimizer, buffer, cf
         loss = policy_loss + p.value_loss_coef * value_loss - entropy_bonus
 
         optimizer.zero_grad()
-        loss.backward()  # <-- DDP all-reduces (averages) gradients across both GPUs here, automatically
-        grad_norm = torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), p.max_grad_norm)
-        optimizer.step()
+        if use_amp and scaler is not None:
+            scaler.scale(loss).backward()  # DDP all-reduces gradients across both GPUs here, automatically
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), p.max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()  # DDP all-reduces gradients across both GPUs here, automatically
+            grad_norm = torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), p.max_grad_norm)
+            optimizer.step()
 
         with torch.no_grad():
             approx_kl = (flat_log_prob_old - log_prob_new).mean().item()

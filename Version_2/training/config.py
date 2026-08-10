@@ -215,6 +215,20 @@ class ModelConfig:
     critic_hidden_dim: int = 64
     critic_dropout: float = 0.1
 
+    # ppo_hybrid.py's ppo_update() -- gradient-checkpoints the CNN's
+    # T*n_envs mega-batch forward pass (the single largest activation-memory
+    # consumer in the replay path, since it scales linearly with n_envs).
+    # Trades ~30% more compute (the CNN forward is recomputed during
+    # backward instead of its activations being kept) for a real reduction
+    # in peak VRAM -- worth it once n_envs gets large enough that memory,
+    # not compute, is the constraint (see training/config.py's module-level
+    # note on the 100-ticker scaling question). Off by default: verify it
+    # doesn't change training behavior on your setup before trusting it,
+    # same caution as use_amp below. Only the CNN is checkpointed here, not
+    # the LSTM loop -- checkpointing across the sequential, hidden-state-
+    # threading LSTM replay is a correctness risk this project's own
+    # ppo_hybrid.py docstring warns about at length; not attempted.
+    use_gradient_checkpointing: bool = False
 
 @dataclass
 class RiskConfig:
@@ -286,6 +300,18 @@ class RunConfig:
     checkpoint_dir: str = "checkpoints"
     checkpoint_every_n_rollouts: int = 25
     log_every_n_rollouts: int = 1
+
+    # training/ppo_hybrid.py's ppo_update() -- mixed-precision (fp16)
+    # autocast, scoped ONLY to the CNN/LSTM/cross-attention/fusion trunk
+    # (the memory- and compute-heavy linear algebra), never to
+    # model/hybrid_policy.py's Beta-distribution log-prob/entropy math or
+    # the PPO loss itself -- those stay fp32 always, per hybrid_policy.py's
+    # own "highest-risk file" warning about numerical fragility near the
+    # (0,1) boundary (its _EPS=1e-6 guard is close to fp16's precision
+    # floor). Off by default -- verify against an fp32 run on your actual
+    # data before trusting it for a real training run; this was written
+    # without access to a GPU to test it against.
+    use_amp: bool = False
 
     # monitoring/dashboard.py -- see resolve_mode()'s precedence (explicit
     # --kaggle/--local CLI flag > this value > env-var auto-detection) and

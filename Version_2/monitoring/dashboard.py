@@ -80,12 +80,25 @@ class MetricsWriter:
         os.makedirs(parent, exist_ok=True)
         self._fh = open(path, "a", buffering=1)
 
-    def log(self, step: int, **metrics: Any) -> None:
+    def log(self, step: int, fsync: bool = True, **metrics: Any) -> None:
+        """
+        fsync=True (default) is what every rollout-level log() call should
+        keep using -- one call per ~256 env-steps, fsync cost is
+        negligible. Tick-level logging (once per env-step -- see
+        train.py's per-tick MetricsWriter usage) calls this with
+        fsync=False: flush() still happens (so a concurrent reader sees the
+        line immediately -- MetricsReader.tail() does a plain file read,
+        not an OS-buffered one), but the disk-sync syscall is skipped,
+        since paying an fsync 256x per rollout instead of once is a real,
+        avoidable cost for data that's inherently disposable (a lost tick
+        record on a crash is nothing like a lost checkpoint).
+        """
         record = {"step": step, "wall_time": time.time(), **metrics}
         self._fh.write(json.dumps(record, default=_json_default) + "\n")
         if self.flush_every_call:
             self._fh.flush()
-            os.fsync(self._fh.fileno())
+            if fsync:
+                os.fsync(self._fh.fileno())
 
     def close(self) -> None:
         self._fh.close()
@@ -262,12 +275,28 @@ class TrainingDashboard:
         history = self.reader.tail(self.history_window)
         if not history:
             return
-        latest = history[-1]
+        latest = history[-1]  # newest record of ANY type -- used only for staleness/liveness
 
-        # "is this actually new data, or the same last line as before" --
-        # drives both the spinner (only animates on real progress) and the
-        # rollouts/sec throughput estimate below.
-        step = latest.get("step")
+        # Tick records now dominate the log (one per env-step vs. one per
+        # 256-step rollout), so "the last line" and "the last rollout
+        # summary" are usually different records. Find each explicitly
+        # rather than assuming history[-1] is a rollout record like the
+        # single-granularity version of this file did. record_type is
+        # absent on any log written before this revision -- treated as
+        # "rollout" for backward compatibility with old metrics files.
+        latest_tick = next((r for r in reversed(history) if r.get("record_type") == "tick"), None)
+        latest_rollout = next((r for r in reversed(history) if r.get("record_type", "rollout") != "tick"), None)
+        if latest_tick is None:
+            latest_tick = latest_rollout
+        if latest_rollout is None:
+            latest_rollout = latest_tick
+        if latest_tick is None:
+            return
+
+        # "is this actually new data" drives the spinner + throughput --
+        # keyed off the tick stream now (global_tick), since that's what
+        # actually updates every single poll once training is tick-logging.
+        step = latest_tick.get("step")
         now = time.time()
         is_new_step = step != self._last_step
         if is_new_step:
@@ -275,7 +304,7 @@ class TrainingDashboard:
         self._last_step = step
         self._last_render_time = now
 
-        renderable = self._build_renderable(latest, history, now, is_new_step)
+        renderable = self._build_renderable(latest_tick, latest_rollout, history, now, is_new_step)
 
         if self._output_widget is not None:
             self.start()
@@ -340,12 +369,21 @@ class TrainingDashboard:
     # ----------------------------------------------------------------
 
     def _build_renderable(
-        self, latest: Dict[str, Any], history: List[Dict[str, Any]], now: float, is_new_step: bool
+        self,
+        tick_record: Dict[str, Any],
+        rollout_record: Dict[str, Any],
+        history: List[Dict[str, Any]],
+        now: float,
+        is_new_step: bool,
     ) -> Group:
-        reward = latest.get("reward")
-        reward_ema = latest.get("reward_ema")
-        drawdown = latest.get("drawdown")
-        net_worth = latest.get("net_worth")
+        # PPO training stats (reward, sharpe, policy/value loss) only exist
+        # at rollout granularity -- read those from rollout_record. Live
+        # position/net-worth/drawdown/trades read from tick_record, which
+        # updates every single env-step, not once per 256.
+        reward = rollout_record.get("reward")
+        reward_ema = rollout_record.get("reward_ema")
+        drawdown = tick_record.get("drawdown")
+        net_worth = tick_record.get("net_worth")
 
         net_worth_color = None
         if net_worth is not None and self._prev_net_worth is not None:
@@ -356,38 +394,43 @@ class TrainingDashboard:
         if net_worth is not None:
             self._prev_net_worth = net_worth
 
-        # throughput -- rollouts/sec over the visible history window, a
-        # cheap "is this actually moving" signal independent of any single
-        # metric's own trend
-        rollouts_per_sec = None
-        if len(history) >= 2:
-            span_steps = (history[-1].get("step") or 0) - (history[0].get("step") or 0)
-            span_time = (history[-1].get("wall_time") or now) - (history[0].get("wall_time") or now)
+        # throughput -- ticks/sec over the visible history window (now that
+        # "step" means real env-ticks, this is real market-bar throughput,
+        # not "rollouts/sec")
+        ticks_per_sec = None
+        tick_history = [r for r in history if r.get("record_type") == "tick"]
+        if len(tick_history) >= 2:
+            span_steps = (tick_history[-1].get("step") or 0) - (tick_history[0].get("step") or 0)
+            span_time = (tick_history[-1].get("wall_time") or now) - (tick_history[0].get("wall_time") or now)
             if span_time > 0 and span_steps > 0:
-                rollouts_per_sec = span_steps / span_time
+                ticks_per_sec = span_steps / span_time
 
         spinner = _SPINNER_FRAMES[self._frame_count % len(_SPINNER_FRAMES)] if is_new_step else "\u25cf"
         spinner_color = "green" if is_new_step else "yellow"
-        staleness = now - (latest.get("wall_time") or now)
+        staleness = now - (tick_record.get("wall_time") or now)
         live_note = "" if staleness < 30 else f"  [red](no new data for {int(staleness)}s -- check the training process)[/red]"
 
+        throughput_text = f"  |  {ticks_per_sec:.1f} ticks/s" if ticks_per_sec is not None else ""
+        halted_list = tick_record.get("halted")
+        n_halted = sum(1 for h in halted_list if h) if isinstance(halted_list, list) else 0
+        halted_note = f"  [bold white on red] {n_halted} HALTED [/bold white on red]" if n_halted > 0 else ""
+
         panel_lines = [
-            f"[{spinner_color}]{spinner}[/{spinner_color}] live  |  uptime {_fmt_uptime(now - self._start_time)}"
-            f"  |  {rollouts_per_sec:.2f} rollouts/s" if rollouts_per_sec is not None else
-            f"[{spinner_color}]{spinner}[/{spinner_color}] live  |  uptime {_fmt_uptime(now - self._start_time)}",
-            f"step:              {latest.get('step')}{live_note}",
-            f"episode:           {latest.get('episode')}",
-            f"reward:            {_fmt_colored(reward, good_is='positive')}",
+            f"[{spinner_color}]{spinner}[/{spinner_color}] live  |  uptime {_fmt_uptime(now - self._start_time)}{throughput_text}{halted_note}",
+            f"tick (env-steps):  {tick_record.get('step')}{live_note}",
+            f"rollout:           {rollout_record.get('rollout', rollout_record.get('step'))}",
+            f"episode (passes):  {rollout_record.get('episode')}",
+            f"reward:            {_fmt_colored(reward, good_is='positive')}   (as of last rollout)",
             f"reward (EMA):      {_fmt_colored(reward_ema, good_is='positive')}",
             f"net worth (total): {_fmt_colored(net_worth, good_is=None, color=net_worth_color, dollar=True)}",
-            f"sharpe:            {_fmt(latest.get('sharpe'))}",
+            f"sharpe:            {_fmt(rollout_record.get('sharpe'))}",
             f"drawdown (avg):    {_fmt_colored(drawdown, good_is='small_pct', pct=True)}",
-            f"trades (rollout):  {_fmt_int(latest.get('trades_this_rollout'))}",
-            f"trades (total):    {_fmt_int(latest.get('total_trades'))}",
+            f"trades (rollout):  {_fmt_int(tick_record.get('trades_this_rollout'))}   (live)",
+            f"trades (total):    {_fmt_int(tick_record.get('total_trades'))}",
         ]
         header = Panel("\n".join(panel_lines), title="Training Status", expand=False)
 
-        table = Table(title=f"Per-Environment State  (frame #{self._frame_count})")
+        table = Table(title=f"Per-Environment State  (tick #{tick_record.get('step')}, frame #{self._frame_count})")
         table.add_column("Ticker")
         table.add_column("Position", justify="right")
         table.add_column("Net Worth", justify="right")
@@ -395,17 +438,20 @@ class TrainingDashboard:
         table.add_column("Drawdown", justify="right")
         table.add_column("Trades (rollout)", justify="right")
         table.add_column("Trades (total)", justify="right")
+        table.add_column("Status")
 
-        tickers = latest.get("tickers")
-        position = latest.get("position")
+        tickers = tick_record.get("tickers")
+        position = tick_record.get("position")
 
         if isinstance(tickers, list) and isinstance(position, list):
             n = len(tickers)
-            net_worth_per_ticker = _as_list(latest.get("net_worth_per_ticker"), n)
-            unrealized = _as_list(latest.get("unrealized_pnl"), n)
-            drawdown_per_ticker = _as_list(latest.get("drawdown_per_ticker"), n)
-            trades_rollout_per_ticker = _as_list(latest.get("trades_per_ticker_this_rollout"), n)
-            trades_total_per_ticker = _as_list(latest.get("total_trades_per_ticker"), n)
+            net_worth_per_ticker = _as_list(tick_record.get("net_worth_per_ticker"), n)
+            unrealized = _as_list(tick_record.get("unrealized_pnl"), n)
+            drawdown_per_ticker = _as_list(tick_record.get("drawdown_per_ticker"), n)
+            trades_rollout_per_ticker = _as_list(tick_record.get("trades_per_ticker_this_rollout"), n)
+            trades_total_per_ticker = _as_list(tick_record.get("total_trades_per_ticker"), n)
+            filled_this_tick = _as_list(tick_record.get("filled_qty_this_tick"), n)
+            halted_per_ticker = _as_list(tick_record.get("halted"), n)
 
             for i, ticker in enumerate(tickers):
                 nw = net_worth_per_ticker[i]
@@ -426,11 +472,30 @@ class TrainingDashboard:
 
                 trades_this = trades_rollout_per_ticker[i]
                 trades_total = trades_total_per_ticker[i]
-                # highlight (bold cyan) any env that actually traded THIS
-                # rollout, so per-env activity is visible at a glance
-                # instead of having to compare numbers frame to frame.
-                just_traded = trades_this is not None and trades_this not in (0, "0")
+                # "just traded" now means THIS exact tick (filled_qty_this_tick),
+                # not merely nonzero somewhere in the current rollout -- a much
+                # tighter, more truthful signal of live per-env activity.
+                fq = filled_this_tick[i]
+                just_traded = fq is not None and fq != 0
                 trades_this_text = f"[bold cyan]{_fmt_int(trades_this)}[/bold cyan]" if just_traded else _fmt_int(trades_this)
+
+                is_halted = bool(halted_per_ticker[i]) if halted_per_ticker[i] is not None else False
+                # A per-env bankrupt/kill-switch flag -- "bankrupt" isn't a
+                # field KillSwitch tracks directly, so treat equity <= 0 as
+                # the bankrupt case (harder, more final) and any other halt
+                # reason as a plain halt; both render as a full-row
+                # highlight so a flagged env can't be missed while
+                # scrolling, without needing to read every cell.
+                is_bankrupt = nw is not None and nw <= 0
+                if is_bankrupt:
+                    status_text = "[bold white on red]BANKRUPT[/bold white on red]"
+                    row_style = "on red"
+                elif is_halted:
+                    status_text = "[bold black on yellow]HALTED[/bold black on yellow]"
+                    row_style = "on yellow"
+                else:
+                    status_text = ""
+                    row_style = None
 
                 table.add_row(
                     str(ticker),
@@ -440,9 +505,11 @@ class TrainingDashboard:
                     _fmt_colored(drawdown_per_ticker[i], good_is="small_pct", pct=True),
                     trades_this_text,
                     _fmt_int(trades_total),
+                    status_text,
+                    style=row_style,
                 )
         else:
-            table.add_row("(no per-ticker breakdown in this record)", "", "", "", "", "", "")
+            table.add_row("(no per-ticker breakdown in this record)", "", "", "", "", "", "", "")
 
         return Group(header, table)
 

@@ -5,17 +5,41 @@ Entry point for Phase 4: loads config, builds the env + model + risk
 pipeline, runs training/ppo_hybrid.py's rollout/GAE/update loop, and
 checkpoints periodically.
 
+Metrics come in two flavors now, both through the same MetricsWriter/
+metrics_path, distinguished by a "record_type" field:
+
+    "tick"    -- one record per real env-step (one 5-min market bar
+                 processed across all tickers). Written from inside
+                 collect_rollout()'s loop via the tick_callback hook
+                 training/ppo_hybrid.py exposes for exactly this purpose.
+                 Carries live position/equity/drawdown/fills -- no PPO
+                 training stats, since those genuinely don't exist at
+                 tick resolution (policy_loss etc. are only computed once
+                 per full rollout, after ppo_update() runs).
+    "rollout" -- one record per cfg.ppo.rollout_length-step rollout (the
+                 old, only, granularity before this revision). Carries
+                 PPO stats (policy_loss, value_loss, approx_kl, ...) plus
+                 the same net-worth/trade summary fields as before.
+
+Three genuinely different counters, previously conflated (both "step" and
+"episode" used to just be rollout_idx logged twice under different names):
+    global_tick -- real env-steps processed, ever. Increments every tick.
+    rollout_idx -- which PPO rollout (cfg.ppo.rollout_length-step batch)
+                   we're on. Increments once per collect_rollout() call.
+    episode_idx -- how many full passes through the training split have
+                   completed (vec_trading_env.py's `done` firing). This is
+                   what "episode" means in the normal RL sense; increments
+                   far less often than rollout_idx.
+
 This file NEVER imports monitoring.dashboard's Rich-dependent pieces --
 only MetricsWriter, which is dependency-light and crash-isolated from
-training by design (see monitoring/dashboard.py's module docstring). If you
-want a live view while training, run the dashboard against the same
-metrics_path from a separate cell/process; that process is the one that
-imports Rich/IPython.
+training by design (see monitoring/dashboard.py's module docstring).
 """
 
 import argparse
 import os
 import sys
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import torch
@@ -27,7 +51,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "env"))
 
 from dataset import MultiTickerRolloutDataset  # noqa: E402
 from paths import is_kaggle  # noqa: E402
-from vec_trading_env import VecTradingEnv  # noqa: E402
+from vec_trading_env import VecTradingEnv, StepResult  # noqa: E402
 
 from training.config import TrainingConfig  # noqa: E402
 from training.ppo_hybrid import HybridActorCritic, collect_rollout, compute_gae, ppo_update  # noqa: E402
@@ -44,9 +68,7 @@ def build_risk_pipeline(cfg: TrainingConfig, n_envs: int, device: torch.device):
     """
     Shared construction, kept in one place because train.py, train_ddp.py,
     eval/backtest_report.py, and live/live_loop.py all build the exact same
-    three objects from the exact same cfg.risk fields -- this is the one
-    spot to update if RiskConfig ever grows a field the others forget to
-    thread through.
+    three objects from the exact same cfg.risk fields.
     """
     kelly_sizer = KellySizer(
         n_envs=n_envs,
@@ -75,6 +97,94 @@ def build_risk_pipeline(cfg: TrainingConfig, n_envs: int, device: torch.device):
         device=str(device),
     )
     return kelly_sizer, risk_manager, kill_switch
+
+
+@dataclass
+class _TickState:
+    """
+    Mutable counters threaded into the tick_callback closure below. A plain
+    class instead of nonlocal ints because tick_callback is defined once
+    but rollout_idx/global_tick/episode_idx all change across calls, and
+    Python closures can't reassign an outer int without nonlocal
+    boilerplate for every single field -- attribute mutation on a shared
+    object is simpler here.
+    """
+
+    n_envs: int
+    global_tick: int = 0
+    episode_idx: int = 0
+    rollout_idx: int = 0
+    total_trades_per_ticker: List[int] = field(default_factory=list)
+    trades_this_rollout_per_ticker: List[int] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.total_trades_per_ticker:
+            self.total_trades_per_ticker = [0] * self.n_envs
+        if not self.trades_this_rollout_per_ticker:
+            self.trades_this_rollout_per_ticker = [0] * self.n_envs
+
+    def start_new_rollout(self) -> None:
+        self.trades_this_rollout_per_ticker = [0] * self.n_envs
+
+
+def make_tick_callback(env: VecTradingEnv, metrics_writer: MetricsWriter, state: _TickState):
+    """
+    Returns a closure matching training/ppo_hybrid.py's collect_rollout()
+    tick_callback signature. Logs one "tick" record per real env-step --
+    live position/equity/drawdown/fills, no PPO stats (those only exist at
+    rollout granularity). fsync=False on every call: see MetricsWriter.log's
+    docstring on why paying a disk-sync syscall 256x per rollout instead of
+    once is worth avoiding for data this disposable.
+    """
+
+    def tick_callback(
+        local_t: int,
+        step_result: StepResult,
+        final_direction: torch.Tensor,
+        final_size: torch.Tensor,
+        kill_switch: KillSwitch,
+    ) -> None:
+        state.global_tick += 1
+
+        filled_qty = step_result.info["filled_qty"]
+        filled_list = filled_qty.tolist()
+        for i, qty in enumerate(filled_list):
+            if qty != 0:
+                state.trades_this_rollout_per_ticker[i] += 1
+                state.total_trades_per_ticker[i] += 1
+
+        equity_per_ticker = step_result.info["equity"]
+        drawdown_per_ticker = step_result.info["drawdown"]
+        position_per_ticker = step_result.info["position"]
+
+        # unrealized PnL isn't in step_result.info (see vec_trading_env.py's
+        # StepResult) -- cheap enough to recompute directly off the
+        # portfolio's current mark, same accessor env.step() itself used.
+        mid_price_now = env._current_prices()  # noqa: SLF001
+        unrealized_per_ticker = env.portfolio.unrealized_pnl(mid_price_now.unsqueeze(1))
+
+        metrics_writer.log(
+            step=state.global_tick,
+            rollout=state.rollout_idx,
+            episode=state.episode_idx,
+            record_type="tick",
+            tickers=env.tickers,
+            position=position_per_ticker.tolist(),
+            net_worth=float(equity_per_ticker.sum().item()),
+            net_worth_per_ticker=equity_per_ticker.tolist(),
+            unrealized_pnl=unrealized_per_ticker.tolist(),
+            drawdown=float(drawdown_per_ticker.mean().item()),
+            drawdown_per_ticker=drawdown_per_ticker.tolist(),
+            filled_qty_this_tick=filled_list,
+            trades_this_rollout=int(sum(state.trades_this_rollout_per_ticker)),
+            trades_per_ticker_this_rollout=list(state.trades_this_rollout_per_ticker),
+            total_trades=int(sum(state.total_trades_per_ticker)),
+            total_trades_per_ticker=list(state.total_trades_per_ticker),
+            halted=kill_switch.is_halted().tolist(),
+            fsync=False,
+        )
+
+    return tick_callback
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -137,8 +247,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     start_rollout = 0
     best_metric = float("-inf")
     ema_reward = None
-    total_trades = 0
-    total_trades_per_ticker = [0] * env.n_envs
+    state = _TickState(n_envs=env.n_envs)
+
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location=device)
         actor_critic.load_state_dict(checkpoint["actor_critic"])
@@ -146,19 +256,14 @@ def main(argv: Optional[List[str]] = None) -> None:
         start_rollout = checkpoint["rollout_idx"] + 1
         best_metric = checkpoint.get("best_metric", float("-inf"))
         ema_reward = checkpoint.get("ema_reward", None)
-        total_trades = checkpoint.get("total_trades", 0)
-        # .get() with a default + length guard so resuming from a checkpoint
-        # saved before per-ticker trade counting existed (or against a
-        # different ticker count) doesn't crash -- it just restarts
-        # per-ticker tracking from zero rather than carrying over
-        # mismatched-length state.
-        saved_per_ticker = checkpoint.get("total_trades_per_ticker", None)
-        if isinstance(saved_per_ticker, list) and len(saved_per_ticker) == env.n_envs:
-            total_trades_per_ticker = saved_per_ticker
+        state.global_tick = checkpoint.get("global_tick", 0)
+        state.episode_idx = checkpoint.get("episode_idx", 0)
+        saved_total = checkpoint.get("total_trades_per_ticker", None)
+        if isinstance(saved_total, list) and len(saved_total) == env.n_envs:
+            state.total_trades_per_ticker = saved_total
         print(f"[train] resumed from {args.resume} at rollout {start_rollout} "
-              f"(best_metric so far: {best_metric if best_metric != float('-inf') else 'none yet'}, "
-              f"total_trades so far: {total_trades})")
-
+              f"(global_tick={state.global_tick}, episode={state.episode_idx}, "
+              f"best_metric so far: {best_metric if best_metric != float('-inf') else 'none yet'})")
     kelly_sizer, risk_manager, kill_switch = build_risk_pipeline(cfg, env.n_envs, device)
     reward_shaper = DifferentialSharpeReward(
         n_envs=env.n_envs,
@@ -170,34 +275,44 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
 
     metrics_writer = MetricsWriter(cfg.run.metrics_path)
+    tick_callback = make_tick_callback(env, metrics_writer, state)
+
+    # Created ONCE, outside the rollout loop -- see ppo_hybrid.py's
+    # ppo_update() docstring on why a fresh scaler per call would defeat
+    # its own loss-scale adaptation. enabled=False when cfg.run.use_amp is
+    # off makes every scaler method a no-op, so this is safe to always
+    # construct and pass regardless of the flag.
+    scaler = torch.cuda.amp.GradScaler(enabled=cfg.run.use_amp)
+    if args.resume is not None and "scaler" in checkpoint:
+        scaler.load_state_dict(checkpoint["scaler"])
 
     obs = env.reset()
     hidden = actor_critic.init_hidden(env.n_envs, device)
     kill_switch.start_new_day(env.portfolio.equity(env._current_prices().unsqueeze(1)))  # noqa: SLF001
 
     for rollout_idx in range(start_rollout, cfg.run.total_rollouts):
+        state.rollout_idx = rollout_idx
+        state.start_new_rollout()
+
         buffer, obs, final_value, hidden = collect_rollout(
-            env, actor_critic, kelly_sizer, risk_manager, kill_switch, reward_shaper, obs, hidden, cfg
+            env, actor_critic, kelly_sizer, risk_manager, kill_switch, reward_shaper, obs, hidden, cfg,
+            tick_callback=tick_callback,
         )
         compute_gae(buffer, final_value, cfg.ppo.gamma, cfg.ppo.gae_lambda)
-        stats = ppo_update(actor_critic, optimizer, buffer, cfg)
+        stats = ppo_update(actor_critic, optimizer, buffer, cfg, scaler=scaler)
 
         if buffer.done.any():
+            # end of a full pass through the training split -- a real
+            # episode boundary in the RL sense, not a rollout boundary.
+            state.episode_idx += 1
             obs = env.reset()
             hidden = actor_critic.init_hidden(env.n_envs, device)
             kelly_sizer.reset()
             reward_shaper.reset()
             # KillSwitch.reset() clears any halt tripped during the pass
-            # that just ended -- a deliberate departure from
-            # kill_switch.py's live-trading semantics (halt persists until
-            # a human explicitly clears it). During TRAINING, an early halt
-            # (near-inevitable: random-init policy + real transaction costs
-            # vs a modest per-stream starting balance) would otherwise
-            # silently zero out ALL real trading signal for the rest of the
-            # run. Confirmed directly: without this, a halt at rollout 0
-            # produced exactly 0.0 reward for 150+ subsequent rollouts with
-            # zero real fills, while the policy still "trained" on that
-            # empty signal.
+            # that just ended -- see this function's earlier version for
+            # the full rationale (training-only departure from
+            # kill_switch.py's live-trading "never auto-clear" semantics).
             kill_switch.reset()
             kill_switch.start_new_day(env.portfolio.equity(env._current_prices().unsqueeze(1)))  # noqa: SLF001
 
@@ -207,36 +322,19 @@ def main(argv: Optional[List[str]] = None) -> None:
             alpha * rollout_reward_mean + (1 - alpha) * ema_reward
         )
 
-        # Per-ticker net worth / unrealized PnL / drawdown -- each stream
-        # started this episode at cfg.env.initial_cash independently (NOT
-        # one shared pool), so these are genuinely per-env numbers, not a
-        # single account balance split up after the fact. net_worth (the
-        # scalar) is just their sum, kept for the dashboard's header total.
         current_prices_unsq = env._current_prices().unsqueeze(1)  # noqa: SLF001
-        equity_per_ticker = env.portfolio.equity(current_prices_unsq)              # [n_envs]
-        unrealized_per_ticker = env.portfolio.unrealized_pnl(current_prices_unsq)  # [n_envs]
-        # Read-only: portfolio.peak_equity was already advanced inside
-        # env.step() via update_drawdown_tracking() -- do NOT call that
-        # again here, it would double-advance the peak.
+        equity_per_ticker = env.portfolio.equity(current_prices_unsq)
+        unrealized_per_ticker = env.portfolio.unrealized_pnl(current_prices_unsq)
         peak = env.portfolio.peak_equity.clamp(min=1e-6)
         drawdown_per_ticker = (peak - equity_per_ticker).clamp(min=0.0) / peak
         net_worth = float(equity_per_ticker.sum().item())
 
-        # Trade counts, both aggregate (unchanged) and per-ticker (new --
-        # this is what lets the dashboard show each env's own trade count
-        # updating independently instead of one system-wide number).
-        # buffer.filled_qty is [T, n_envs], signed, 0 where nothing filled.
-        trades_per_ticker_this_rollout = (buffer.filled_qty != 0).sum(dim=0).tolist()  # length n_envs
-        trades_this_rollout = int(sum(trades_per_ticker_this_rollout))
-        total_trades += trades_this_rollout
-        total_trades_per_ticker = [
-            total_trades_per_ticker[i] + trades_per_ticker_this_rollout[i] for i in range(env.n_envs)
-        ]
-
         if rollout_idx % cfg.run.log_every_n_rollouts == 0:
             metrics_writer.log(
-                step=rollout_idx,
-                episode=rollout_idx,
+                step=state.global_tick,
+                rollout=rollout_idx,
+                episode=state.episode_idx,
+                record_type="rollout",
                 reward=rollout_reward_mean,
                 reward_ema=ema_reward,
                 sharpe=None,  # per-rollout Sharpe isn't meaningful over 256 steps; see eval/metrics.py for the real thing at eval time
@@ -245,10 +343,10 @@ def main(argv: Optional[List[str]] = None) -> None:
                 net_worth=net_worth,
                 net_worth_per_ticker=equity_per_ticker.tolist(),
                 unrealized_pnl=unrealized_per_ticker.tolist(),
-                trades_this_rollout=trades_this_rollout,
-                total_trades=total_trades,
-                trades_per_ticker_this_rollout=trades_per_ticker_this_rollout,
-                total_trades_per_ticker=total_trades_per_ticker,
+                trades_this_rollout=int(sum(state.trades_this_rollout_per_ticker)),
+                trades_per_ticker_this_rollout=list(state.trades_this_rollout_per_ticker),
+                total_trades=int(sum(state.total_trades_per_ticker)),
+                total_trades_per_ticker=list(state.total_trades_per_ticker),
                 tickers=env.tickers,
                 position=env.portfolio.positions[:, 0].tolist(),
                 **stats,
@@ -260,8 +358,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             "rollout_idx": rollout_idx,
             "best_metric": best_metric,
             "ema_reward": ema_reward,
-            "total_trades": total_trades,
-            "total_trades_per_ticker": total_trades_per_ticker,
+            "global_tick": state.global_tick,
+            "episode_idx": state.episode_idx,
+            "total_trades_per_ticker": state.total_trades_per_ticker,
+            "scaler": scaler.state_dict(),
         }
 
         if rollout_idx % cfg.run.checkpoint_every_n_rollouts == 0:

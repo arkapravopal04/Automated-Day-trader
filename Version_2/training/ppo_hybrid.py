@@ -51,7 +51,7 @@ bottleneck; shuffling across time would not be.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -178,9 +178,22 @@ def collect_rollout(
     obs: torch.Tensor,
     hidden: Hidden,
     cfg: TrainingConfig,
+    tick_callback: Optional[Callable[[int, "StepResult", torch.Tensor, torch.Tensor, "KillSwitch"], None]] = None,
 ) -> Tuple[RolloutBuffer, torch.Tensor, torch.Tensor, Hidden]:
     """
     Runs cfg.ppo.rollout_length steps across all streams simultaneously.
+
+    tick_callback, if given, is called once per env-step (i.e. cfg.ppo.
+    rollout_length times per call to collect_rollout()) as
+    tick_callback(local_t, step_result, final_direction, final_size,
+    kill_switch) -- AFTER env.step() for that tick, so step_result.info
+    already reflects the fill/equity/position for that exact tick. This
+    exists purely so a caller (train.py) can log tick-level metrics without
+    collect_rollout() itself knowing anything about metrics/dashboards --
+    it never imports MetricsWriter, matching this project's existing
+    decoupling convention (see monitoring/dashboard.py's module docstring).
+    Left as None, behavior is byte-identical to before this parameter
+    existed.
 
     `obs` and `hidden` are the carry-over from the previous rollout (or from
     env.reset() / actor_critic.init_hidden() on the very first call) --
@@ -222,7 +235,7 @@ def collect_rollout(
     # module docstring warns about, but the same family: collect_rollout's
     # graph must be fully isolated from ppo_update()'s replay graph.
     with torch.no_grad():
-        for _ in range(T):
+        for local_t in range(T):
             mid_price = env._current_prices()  # noqa: SLF001 -- same accessor env.step() itself uses internally
             equity_before = env.portfolio.equity(mid_price.unsqueeze(1))
             position_before = torch.sign(env.portfolio.positions[:, 0])
@@ -279,6 +292,15 @@ def collect_rollout(
             filled_qty_buf.append(step_result.info["filled_qty"])
             reward_buf.append(shaped_reward)
             done_buf.append(step_result.done)
+
+            if tick_callback is not None:
+                # Fires once per real env-step (a "tick"), not once per
+                # rollout -- see this function's docstring. step_result.info
+                # already reflects this exact tick's fill/equity/position;
+                # final_direction/final_size are the fully-risk-processed
+                # action that was actually submitted, not the raw policy
+                # output.
+                tick_callback(local_t, step_result, final_direction, final_size, kill_switch)
 
             # NOTE: vec_trading_env.py currently signals `done` globally (the
             # whole dataset pass ends at once, not per-stream) -- this handles
@@ -358,6 +380,7 @@ def ppo_update(
     optimizer: torch.optim.Optimizer,
     buffer: RolloutBuffer,
     cfg: TrainingConfig,
+    scaler: "Optional[torch.cuda.amp.GradScaler]" = None,
 ) -> Dict[str, float]:
     """
     Replays the stored trajectory through the CURRENT network parameters
@@ -365,9 +388,26 @@ def ppo_update(
     warning about matching collect_rollout()'s forward pass exactly),
     recomputes the mixed log-prob and split entropy, and runs the clipped
     PPO objective for cfg.ppo.ppo_epochs full-batch epochs.
+
+    cfg.run.use_amp / cfg.model.use_gradient_checkpointing (both off by
+    default -- see training/config.py's fields for the full rationale):
+    when use_amp is True, `scaler` MUST be a torch.cuda.amp.GradScaler the
+    caller creates ONCE outside the rollout loop and passes into every
+    ppo_update() call (a fresh scaler each call would reset its loss-scale
+    adaptation every rollout, defeating the point). autocast covers ONLY
+    the CNN/LSTM/cross-attention/fusion trunk below -- policy_head/
+    critic_head and all loss math run in fp32 regardless of use_amp, since
+    model/hybrid_policy.py's Beta log-prob math is explicitly flagged in
+    that file's own docstring as numerically fragile near the (0,1)
+    boundary. Gradient checkpointing (when enabled) wraps ONLY the CNN's
+    T*n_envs mega-batch forward, not the sequential LSTM loop -- see
+    training/config.py's ModelConfig.use_gradient_checkpointing docstring
+    for why the LSTM loop is deliberately excluded.
     """
     T, n_envs, window, n_features = buffer.obs.shape
     p = cfg.ppo
+    use_amp = bool(getattr(cfg.run, "use_amp", False)) and torch.cuda.is_available()
+    use_checkpoint = bool(getattr(cfg.model, "use_gradient_checkpointing", False))
 
     flat_direction_idx = buffer.direction_idx.reshape(T * n_envs)
     flat_size = buffer.size.reshape(T * n_envs)
@@ -391,18 +431,37 @@ def ppo_update(
         # bug before changing anything below.
         hidden = (buffer.initial_hidden[0].clone(), buffer.initial_hidden[1].clone())
 
-        cnn_seq_all = actor_critic.cnn(buffer.obs.reshape(T * n_envs, window, n_features))
-        cnn_seq_all = cnn_seq_all.reshape(T, n_envs, window, -1)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            flat_obs = buffer.obs.reshape(T * n_envs, window, n_features)
+            if use_checkpoint and torch.is_grad_enabled():
+                # CNN is stateless/side-effect-free (see cnn_encoder.py), so
+                # checkpointing its forward is safe: recomputed during
+                # backward instead of keeping every conv block's activations
+                # around for all T*n_envs rows simultaneously -- this is the
+                # single biggest activation-memory line item as n_envs grows
+                # (see training/config.py's ModelConfig docstring).
+                cnn_seq_all = torch.utils.checkpoint.checkpoint(
+                    actor_critic.cnn, flat_obs, use_reentrant=False
+                )
+            else:
+                cnn_seq_all = actor_critic.cnn(flat_obs)
+            cnn_seq_all = cnn_seq_all.reshape(T, n_envs, window, -1)
 
-        trunks: List[torch.Tensor] = []
-        for t in range(T):  # MUST stay sequential -- see module docstring
-            lstm_seq_t, hidden = actor_critic.lstm(cnn_seq_all[t], hidden)
-            lstm_last_t = lstm_seq_t[:, -1, :]
-            cnn_last_t = cnn_seq_all[t][:, -1, :]
-            attn_out_t = actor_critic.cross_attn(lstm_last_t)
-            trunks.append(actor_critic.fusion(cnn_last_t, attn_out_t))
-        trunk_all = torch.stack(trunks, dim=0)  # [T, n_envs, trunk_dim]
-        flat_trunk = trunk_all.reshape(T * n_envs, -1)
+            trunks: List[torch.Tensor] = []
+            for t in range(T):  # MUST stay sequential -- see module docstring
+                lstm_seq_t, hidden = actor_critic.lstm(cnn_seq_all[t], hidden)
+                lstm_last_t = lstm_seq_t[:, -1, :]
+                cnn_last_t = cnn_seq_all[t][:, -1, :]
+                attn_out_t = actor_critic.cross_attn(lstm_last_t)
+                trunks.append(actor_critic.fusion(cnn_last_t, attn_out_t))
+            trunk_all = torch.stack(trunks, dim=0)  # [T, n_envs, trunk_dim]
+            flat_trunk = trunk_all.reshape(T * n_envs, -1)
+
+        # --- exit autocast here, deliberately: everything below is
+        # policy_head/critic_head distribution math and the PPO loss
+        # itself, kept fp32 regardless of use_amp (see this function's
+        # docstring).
+        flat_trunk = flat_trunk.float()
 
         log_prob_new, discrete_entropy, continuous_entropy = actor_critic.policy_head.evaluate_actions_split(
             flat_trunk, flat_direction_idx, flat_size, flat_limit_offset
@@ -429,9 +488,16 @@ def ppo_update(
         loss = policy_loss + p.value_loss_coef * value_loss - entropy_bonus
 
         optimizer.zero_grad()
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), p.max_grad_norm)
-        optimizer.step()
+        if use_amp and scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)  # must unscale before clip_grad_norm_, or the clip threshold is meaningless
+            grad_norm = torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), p.max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), p.max_grad_norm)
+            optimizer.step()
 
         with torch.no_grad():
             approx_kl = (flat_log_prob_old - log_prob_new).mean().item()
