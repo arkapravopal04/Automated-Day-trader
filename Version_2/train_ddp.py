@@ -135,6 +135,7 @@ def _worker(
     metrics_path: Optional[str] = None,
     checkpoint_every_n_rollouts: Optional[int] = None,
     log_every_n_rollouts: Optional[int] = None,
+    tick_log_every_n_ticks: Optional[int] = None,
 ) -> None:
     _setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
@@ -150,6 +151,8 @@ def _worker(
         cfg.run.checkpoint_every_n_rollouts = checkpoint_every_n_rollouts
     if log_every_n_rollouts is not None:
         cfg.run.log_every_n_rollouts = log_every_n_rollouts
+    if tick_log_every_n_ticks is not None:
+        cfg.run.tick_log_every_n_ticks = tick_log_every_n_ticks
     # Different seed per rank -> genuinely different rollouts (act() samples,
     # vec_trading_env.py's mirror_mask draw), not two copies of one trajectory.
     torch.manual_seed(cfg.run.seed + rank)
@@ -215,7 +218,10 @@ def _worker(
     # bother" (see its own docstring), so non-zero ranks pay zero tick-logging
     # overhead, not just a suppressed write.
     metrics_writer = MetricsWriter(cfg.run.metrics_path) if rank == 0 else None
-    tick_callback = make_tick_callback(env, metrics_writer, state) if rank == 0 else None
+    tick_callback = (
+        make_tick_callback(env, metrics_writer, state, log_every_n_ticks=cfg.run.tick_log_every_n_ticks)
+        if rank == 0 else None
+    )
 
     obs = env.reset()
     hidden = ddp_model.module.init_hidden(env.n_envs, device)
@@ -440,6 +446,7 @@ def launch_ddp_training(
     metrics_path: Optional[str] = None,
     checkpoint_every_n_rollouts: Optional[int] = None,
     log_every_n_rollouts: Optional[int] = None,
+    tick_log_every_n_ticks: Optional[int] = None,
 ) -> None:
     """
     Meant to be called from `python train_ddp.py ...` (a real subprocess),
@@ -463,6 +470,8 @@ def launch_ddp_training(
             argv += ["--total-rollouts", str(total_rollouts)]
         if resume is not None:
             argv += ["--resume", resume]
+        if tick_log_every_n_ticks is not None:
+            argv += ["--tick-log-every-n-ticks", str(tick_log_every_n_ticks)]
         # train.py's own argparse doesn't expose checkpoint_dir/metrics_path
         # overrides -- if you need those on the single-GPU fallback path
         # too, set cfg.run.checkpoint_dir / cfg.run.metrics_path directly in
@@ -475,7 +484,7 @@ def launch_ddp_training(
     mp.spawn(
         _worker,
         args=(world_size, total_rollouts, resume, checkpoint_dir, metrics_path,
-              checkpoint_every_n_rollouts, log_every_n_rollouts),
+              checkpoint_every_n_rollouts, log_every_n_rollouts, tick_log_every_n_ticks),
         nprocs=world_size,
         join=True,
     )
@@ -489,6 +498,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--metrics-path", type=str, default=None)
     parser.add_argument("--checkpoint-every-n-rollouts", type=int, default=None)
     parser.add_argument("--log-every-n-rollouts", type=int, default=None)
+    parser.add_argument(
+        "--tick-log-every-n-ticks", type=int, default=None,
+        help="Override cfg.run.tick_log_every_n_ticks. 1 = log every env-step (max dashboard resolution).",
+    )
     return parser.parse_args(argv)
 
 
@@ -501,4 +514,5 @@ if __name__ == "__main__":
         metrics_path=args.metrics_path,
         checkpoint_every_n_rollouts=args.checkpoint_every_n_rollouts,
         log_every_n_rollouts=args.log_every_n_rollouts,
+        tick_log_every_n_ticks=args.tick_log_every_n_ticks,
     )

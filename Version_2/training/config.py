@@ -313,6 +313,16 @@ class RunConfig:
     # without access to a GPU to test it against.
     use_amp: bool = False
 
+    # train.py's tick_callback -- write a "tick" metrics record every Nth
+    # real env-step rather than every single one. Counters (global_tick,
+    # trade tallies) still advance every real tick regardless -- this only
+    # throttles disk writes. 1 = log every tick (max resolution, max I/O);
+    # higher values trade update smoothness for less write volume. 5 gives
+    # ~51 tick records per 256-step rollout -- frequent enough to watch
+    # numbers move within a rollout instead of jumping once per 256 steps,
+    # without writing+fsyncing 256 times.
+    tick_log_every_n_ticks: int = 5
+
     # monitoring/dashboard.py -- see resolve_mode()'s precedence (explicit
     # --kaggle/--local CLI flag > this value > env-var auto-detection) and
     # TrainingDashboard.render_once()'s docstring.

@@ -127,14 +127,19 @@ class _TickState:
         self.trades_this_rollout_per_ticker = [0] * self.n_envs
 
 
-def make_tick_callback(env: VecTradingEnv, metrics_writer: MetricsWriter, state: _TickState):
+def make_tick_callback(
+    env: VecTradingEnv, metrics_writer: MetricsWriter, state: _TickState, log_every_n_ticks: int = 5
+):
     """
     Returns a closure matching training/ppo_hybrid.py's collect_rollout()
-    tick_callback signature. Logs one "tick" record per real env-step --
-    live position/equity/drawdown/fills, no PPO stats (those only exist at
-    rollout granularity). fsync=False on every call: see MetricsWriter.log's
-    docstring on why paying a disk-sync syscall 256x per rollout instead of
-    once is worth avoiding for data this disposable.
+    tick_callback signature. Every real env-step still advances state
+    (global_tick, trade tallies) so those numbers are always accurate --
+    only the metrics_writer.log() WRITE is throttled to every
+    log_every_n_ticks-th tick (default 5, see training/config.py's
+    RunConfig.tick_log_every_n_ticks). fsync=False on every write: see
+    MetricsWriter.log's docstring on why paying a disk-sync syscall dozens
+    of times per rollout instead of once is worth avoiding for data this
+    disposable.
     """
 
     def tick_callback(
@@ -152,6 +157,11 @@ def make_tick_callback(env: VecTradingEnv, metrics_writer: MetricsWriter, state:
             if qty != 0:
                 state.trades_this_rollout_per_ticker[i] += 1
                 state.total_trades_per_ticker[i] += 1
+
+        # Counters above always advance; the write below is throttled.
+        # log_every_n_ticks <= 1 means "log every tick" (max resolution).
+        if log_every_n_ticks > 1 and state.global_tick % log_every_n_ticks != 0:
+            return
 
         equity_per_ticker = step_result.info["equity"]
         drawdown_per_ticker = step_result.info["drawdown"]
@@ -193,6 +203,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--local", action="store_true", help="Force local paths/checkpointing.")
     parser.add_argument("--total-rollouts", type=int, default=None, help="Override cfg.run.total_rollouts.")
     parser.add_argument("--resume", type=str, default=None, help="Path to a checkpoint to resume from.")
+    parser.add_argument(
+        "--tick-log-every-n-ticks", type=int, default=None,
+        help="Override cfg.run.tick_log_every_n_ticks. 1 = log every env-step (max dashboard resolution).",
+    )
     return parser.parse_args(argv)
 
 
@@ -202,6 +216,8 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     if args.total_rollouts is not None:
         cfg.run.total_rollouts = args.total_rollouts
+    if args.tick_log_every_n_ticks is not None:
+        cfg.run.tick_log_every_n_ticks = args.tick_log_every_n_ticks
 
     on_kaggle = args.kaggle or (is_kaggle() and not args.local)
     if on_kaggle and cfg.run.checkpoint_dir == "checkpoints":
@@ -275,7 +291,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
 
     metrics_writer = MetricsWriter(cfg.run.metrics_path)
-    tick_callback = make_tick_callback(env, metrics_writer, state)
+    tick_callback = make_tick_callback(env, metrics_writer, state, log_every_n_ticks=cfg.run.tick_log_every_n_ticks)
 
     # Created ONCE, outside the rollout loop -- see ppo_hybrid.py's
     # ppo_update() docstring on why a fresh scaler per call would defeat
