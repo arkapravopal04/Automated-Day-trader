@@ -251,6 +251,23 @@ class RiskConfig:
     broker_error_streak_limit: int = 3
     state_mismatch_tolerance: float = 1e-3
 
+    # TRAINING-ONLY (train.py / train_ddp.py, not live_loop.py): how often,
+    # in rollouts, to force kill_switch.reset() + start_new_day() regardless
+    # of episode boundaries. kill_switch.py's daily_loss_limit_frac (3% by
+    # default) trips easily against a random early-training policy, and an
+    # "episode" here means one full pass through the ENTIRE training
+    # dataset -- potentially tens of thousands of bars. Without a shorter
+    # reset cadence, a stream tripped early stays halted for the rest of
+    # that enormous episode: not visibly broken (it still marks-to-market
+    # every tick, so its numbers keep moving), just silently contributing
+    # zero real trading signal for a very long time. 1 = reset every
+    # rollout (treats each 256-bar rollout as its own "day" for kill-switch
+    # purposes) -- aggressive, but appropriate for training where the
+    # actual goal is exploration, not a realistic daily-loss simulation
+    # (that's what eval/backtest_report.py and live/live_loop.py are for,
+    # and neither of those uses this field).
+    kill_switch_reset_every_n_rollouts: int = 1
+
     # order sizing that hybrid_policy.py's rescale_* helpers need but which
     # isn't itself derived from equity (a hard ceiling the network's
     # normalized (0,1) output gets mapped onto BEFORE kelly/risk clip it

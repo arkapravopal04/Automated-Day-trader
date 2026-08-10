@@ -253,6 +253,11 @@ def _worker(
             reward_shaper.reset()
             kill_switch.reset()  # training-only departure from live semantics -- see train.py's matching comment
             kill_switch.start_new_day(env.portfolio.equity(env._current_prices().unsqueeze(1)))  # noqa: SLF001
+        elif (rollout_idx + 1) % cfg.risk.kill_switch_reset_every_n_rollouts == 0:
+            # Episode boundaries are far too rare on their own -- see
+            # training/config.py's RiskConfig.kill_switch_reset_every_n_rollouts.
+            kill_switch.reset()
+            kill_switch.start_new_day(env.portfolio.equity(env._current_prices().unsqueeze(1)))  # noqa: SLF001
 
         rollout_reward_mean = buffer.reward.mean().item()
         alpha = cfg.run.best_metric_ema_alpha

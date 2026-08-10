@@ -135,18 +135,56 @@ class MetricsReader:
         self.path = path
 
     def tail(self, n: int) -> List[Dict[str, Any]]:
+        """
+        Reads only the last ~n lines, not the whole file. The previous
+        implementation did `f.readlines()` on the ENTIRE file every single
+        call -- fine for a short run, but with tick-level logging now
+        writing far more lines than the old rollout-only cadence, the file
+        keeps growing for the whole training run, and re-reading all of it
+        every poll gets progressively slower as it grows -- exactly the
+        kind of bug that looks like "updates aren't frequent enough" and
+        gets WORSE the longer training runs, not better. This reads
+        backward from the end of the file in chunks until it has at least
+        n newlines, which keeps the cost roughly constant regardless of
+        total file size.
+        """
         if not os.path.exists(self.path):
             return []
-        with open(self.path, "r") as f:
-            lines = f.readlines()
+
+        chunk_size = 65536
+        file_size = os.path.getsize(self.path)
+        if file_size == 0:
+            return []
+
+        with open(self.path, "rb") as f:
+            data = b""
+            pos = file_size
+            newline_count = 0
+            # +1 target: we need n complete lines, which means n+1 newlines
+            # scanned from EOF in the worst case (a trailing partial/no
+            # final newline) -- overshoot by one chunk rather than
+            # under-read and silently return fewer than n records.
+            while pos > 0 and newline_count <= n:
+                read_size = min(chunk_size, pos)
+                pos -= read_size
+                f.seek(pos)
+                data = f.read(read_size) + data
+                newline_count = data.count(b"\n")
+
+        text = data.decode("utf-8", errors="ignore")
+        lines = text.splitlines()[-n:]
+
         records: List[Dict[str, Any]] = []
-        for line in lines[-n:]:
+        for line in lines:
             line = line.strip()
             if not line:
                 continue
             try:
                 records.append(json.loads(line))
             except json.JSONDecodeError:
+                # a torn read of a line split mid-write (either the file's
+                # true last line still being flushed, or a chunk boundary
+                # landing mid-line) -- skip it, it'll read fine next poll.
                 continue
         return records
 
@@ -388,9 +426,9 @@ class TrainingDashboard:
         net_worth_color = None
         if net_worth is not None and self._prev_net_worth is not None:
             if net_worth > self._prev_net_worth:
-                net_worth_color = "green"
+                net_worth_color = "bright_green"
             elif net_worth < self._prev_net_worth:
-                net_worth_color = "red"
+                net_worth_color = "bright_red"
         if net_worth is not None:
             self._prev_net_worth = net_worth
 
@@ -406,14 +444,14 @@ class TrainingDashboard:
                 ticks_per_sec = span_steps / span_time
 
         spinner = _SPINNER_FRAMES[self._frame_count % len(_SPINNER_FRAMES)] if is_new_step else "\u25cf"
-        spinner_color = "green" if is_new_step else "yellow"
+        spinner_color = "bright_green" if is_new_step else "grey62"  # dim grey, not yellow -- see this file's dark-mode color notes
         staleness = now - (tick_record.get("wall_time") or now)
         live_note = "" if staleness < 30 else f"  [red](no new data for {int(staleness)}s -- check the training process)[/red]"
 
         throughput_text = f"  |  {ticks_per_sec:.1f} ticks/s" if ticks_per_sec is not None else ""
         halted_list = tick_record.get("halted")
         n_halted = sum(1 for h in halted_list if h) if isinstance(halted_list, list) else 0
-        halted_note = f"  [bold white on red] {n_halted} HALTED [/bold white on red]" if n_halted > 0 else ""
+        halted_note = f"  [bold white on dark_orange3] {n_halted} HALTED [/bold white on dark_orange3] " if n_halted > 0 else ""
 
         panel_lines = [
             f"[{spinner_color}]{spinner}[/{spinner_color}] live  |  uptime {_fmt_uptime(now - self._start_time)}{throughput_text}{halted_note}",
@@ -460,14 +498,14 @@ class TrainingDashboard:
                     prev = self._prev_net_worth_per_ticker.get(ticker)
                     if prev is not None:
                         if nw > prev:
-                            nw_color = "green"
+                            nw_color = "bright_green"
                         elif nw < prev:
-                            nw_color = "red"
+                            nw_color = "bright_red"
                     self._prev_net_worth_per_ticker[ticker] = nw
                 nw_text = _fmt_colored(nw, good_is=None, color=nw_color, dollar=True)
-                if nw_color == "green":
+                if nw_color == "bright_green":
                     nw_text = "\u25b2 " + nw_text
-                elif nw_color == "red":
+                elif nw_color == "bright_red":
                     nw_text = "\u25bc " + nw_text
 
                 trades_this = trades_rollout_per_ticker[i]
@@ -488,11 +526,11 @@ class TrainingDashboard:
                 # scrolling, without needing to read every cell.
                 is_bankrupt = nw is not None and nw <= 0
                 if is_bankrupt:
-                    status_text = "[bold white on red]BANKRUPT[/bold white on red]"
-                    row_style = "on red"
+                    status_text = "[bold white on bright_red]BANKRUPT[/bold white on bright_red]"
+                    row_style = "on bright_red"
                 elif is_halted:
-                    status_text = "[bold black on yellow]HALTED[/bold black on yellow]"
-                    row_style = "on yellow"
+                    status_text = "[bold white on dark_orange3]HALTED[/bold white on dark_orange3]"
+                    row_style = "on dark_orange3"
                 else:
                     status_text = ""
                     row_style = None
@@ -562,8 +600,8 @@ def _fmt_colored(
     resolved_color = color
     if resolved_color is None:
         if good_is == "positive":
-            resolved_color = "green" if v >= 0 else "red"
+            resolved_color = "bright_green" if v >= 0 else "bright_red"
         elif good_is == "small_pct":
-            resolved_color = "green" if v <= 0.10 else "red"
+            resolved_color = "bright_green" if v <= 0.10 else "bright_red"
 
     return f"[{resolved_color}]{text}[/{resolved_color}]" if resolved_color else text

@@ -331,6 +331,15 @@ def main(argv: Optional[List[str]] = None) -> None:
             # kill_switch.py's live-trading "never auto-clear" semantics).
             kill_switch.reset()
             kill_switch.start_new_day(env.portfolio.equity(env._current_prices().unsqueeze(1)))  # noqa: SLF001
+        elif (rollout_idx + 1) % cfg.risk.kill_switch_reset_every_n_rollouts == 0:
+            # The episode-boundary reset above fires far too rarely to be
+            # the ONLY reset during training -- see
+            # training/config.py's RiskConfig.kill_switch_reset_every_n_rollouts
+            # docstring. `elif`, not a second independent `if`: no point
+            # resetting twice in the same rollout when the episode boundary
+            # already did it.
+            kill_switch.reset()
+            kill_switch.start_new_day(env.portfolio.equity(env._current_prices().unsqueeze(1)))  # noqa: SLF001
 
         rollout_reward_mean = buffer.reward.mean().item()
         alpha = cfg.run.best_metric_ema_alpha
