@@ -193,3 +193,36 @@ class PortfolioState:
         self.peak_equity = torch.maximum(self.peak_equity, eq)
         drawdown = (self.peak_equity - eq) / self.peak_equity.clamp(min=1e-8)
         return drawdown
+
+    def reset_peak_equity(self, current_prices: torch.Tensor, env_mask: Optional[torch.Tensor] = None) -> None:
+        """
+        Re-baselines peak_equity to CURRENT equity, WITHOUT touching cash,
+        positions, realized PnL, or commission history -- unlike reset(),
+        this doesn't liquidate or forget anything real, it only changes what
+        "underwater" is measured against going forward.
+
+        Exists for the same reason kill_switch.py needed a training-only
+        periodic reset: risk_manager.py's RiskLimits.drawdown_halt_frac
+        compares current equity against this peak, and the peak here is
+        otherwise a true all-time high that (correctly, for live trading)
+        never resets on its own. During TRAINING, that peak gets set once
+        early and then a struggling policy can sit in "underwater" territory
+        for the rest of a very long episode (see paths.py/dataset.py -- an
+        episode is one full pass through the training split, potentially
+        tens of thousands of bars) -- RiskManager quietly forces reduce_only
+        mode for that entire stretch, with no error and no KillSwitch flag,
+        which looks exactly like "the policy stopped trading for no reason."
+        Calling this periodically during training (see train.py's matching
+        comment) prevents that without ever touching real portfolio state.
+
+        NEVER call this in eval/backtest_report.py or live/live_loop.py --
+        cheating the drawdown reference is a real training-only easement,
+        not something a go/no-go backtest or live risk pipeline should do.
+        """
+        current_prices = current_prices.to(self.device)
+        eq = self.equity(current_prices)
+        if env_mask is None:
+            self.peak_equity = eq.clone()
+        else:
+            env_mask = env_mask.to(self.device)
+            self.peak_equity[env_mask] = eq[env_mask]

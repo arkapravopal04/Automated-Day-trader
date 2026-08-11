@@ -128,7 +128,7 @@ class _TickState:
 
 
 def make_tick_callback(
-    env: VecTradingEnv, metrics_writer: MetricsWriter, state: _TickState, log_every_n_ticks: int = 5
+    env: VecTradingEnv, metrics_writer: MetricsWriter, state: _TickState, log_every_n_ticks: int = 2
 ):
     """
     Returns a closure matching training/ppo_hybrid.py's collect_rollout()
@@ -186,6 +186,7 @@ def make_tick_callback(
             drawdown=float(drawdown_per_ticker.mean().item()),
             drawdown_per_ticker=drawdown_per_ticker.tolist(),
             filled_qty_this_tick=filled_list,
+            price_per_ticker=mid_price_now.tolist(),
             trades_this_rollout=int(sum(state.trades_this_rollout_per_ticker)),
             trades_per_ticker_this_rollout=list(state.trades_this_rollout_per_ticker),
             total_trades=int(sum(state.total_trades_per_ticker)),
@@ -340,6 +341,13 @@ def main(argv: Optional[List[str]] = None) -> None:
             # already did it.
             kill_switch.reset()
             kill_switch.start_new_day(env.portfolio.equity(env._current_prices().unsqueeze(1)))  # noqa: SLF001
+            # Same rationale, different module: risk_manager.py's
+            # drawdown_halt_frac compares against portfolio.peak_equity,
+            # which is otherwise a true all-time high that never resets on
+            # its own -- see PortfolioState.reset_peak_equity()'s docstring
+            # for the full story (this is what "stopped trading, episodes
+            # just roll by, no errors" actually was).
+            env.portfolio.reset_peak_equity(env._current_prices().unsqueeze(1))  # noqa: SLF001
 
         rollout_reward_mean = buffer.reward.mean().item()
         alpha = cfg.run.best_metric_ema_alpha

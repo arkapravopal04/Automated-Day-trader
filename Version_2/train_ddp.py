@@ -258,6 +258,10 @@ def _worker(
             # training/config.py's RiskConfig.kill_switch_reset_every_n_rollouts.
             kill_switch.reset()
             kill_switch.start_new_day(env.portfolio.equity(env._current_prices().unsqueeze(1)))  # noqa: SLF001
+            # See PortfolioState.reset_peak_equity()'s docstring -- same
+            # "stuck for the rest of a huge episode" failure mode, in
+            # risk_manager.py's drawdown_halt_frac instead of KillSwitch.
+            env.portfolio.reset_peak_equity(env._current_prices().unsqueeze(1))  # noqa: SLF001
 
         rollout_reward_mean = buffer.reward.mean().item()
         alpha = cfg.run.best_metric_ema_alpha

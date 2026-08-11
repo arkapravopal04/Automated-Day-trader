@@ -252,20 +252,39 @@ class RiskConfig:
     state_mismatch_tolerance: float = 1e-3
 
     # TRAINING-ONLY (train.py / train_ddp.py, not live_loop.py): how often,
-    # in rollouts, to force kill_switch.reset() + start_new_day() regardless
-    # of episode boundaries. kill_switch.py's daily_loss_limit_frac (3% by
-    # default) trips easily against a random early-training policy, and an
-    # "episode" here means one full pass through the ENTIRE training
-    # dataset -- potentially tens of thousands of bars. Without a shorter
-    # reset cadence, a stream tripped early stays halted for the rest of
-    # that enormous episode: not visibly broken (it still marks-to-market
-    # every tick, so its numbers keep moving), just silently contributing
-    # zero real trading signal for a very long time. 1 = reset every
-    # rollout (treats each 256-bar rollout as its own "day" for kill-switch
-    # purposes) -- aggressive, but appropriate for training where the
-    # actual goal is exploration, not a realistic daily-loss simulation
-    # (that's what eval/backtest_report.py and live/live_loop.py are for,
-    # and neither of those uses this field).
+    # in rollouts, to force kill_switch.reset() + start_new_day() AND
+    # portfolio.reset_peak_equity() regardless of episode boundaries.
+    # kill_switch.py's daily_loss_limit_frac (3% by default) trips easily
+    # against a random early-training policy, and risk_manager.py's
+    # drawdown_halt_frac (20%) compares against a peak_equity that is
+    # otherwise a true all-time high -- an "episode" here means one full
+    # pass through the ENTIRE training dataset, potentially tens of
+    # thousands of bars. Without a shorter reset cadence for BOTH of these,
+    # a stream tripped/underwater early stays stuck for the rest of that
+    # enormous episode: not visibly broken (it still marks-to-market every
+    # tick, so its numbers keep moving), just silently contributing zero
+    # real trading signal for a very long time. 1 = reset every rollout
+    # (treats each 256-bar rollout as its own "day" for both purposes) --
+    # aggressive, but appropriate for training where the actual goal is
+    # exploration, not a realistic daily-loss simulation (that's what
+    # eval/backtest_report.py and live/live_loop.py are for, and neither of
+    # those uses this field).
+    #
+    # DIAGNOSTIC NOTE (episode-76-style "stopped trading, rollouts just
+    # roll by" stalls): check tick_record["halted"] in the metrics log
+    # (also visible live on the dashboard's HALTED badge/row) AND the
+    # per-env drawdown column FIRST. If halted is False everywhere but
+    # trades still aren't happening, the culprit is very likely
+    # risk_manager.py's drawdown_halt_frac blocking new exposure via
+    # reduce_only mode (see PortfolioState.reset_peak_equity()'s docstring)
+    # -- that's a SEPARATE mechanism from KillSwitch and won't show up as
+    # "halted" at all, only as persistently elevated per-ticker drawdown
+    # with a flat/non-climbing trade count. If KillSwitch itself is stuck
+    # halted despite this reset cadence, check whether
+    # state_mismatch_tolerance or broker_error_streak_limit is tripping
+    # repeatedly instead (unlikely during training, since nothing in
+    # train.py/train_ddp.py calls record_broker_error() -- that path is
+    # live-only).
     kill_switch_reset_every_n_rollouts: int = 1
 
     # order sizing that hybrid_policy.py's rescale_* helpers need but which
@@ -334,11 +353,23 @@ class RunConfig:
     # real env-step rather than every single one. Counters (global_tick,
     # trade tallies) still advance every real tick regardless -- this only
     # throttles disk writes. 1 = log every tick (max resolution, max I/O);
-    # higher values trade update smoothness for less write volume. 5 gives
-    # ~51 tick records per 256-step rollout -- frequent enough to watch
-    # numbers move within a rollout instead of jumping once per 256 steps,
-    # without writing+fsyncing 256 times.
-    tick_log_every_n_ticks: int = 5
+    # higher values trade update smoothness for less write volume. 2 gives
+    # ~127 tick records per 256-step rollout -- close to max resolution
+    # without doubling write volume again for a level of detail most human
+    # eyes can't distinguish on a 1s dashboard refresh anyway (see
+    # dashboard_poll_interval_seconds below -- match this to that, don't
+    # just max both out independently).
+    tick_log_every_n_ticks: int = 2
+
+    # How often the SEPARATE notebook cell running
+    # TrainingDashboard.run_polling_loop() (or a manual polling loop) re-reads
+    # metrics_path and redraws. Lives in config, not a notebook-cell literal,
+    # so tick_log_every_n_ticks and the dashboard's poll cadence can be
+    # reasoned about together -- polling faster than new tick records
+    # actually arrive just redraws the same frame and wastes reads; polling
+    # much slower than they arrive makes the tape jump in visible chunks
+    # instead of trickling.
+    dashboard_poll_interval_seconds: float = 1.0
 
     # monitoring/dashboard.py -- see resolve_mode()'s precedence (explicit
     # --kaggle/--local CLI flag > this value > env-var auto-detection) and

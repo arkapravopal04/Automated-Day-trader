@@ -223,6 +223,7 @@ def resolve_mode(cfg_display_mode: str = "auto", argv: Optional[List[str]] = Non
 
 
 _SPINNER_FRAMES = ["\u28f7", "\u28ef", "\u28df", "\u287f", "\u28bf", "\u28fb", "\u28fd", "\u28fe"]  # braille spinner
+_TAPE_MAX_ROWS = 12  # Live Trade Tape -- how many recent real fills to keep on screen
 
 
 def _fmt_uptime(seconds: float) -> str:
@@ -289,6 +290,7 @@ class TrainingDashboard:
         # trend state, all keyed by ticker (or None for the portfolio total)
         self._prev_net_worth: Optional[float] = None
         self._prev_net_worth_per_ticker: Dict[str, float] = {}
+        self._prev_price_per_ticker: Dict[str, float] = {}
         self._prev_trades_per_ticker: Dict[str, int] = {}
 
     def start(self) -> None:
@@ -451,7 +453,7 @@ class TrainingDashboard:
         throughput_text = f"  |  {ticks_per_sec:.1f} ticks/s" if ticks_per_sec is not None else ""
         halted_list = tick_record.get("halted")
         n_halted = sum(1 for h in halted_list if h) if isinstance(halted_list, list) else 0
-        halted_note = f"  [bold white on dark_orange3] {n_halted} HALTED [/bold white on dark_orange3] " if n_halted > 0 else ""
+        halted_note = f"  [bold white on purple4] {n_halted} HALTED [/bold white on purple4] " if n_halted > 0 else ""
 
         panel_lines = [
             f"[{spinner_color}]{spinner}[/{spinner_color}] live  |  uptime {_fmt_uptime(now - self._start_time)}{throughput_text}{halted_note}",
@@ -470,6 +472,7 @@ class TrainingDashboard:
 
         table = Table(title=f"Per-Environment State  (tick #{tick_record.get('step')}, frame #{self._frame_count})")
         table.add_column("Ticker")
+        table.add_column("Price", justify="right")
         table.add_column("Position", justify="right")
         table.add_column("Net Worth", justify="right")
         table.add_column("Unrealized PnL", justify="right")
@@ -484,6 +487,7 @@ class TrainingDashboard:
         if isinstance(tickers, list) and isinstance(position, list):
             n = len(tickers)
             net_worth_per_ticker = _as_list(tick_record.get("net_worth_per_ticker"), n)
+            price_per_ticker = _as_list(tick_record.get("price_per_ticker"), n)
             unrealized = _as_list(tick_record.get("unrealized_pnl"), n)
             drawdown_per_ticker = _as_list(tick_record.get("drawdown_per_ticker"), n)
             trades_rollout_per_ticker = _as_list(tick_record.get("trades_per_ticker_this_rollout"), n)
@@ -492,6 +496,22 @@ class TrainingDashboard:
             halted_per_ticker = _as_list(tick_record.get("halted"), n)
 
             for i, ticker in enumerate(tickers):
+                price = price_per_ticker[i]
+                price_color = None
+                if price is not None:
+                    prev_price = self._prev_price_per_ticker.get(ticker)
+                    if prev_price is not None:
+                        if price > prev_price:
+                            price_color = "bright_green"
+                        elif price < prev_price:
+                            price_color = "bright_red"
+                    self._prev_price_per_ticker[ticker] = price
+                price_text = _fmt_colored(price, good_is=None, color=price_color, dollar=True)
+                if price_color == "bright_green":
+                    price_text = "\u25b2" + price_text
+                elif price_color == "bright_red":
+                    price_text = "\u25bc" + price_text
+
                 nw = net_worth_per_ticker[i]
                 nw_color = None
                 if nw is not None:
@@ -529,14 +549,15 @@ class TrainingDashboard:
                     status_text = "[bold white on bright_red]BANKRUPT[/bold white on bright_red]"
                     row_style = "on bright_red"
                 elif is_halted:
-                    status_text = "[bold white on dark_orange3]HALTED[/bold white on dark_orange3]"
-                    row_style = "on dark_orange3"
+                    status_text = "[bold white on purple4]HALTED[/bold white on purple4]"
+                    row_style = "on purple4"
                 else:
                     status_text = ""
                     row_style = None
 
                 table.add_row(
                     str(ticker),
+                    price_text,
                     _fmt(position[i]),
                     nw_text,
                     _fmt_colored(unrealized[i], good_is="positive"),
@@ -547,9 +568,109 @@ class TrainingDashboard:
                     style=row_style,
                 )
         else:
-            table.add_row("(no per-ticker breakdown in this record)", "", "", "", "", "", "", "")
+            table.add_row("(no per-ticker breakdown in this record)", "", "", "", "", "", "", "", "")
 
-        return Group(header, table)
+        tape_panel = Panel(self._build_ticker_tape(tick_record), title="Live Prices", expand=False)
+        return Group(header, tape_panel, self._build_trade_tape(tick_history), table)
+
+    def _build_ticker_tape(self, tick_record: Dict[str, Any]) -> Text:
+        """
+        A single-line, continuously-updating readout of REAL per-tick
+        prices for EVERY ticker, every frame -- tick_record["price_per_ticker"],
+        the exact mid price env.step() traded against on this tick (see
+        train.py's tick_callback). Unlike _build_trade_tape() below (which
+        only shows a row when a fill actually happened), this updates on
+        literally every render_once() call regardless of whether anything
+        traded -- a real market ticker moves even when you personally
+        aren't trading it, and that continuous real movement (not fake
+        flicker) is what gives the "watching a live market" feel.
+
+        If this tick_record predates the price_per_ticker field (an old
+        metrics.jsonl from before that field existed), this prints an
+        explicit fallback line rather than drawing a tape with fabricated
+        numbers -- same convention used everywhere else in this file.
+        """
+        tickers = tick_record.get("tickers")
+        prices = tick_record.get("price_per_ticker")
+
+        if not isinstance(tickers, list) or not isinstance(prices, list) or len(tickers) != len(prices):
+            return Text("(no price feed in this record -- resume with the updated train.py to populate it)",
+                        style="grey50")
+
+        tape = Text()
+        for i, ticker in enumerate(tickers):
+            price = prices[i]
+            if price is None:
+                tape.append(f" {ticker} -- ", style="grey50")
+                continue
+
+            prev = self._prev_price_per_ticker.get(ticker)
+            if prev is None:
+                arrow, color = "\u2022", "grey62"
+            elif price > prev:
+                arrow, color = "\u25b2", "bright_green"
+            elif price < prev:
+                arrow, color = "\u25bc", "bright_red"
+            else:
+                arrow, color = "\u2022", "grey62"
+            self._prev_price_per_ticker[ticker] = price
+
+            tape.append(f" {ticker} ", style="bold white")
+            tape.append(f"{price:,.2f} ", style=color)
+            tape.append(f"{arrow} ", style=color)
+            tape.append("|", style="grey35")
+
+        return tape
+
+    def _build_trade_tape(self, tick_history: List[Dict[str, Any]]) -> Panel:
+        """
+        A scrolling blotter of REAL individual fills, newest first -- every
+        entry here is read directly off a real tick record's
+        filled_qty_this_tick / price_per_ticker (see train.py's
+        tick_callback: price_per_ticker is the actual mid price env.step()
+        marked that fill against, not a display-only estimate). Nothing in
+        this panel is synthesized, randomized, or interpolated -- the
+        "flicker" comes entirely from genuinely new fills appearing as
+        training actually produces them, at whatever rate that really
+        happens, not from an animation faking activity that isn't there.
+
+        Scans tick_history (already fetched for this frame, no extra I/O)
+        for any record with a nonzero fill, most recent last-in-history
+        first. Capped at the last _TAPE_MAX_ROWS fills found, so this stays
+        cheap even with a large history_window.
+        """
+        events: List[str] = []
+        for record in reversed(tick_history):
+            if len(events) >= _TAPE_MAX_ROWS:
+                break
+            tickers = record.get("tickers")
+            filled = record.get("filled_qty_this_tick")
+            prices = record.get("price_per_ticker")
+            if not (isinstance(tickers, list) and isinstance(filled, list)):
+                continue
+            step = record.get("step")
+            for i, qty in enumerate(filled):
+                if len(events) >= _TAPE_MAX_ROWS:
+                    break
+                if not qty:
+                    continue
+                ticker = tickers[i] if i < len(tickers) else "?"
+                price = prices[i] if isinstance(prices, list) and i < len(prices) else None
+                side = "BUY " if qty > 0 else "SELL"
+                color = "bright_green" if qty > 0 else "bright_red"
+                price_text = f"@ ${price:,.2f}" if price is not None else ""
+                events.append(
+                    f"[grey62]t{step:>7}[/grey62]  [bold {color}]{side}[/bold {color}]  "
+                    f"[bold]{ticker:<6}[/bold]  {abs(qty):>8.2f} sh  {price_text}"
+                )
+
+        if not events:
+            body = "[grey62](no fills yet)[/grey62]"
+        else:
+            body = "\n".join(events)
+
+        return Panel(body, title="Live Trade Tape", expand=False, border_style="grey42")
+
 
 
 def _as_list(value: Any, n: int) -> List[Any]:
