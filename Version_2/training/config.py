@@ -352,24 +352,27 @@ class RunConfig:
     # train.py's tick_callback -- write a "tick" metrics record every Nth
     # real env-step rather than every single one. Counters (global_tick,
     # trade tallies) still advance every real tick regardless -- this only
-    # throttles disk writes. 1 = log every tick (max resolution, max I/O);
-    # higher values trade update smoothness for less write volume. 2 gives
-    # ~127 tick records per 256-step rollout -- close to max resolution
-    # without doubling write volume again for a level of detail most human
-    # eyes can't distinguish on a 1s dashboard refresh anyway (see
-    # dashboard_poll_interval_seconds below -- match this to that, don't
-    # just max both out independently).
-    tick_log_every_n_ticks: int = 2
+    # throttles disk writes. 1 = log every tick (max resolution, max I/O).
+    #
+    # Set to 1 in this revision: the two things that made higher-frequency
+    # logging expensive earlier are both gone now -- fsync is already
+    # skipped on every tick write (see MetricsWriter.log's docstring), and
+    # MetricsReader.tail() no longer re-reads the whole file every poll
+    # (chunked reverse read, cost independent of total file size). If you
+    # run many parallel Kaggle sessions writing to a network-mounted
+    # /kaggle/working and see real I/O contention, raise this back toward
+    # 2-5 rather than assuming something else is wrong.
+    tick_log_every_n_ticks: int = 1
 
     # How often the SEPARATE notebook cell running
     # TrainingDashboard.run_polling_loop() (or a manual polling loop) re-reads
-    # metrics_path and redraws. Lives in config, not a notebook-cell literal,
-    # so tick_log_every_n_ticks and the dashboard's poll cadence can be
-    # reasoned about together -- polling faster than new tick records
-    # actually arrive just redraws the same frame and wastes reads; polling
-    # much slower than they arrive makes the tape jump in visible chunks
-    # instead of trickling.
-    dashboard_poll_interval_seconds: float = 1.0
+    # metrics_path and redraws. Lowered from 1.0 -> 0.5 alongside
+    # tick_log_every_n_ticks=1 above -- at this pace the dashboard is polling
+    # roughly as often as new tick data actually lands, which is what
+    # "frequent updates" actually requires (polling faster than data
+    # arrives just re-renders the same frame; the floor below this is Rich's
+    # own render cost, not I/O).
+    dashboard_poll_interval_seconds: float = 0.5
 
     # monitoring/dashboard.py -- see resolve_mode()'s precedence (explicit
     # --kaggle/--local CLI flag > this value > env-var auto-detection) and

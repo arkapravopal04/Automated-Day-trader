@@ -224,6 +224,7 @@ def resolve_mode(cfg_display_mode: str = "auto", argv: Optional[List[str]] = Non
 
 _SPINNER_FRAMES = ["\u28f7", "\u28ef", "\u28df", "\u287f", "\u28bf", "\u28fb", "\u28fd", "\u28fe"]  # braille spinner
 _TAPE_MAX_ROWS = 12  # Live Trade Tape -- how many recent real fills to keep on screen
+_GRID_LAYOUT_THRESHOLD = 20  # above this many tickers, switch from a tall list to a scroll-free grid
 
 
 def _fmt_uptime(seconds: float) -> str:
@@ -266,11 +267,25 @@ class TrainingDashboard:
         self.reader = MetricsReader(metrics_path)
         self.mode = resolve_display_mode(mode)
         self.history_window = history_window
-        self.console = console if console is not None else Console()
 
         self._notebook_capable = _HAS_IPYTHON and _get_ipython() is not None
         self._widget_capable = self._notebook_capable and _HAS_IPYWIDGETS
         self._is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+        if console is not None:
+            self.console = console
+        elif self._is_tty:
+            # Real terminal -- let Rich auto-detect actual columns.
+            self.console = Console()
+        else:
+            # No real terminal to measure (notebook/widget rendering, or a
+            # piped/redirected stdout) -- Rich's own fallback here is a
+            # narrow 80-column default, which starves _build_compact_grid()
+            # down to its 4-column floor regardless of how much actual
+            # horizontal space the notebook output area has. 160 gives the
+            # grid room to actually use multiple columns in the common case
+            # this dashboard runs in (Kaggle/Jupyter, not a real tty).
+            self.console = Console(width=160)
 
         self._live: Optional[Live] = None
         self._output_widget = None
@@ -462,7 +477,7 @@ class TrainingDashboard:
             f"episode (passes):  {rollout_record.get('episode')}",
             f"reward:            {_fmt_colored(reward, good_is='positive')}   (as of last rollout)",
             f"reward (EMA):      {_fmt_colored(reward_ema, good_is='positive')}",
-            f"net worth (total): {_fmt_colored(net_worth, good_is=None, color=net_worth_color, dollar=True)}",
+            f"net worth (total): {_fmt_colored(net_worth, good_is=None, color=net_worth_color, dollar=True, flash=True)}",
             f"sharpe:            {_fmt(rollout_record.get('sharpe'))}",
             f"drawdown (avg):    {_fmt_colored(drawdown, good_is='small_pct', pct=True)}",
             f"trades (rollout):  {_fmt_int(tick_record.get('trades_this_rollout'))}   (live)",
@@ -470,7 +485,135 @@ class TrainingDashboard:
         ]
         header = Panel("\n".join(panel_lines), title="Training Status", expand=False)
 
-        table = Table(title=f"Per-Environment State  (tick #{tick_record.get('step')}, frame #{self._frame_count})")
+        tickers = tick_record.get("tickers")
+        position = tick_record.get("position")
+        per_ticker_rows = self._compute_per_ticker_rows(tick_record, tickers, position)
+
+        tape_panel = Panel(self._build_ticker_tape(tick_record), title="Live Prices", expand=False)
+
+        n = len(per_ticker_rows)
+        if n == 0:
+            table = Table(title="Per-Environment State")
+            table.add_column("(no per-ticker breakdown in this record)")
+            table.add_row("")
+            return Group(header, tape_panel, self._build_trade_tape(tick_history), table)
+
+        if n <= _GRID_LAYOUT_THRESHOLD:
+            # Small ticker counts: the full detailed table, unchanged from
+            # before -- every column, one row per ticker, no scrolling
+            # problem at this size.
+            body = self._build_detail_table(per_ticker_rows, tick_record)
+        else:
+            # Large ticker counts (see _GRID_LAYOUT_THRESHOLD): a scroll-free
+            # multi-column board instead of one tall list -- fits on screen
+            # regardless of n by wrapping into as many rows as needed, at a
+            # fixed column count sized to the console width. Full per-column
+            # detail (unrealized PnL, drawdown, trade counts) isn't shown
+            # per-tile at this density; a compact tile has ticker/price/
+            # position/status only. Anything flagged (halted/bankrupt) ALSO
+            # gets a full-detail row in the separate table below it, so
+            # nothing critical is lost to the compact view.
+            grid = self._build_compact_grid(per_ticker_rows)
+            flagged = [r for r in per_ticker_rows if r["is_halted"] or r["is_bankrupt"]]
+            pieces = [grid]
+            if flagged:
+                pieces.append(self._build_detail_table(flagged, tick_record, title_prefix="Flagged "))
+            body = Group(*pieces)
+
+        return Group(header, tape_panel, self._build_trade_tape(tick_history), body)
+
+    def _compute_per_ticker_rows(
+        self, tick_record: Dict[str, Any], tickers: Any, position: Any
+    ) -> List[Dict[str, Any]]:
+        """
+        One computation pass, shared by both the detailed table and the
+        compact grid, so trend-flash state (self._prev_price_per_ticker /
+        self._prev_net_worth_per_ticker) only gets updated ONCE per ticker
+        per frame regardless of which layout ends up rendering it -- doing
+        this twice (once per layout) would double-advance the "previous
+        value" trackers and break the flash/arrow logic.
+        """
+        if not (isinstance(tickers, list) and isinstance(position, list)):
+            return []
+        n = len(tickers)
+        net_worth_per_ticker = _as_list(tick_record.get("net_worth_per_ticker"), n)
+        price_per_ticker = _as_list(tick_record.get("price_per_ticker"), n)
+        unrealized = _as_list(tick_record.get("unrealized_pnl"), n)
+        drawdown_per_ticker = _as_list(tick_record.get("drawdown_per_ticker"), n)
+        trades_rollout_per_ticker = _as_list(tick_record.get("trades_per_ticker_this_rollout"), n)
+        trades_total_per_ticker = _as_list(tick_record.get("total_trades_per_ticker"), n)
+        filled_this_tick = _as_list(tick_record.get("filled_qty_this_tick"), n)
+        halted_per_ticker = _as_list(tick_record.get("halted"), n)
+
+        rows: List[Dict[str, Any]] = []
+        for i, ticker in enumerate(tickers):
+            price = price_per_ticker[i]
+            price_color = None
+            if price is not None:
+                prev_price = self._prev_price_per_ticker.get(ticker)
+                if prev_price is not None:
+                    if price > prev_price:
+                        price_color = "bright_green"
+                    elif price < prev_price:
+                        price_color = "bright_red"
+                self._prev_price_per_ticker[ticker] = price
+            price_text = _fmt_colored(price, good_is=None, color=price_color, dollar=True, flash=True)
+            price_arrow = "\u25b2" if price_color == "bright_green" else ("\u25bc" if price_color == "bright_red" else "")
+
+            nw = net_worth_per_ticker[i]
+            nw_color = None
+            if nw is not None:
+                prev = self._prev_net_worth_per_ticker.get(ticker)
+                if prev is not None:
+                    if nw > prev:
+                        nw_color = "bright_green"
+                    elif nw < prev:
+                        nw_color = "bright_red"
+                self._prev_net_worth_per_ticker[ticker] = nw
+            nw_text = _fmt_colored(nw, good_is=None, color=nw_color, dollar=True, flash=True)
+            if nw_color == "bright_green":
+                nw_text = "\u25b2 " + nw_text
+            elif nw_color == "bright_red":
+                nw_text = "\u25bc " + nw_text
+
+            trades_this = trades_rollout_per_ticker[i]
+            trades_total = trades_total_per_ticker[i]
+            fq = filled_this_tick[i]
+            just_traded = fq is not None and fq != 0
+            trades_this_text = f"[bold cyan]{_fmt_int(trades_this)}[/bold cyan]" if just_traded else _fmt_int(trades_this)
+
+            is_halted = bool(halted_per_ticker[i]) if halted_per_ticker[i] is not None else False
+            is_bankrupt = nw is not None and nw <= 0
+            if is_bankrupt:
+                status_text = "[bold white on bright_red]BANKRUPT[/bold white on bright_red]"
+                row_style = "on bright_red"
+            elif is_halted:
+                status_text = "[bold white on purple4]HALTED[/bold white on purple4]"
+                row_style = "on purple4"
+            else:
+                status_text = ""
+                row_style = None
+
+            rows.append({
+                "ticker": ticker,
+                "price": price, "price_text": price_text, "price_color": price_color, "price_arrow": price_arrow,
+                "position": position[i], "nw_text": nw_text, "nw_color": nw_color,
+                "unrealized_text": _fmt_colored(unrealized[i], good_is="positive"),
+                "drawdown_text": _fmt_colored(drawdown_per_ticker[i], good_is="small_pct", pct=True),
+                "trades_this_text": trades_this_text, "just_traded": just_traded,
+                "trades_total": _fmt_int(trades_total),
+                "status_text": status_text, "row_style": row_style,
+                "is_halted": is_halted, "is_bankrupt": is_bankrupt,
+            })
+        return rows
+
+    def _build_detail_table(
+        self, rows: List[Dict[str, Any]], tick_record: Dict[str, Any], title_prefix: str = ""
+    ) -> Table:
+        """Full-column table, one row per ticker -- used directly for small ticker counts, and for the
+        flagged-only subset shown alongside the compact grid at large ticker counts."""
+        title = f"{title_prefix}Per-Environment State  (tick #{tick_record.get('step')}, frame #{self._frame_count})"
+        table = Table(title=title)
         table.add_column("Ticker")
         table.add_column("Price", justify="right")
         table.add_column("Position", justify="right")
@@ -480,98 +623,60 @@ class TrainingDashboard:
         table.add_column("Trades (rollout)", justify="right")
         table.add_column("Trades (total)", justify="right")
         table.add_column("Status")
+        for r in rows:
+            table.add_row(
+                str(r["ticker"]), r["price_text"], _fmt(r["position"]), r["nw_text"],
+                r["unrealized_text"], r["drawdown_text"], r["trades_this_text"], r["trades_total"],
+                r["status_text"], style=r["row_style"],
+            )
+        return table
 
-        tickers = tick_record.get("tickers")
-        position = tick_record.get("position")
+    def _build_compact_grid(self, rows: List[Dict[str, Any]]) -> Table:
+        """
+        Scroll-free multi-column board for large ticker counts (see
+        _GRID_LAYOUT_THRESHOLD) -- wraps N tickers into as many columns as
+        the console width allows, instead of one N-row list a person has to
+        scroll through. Each tile: ticker, real price with its flash/arrow,
+        position, and a one-character status dot (colored, not just
+        text -- readable at a glance even in a small tile). This is
+        deliberately less detailed per-ticker than the full table -- see
+        _build_renderable()'s docstring comment on why flagged
+        (halted/bankrupt) envs still get a full-detail row elsewhere.
+        """
+        col_width = 20
+        n_cols = max(4, min(12, (self.console.width or 100) // col_width))
 
-        if isinstance(tickers, list) and isinstance(position, list):
-            n = len(tickers)
-            net_worth_per_ticker = _as_list(tick_record.get("net_worth_per_ticker"), n)
-            price_per_ticker = _as_list(tick_record.get("price_per_ticker"), n)
-            unrealized = _as_list(tick_record.get("unrealized_pnl"), n)
-            drawdown_per_ticker = _as_list(tick_record.get("drawdown_per_ticker"), n)
-            trades_rollout_per_ticker = _as_list(tick_record.get("trades_per_ticker_this_rollout"), n)
-            trades_total_per_ticker = _as_list(tick_record.get("total_trades_per_ticker"), n)
-            filled_this_tick = _as_list(tick_record.get("filled_qty_this_tick"), n)
-            halted_per_ticker = _as_list(tick_record.get("halted"), n)
+        grid = Table.grid(padding=(0, 1))
+        for _ in range(n_cols):
+            grid.add_column()
 
-            for i, ticker in enumerate(tickers):
-                price = price_per_ticker[i]
-                price_color = None
-                if price is not None:
-                    prev_price = self._prev_price_per_ticker.get(ticker)
-                    if prev_price is not None:
-                        if price > prev_price:
-                            price_color = "bright_green"
-                        elif price < prev_price:
-                            price_color = "bright_red"
-                    self._prev_price_per_ticker[ticker] = price
-                price_text = _fmt_colored(price, good_is=None, color=price_color, dollar=True)
-                if price_color == "bright_green":
-                    price_text = "\u25b2" + price_text
-                elif price_color == "bright_red":
-                    price_text = "\u25bc" + price_text
+        def tile(r: Dict[str, Any]) -> str:
+            if r["is_bankrupt"]:
+                dot = "[bright_red]\u25cf[/bright_red]"
+            elif r["is_halted"]:
+                dot = "[purple4]\u25cf[/purple4]"
+            else:
+                dot = "[grey42]\u25cf[/grey42]"
+            arrow = r["price_arrow"]
+            arrow_markup = (
+                f"[bright_green]{arrow}[/bright_green]" if r["price_color"] == "bright_green"
+                else f"[bright_red]{arrow}[/bright_red]" if r["price_color"] == "bright_red"
+                else " "
+            )
+            price_str = f"{r['price']:,.2f}" if r["price"] is not None else "-"
+            return f"{dot} [bold]{r['ticker']:<6}[/bold]\n  {price_str}{arrow_markup}  pos {_fmt(r['position'])}"
 
-                nw = net_worth_per_ticker[i]
-                nw_color = None
-                if nw is not None:
-                    prev = self._prev_net_worth_per_ticker.get(ticker)
-                    if prev is not None:
-                        if nw > prev:
-                            nw_color = "bright_green"
-                        elif nw < prev:
-                            nw_color = "bright_red"
-                    self._prev_net_worth_per_ticker[ticker] = nw
-                nw_text = _fmt_colored(nw, good_is=None, color=nw_color, dollar=True)
-                if nw_color == "bright_green":
-                    nw_text = "\u25b2 " + nw_text
-                elif nw_color == "bright_red":
-                    nw_text = "\u25bc " + nw_text
+        row_cells: List[str] = []
+        for r in rows:
+            row_cells.append(tile(r))
+            if len(row_cells) == n_cols:
+                grid.add_row(*row_cells)
+                row_cells = []
+        if row_cells:
+            row_cells += [""] * (n_cols - len(row_cells))
+            grid.add_row(*row_cells)
 
-                trades_this = trades_rollout_per_ticker[i]
-                trades_total = trades_total_per_ticker[i]
-                # "just traded" now means THIS exact tick (filled_qty_this_tick),
-                # not merely nonzero somewhere in the current rollout -- a much
-                # tighter, more truthful signal of live per-env activity.
-                fq = filled_this_tick[i]
-                just_traded = fq is not None and fq != 0
-                trades_this_text = f"[bold cyan]{_fmt_int(trades_this)}[/bold cyan]" if just_traded else _fmt_int(trades_this)
-
-                is_halted = bool(halted_per_ticker[i]) if halted_per_ticker[i] is not None else False
-                # A per-env bankrupt/kill-switch flag -- "bankrupt" isn't a
-                # field KillSwitch tracks directly, so treat equity <= 0 as
-                # the bankrupt case (harder, more final) and any other halt
-                # reason as a plain halt; both render as a full-row
-                # highlight so a flagged env can't be missed while
-                # scrolling, without needing to read every cell.
-                is_bankrupt = nw is not None and nw <= 0
-                if is_bankrupt:
-                    status_text = "[bold white on bright_red]BANKRUPT[/bold white on bright_red]"
-                    row_style = "on bright_red"
-                elif is_halted:
-                    status_text = "[bold white on purple4]HALTED[/bold white on purple4]"
-                    row_style = "on purple4"
-                else:
-                    status_text = ""
-                    row_style = None
-
-                table.add_row(
-                    str(ticker),
-                    price_text,
-                    _fmt(position[i]),
-                    nw_text,
-                    _fmt_colored(unrealized[i], good_is="positive"),
-                    _fmt_colored(drawdown_per_ticker[i], good_is="small_pct", pct=True),
-                    trades_this_text,
-                    _fmt_int(trades_total),
-                    status_text,
-                    style=row_style,
-                )
-        else:
-            table.add_row("(no per-ticker breakdown in this record)", "", "", "", "", "", "", "", "")
-
-        tape_panel = Panel(self._build_ticker_tape(tick_record), title="Live Prices", expand=False)
-        return Group(header, tape_panel, self._build_trade_tape(tick_history), table)
+        return grid
 
     def _build_ticker_tape(self, tick_record: Dict[str, Any]) -> Text:
         """
@@ -702,12 +807,25 @@ def _fmt_colored(
     color: Optional[str] = None,
     pct: bool = False,
     dollar: bool = False,
+    flash: bool = False,
 ) -> str:
     """
     good_is="positive"  -> green if value >= 0, red if value < 0
     good_is="small_pct" -> green if value <= 0.10 (10%), red otherwise
     good_is=None         -> no automatic rule; only an explicit `color` applies
     `color`, when given, always wins over the good_is rule.
+
+    flash=True adds a reverse-video (inverted fg/bg) style on top of the
+    resolved color -- meant ONLY for values whose color already means "this
+    changed since last frame" (price, net worth -- see their call sites,
+    where color is None unless an actual tick-to-tick delta was detected).
+    Since redraws happen every poll, a value that changed gets exactly one
+    inverted frame before reverting to plain colored text on the next
+    render -- a real flash, not a persistent highlight, and only ever on
+    values that are genuinely moving. Do NOT set flash=True for
+    magnitude/sign-based coloring (e.g. unrealized PnL's good_is="positive")
+    -- that color reflects current sign, not "just changed," and would
+    flash every single frame regardless of whether anything moved.
     """
     if value is None:
         return "-"
@@ -725,4 +843,7 @@ def _fmt_colored(
         elif good_is == "small_pct":
             resolved_color = "bright_green" if v <= 0.10 else "bright_red"
 
-    return f"[{resolved_color}]{text}[/{resolved_color}]" if resolved_color else text
+    if resolved_color is None:
+        return text
+    style = f"bold reverse {resolved_color}" if flash else resolved_color
+    return f"[{style}]{text}[/{style}]"
