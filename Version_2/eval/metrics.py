@@ -25,15 +25,20 @@ session length, or trading calendar differs.
 """
 
 from dataclasses import dataclass
-from typing import Optional
-
 import torch
 
 DEFAULT_BARS_PER_YEAR = 78 * 252  # 5-min bars, 6.5h US equity session, 252 trading days/year
 
 
 def simple_returns(equity_curve: torch.Tensor) -> torch.Tensor:
-    """equity_curve: [T] or [T, n_envs]. Returns [T-1] or [T-1, n_envs]."""
+    """Compute per-step simple returns for a 1D or 2D equity curve.
+
+    Args:
+        equity_curve: Tensor shaped ``[T]`` or ``[T, n_envs]``.
+
+    Returns:
+        Tensor shaped ``[T - 1]`` or ``[T - 1, n_envs]``.
+    """
     return equity_curve[1:] / equity_curve[:-1].clamp(min=1e-8) - 1.0
 
 
@@ -42,7 +47,19 @@ def sharpe_ratio(
     bars_per_year: int = DEFAULT_BARS_PER_YEAR,
     risk_free_rate_annual: float = 0.0,
 ) -> torch.Tensor:
-    """returns: [T] or [T, n_envs] per-bar simple returns. Returns annualized Sharpe."""
+    """Compute annualized Sharpe from per-bar simple returns.
+
+    Args:
+        returns: Tensor shaped ``[T]`` or ``[T, n_envs]``.
+        bars_per_year: Number of bars in a trading year.
+        risk_free_rate_annual: Annualized risk-free rate.
+
+    Returns:
+        Annualized Sharpe ratio, reduced over the time dimension.
+    """
+    if bars_per_year <= 0:
+        raise ValueError("bars_per_year must be greater than zero")
+
     rf_per_bar = risk_free_rate_annual / bars_per_year
     excess = returns - rf_per_bar
     mean = excess.mean(dim=0)
@@ -55,11 +72,14 @@ def sortino_ratio(
     bars_per_year: int = DEFAULT_BARS_PER_YEAR,
     risk_free_rate_annual: float = 0.0,
 ) -> torch.Tensor:
+    """Compute annualized Sortino from per-bar simple returns.
+
+    The denominator includes only downside deviations below the
+    risk-free/target rate; upside volatility is not penalized.
     """
-    Same as sharpe_ratio() but the denominator only penalizes downside
-    deviation (returns below the risk-free/target rate), not upside
-    volatility -- distinguishes "risky" from "profitable but lumpy."
-    """
+    if bars_per_year <= 0:
+        raise ValueError("bars_per_year must be greater than zero")
+
     rf_per_bar = risk_free_rate_annual / bars_per_year
     excess = returns - rf_per_bar
     downside = torch.where(excess < 0, excess, torch.zeros_like(excess))
@@ -81,7 +101,7 @@ def drawdown_series(equity_curve: torch.Tensor) -> torch.Tensor:
 
 
 def max_drawdown(equity_curve: torch.Tensor) -> torch.Tensor:
-    """equity_curve: [T] or [T, n_envs]. Returns the largest peak-to-trough decline as a positive fraction."""
+    """Return the largest peak-to-trough decline as a positive fraction."""
     return drawdown_series(equity_curve).max(dim=0).values
 
 
@@ -142,16 +162,20 @@ def aggregate_bh_curve(price_curve: torch.Tensor, initial_cash_per_ticker: float
 
 
 def aggregate_trade_pnls(trade_pnls: torch.Tensor) -> torch.Tensor:
-    """
-    trade_pnls: [n_trades, n_envs], NaN-padded per win_rate()'s convention.
-    Returns a flattened [n_trades * n_envs] view, for a portfolio-level win
-    rate that doesn't care which ticker a closed trade came from.
+    """Flatten per-ticker realized PnL into a portfolio-level trade stream.
+
+    Args:
+        trade_pnls: ``[n_trades, n_envs]`` tensor with NaN padding.
+
+    Returns:
+        Flattened ``[n_trades * n_envs]`` view suitable for ``win_rate()``.
     """
     return trade_pnls.reshape(-1)
 
 
 @dataclass
 class MetricsResult:
+    """Container for per-stream or portfolio-level evaluation metrics."""
     sharpe: torch.Tensor
     sortino: torch.Tensor
     max_drawdown: torch.Tensor
@@ -163,17 +187,17 @@ class MetricsResult:
 
 
 def compute_metrics(
-    equity_curve: torch.Tensor,     # [T] or [T, n_envs]
-    bh_curve: torch.Tensor,         # same shape as equity_curve -- from buy_and_hold_curve() / aggregate_bh_curve()
-    trade_pnls: torch.Tensor,       # [n_trades] or [n_trades, n_envs], NaN-padded (see win_rate())
+    equity_curve: torch.Tensor,
+    bh_curve: torch.Tensor,
+    trade_pnls: torch.Tensor,
     bars_per_year: int = DEFAULT_BARS_PER_YEAR,
     risk_free_rate_annual: float = 0.0,
 ) -> MetricsResult:
-    """
-    Same function computes per-ticker metrics (2D curves) or portfolio-level
-    metrics (1D curves, built via aggregate_equity() / aggregate_bh_curve()
-    / aggregate_trade_pnls()) -- caller builds the right-shaped curve first,
-    this just reduces over the time axis either way.
+    """Compute the complete evaluation metric set.
+
+    The same implementation handles per-ticker 2D curves and portfolio-level
+    1D curves. Callers are responsible for constructing portfolio aggregates
+    before invoking this function.
     """
     returns = simple_returns(equity_curve)
 

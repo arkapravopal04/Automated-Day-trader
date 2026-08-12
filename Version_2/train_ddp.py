@@ -70,7 +70,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "env"))
 
 from dataset import MultiTickerRolloutDataset  # noqa: E402
 from paths import is_kaggle  # noqa: E402
-from vec_trading_env import VecTradingEnv  # noqa: E402
+from env.vec_trading_env import VecTradingEnv  # noqa: E402
 
 from training.config import TrainingConfig  # noqa: E402
 from training.ppo_hybrid import HybridActorCritic, collect_rollout, compute_gae  # noqa: E402
@@ -217,6 +217,10 @@ def _worker(
     # None on every other rank, and collect_rollout() treats None as "don't
     # bother" (see its own docstring), so non-zero ranks pay zero tick-logging
     # overhead, not just a suppressed write.
+    # Only rank 0 owns the metrics writer. The writer itself routes
+    # record_type="tick" records to its bounded tick log and keeps rollout
+    # records in cfg.run.metrics_path, so this DDP entrypoint does not need
+    # separate tick-path or rotation arguments.
     metrics_writer = MetricsWriter(cfg.run.metrics_path) if rank == 0 else None
     tick_callback = (
         make_tick_callback(env, metrics_writer, state, log_every_n_ticks=cfg.run.tick_log_every_n_ticks)
@@ -323,9 +327,11 @@ def _worker(
                 torch.save(checkpoint_state, best_path)
                 print(f"[train_ddp] rollout {rollout_idx}: new best (EMA reward {best_metric:.6f}) -> {best_path}")
 
-    if metrics_writer is not None:
-        metrics_writer.close()
-    _cleanup()
+    try:
+        if metrics_writer is not None:
+            metrics_writer.close()
+    finally:
+        _cleanup()
 
 
 
@@ -338,9 +344,10 @@ def _ddp_ppo_update(
     scaler: "Optional[torch.cuda.amp.GradScaler]" = None,
 ) -> dict:
     """
-    Same math as training/ppo_hybrid.py's ppo_update() -- the ONLY
-    difference is that this calls submodules via `actor_critic =
-    ddp_model.module` exactly as ppo_update() does (DDP does not intercept
+    Same math as training/ppo_hybrid.py's ppo_update(). The DDP-specific
+    difference is that submodules are accessed through `ddp_model.module`,
+    while the resulting backward pass remains connected to parameters watched
+    by DDP so gradient synchronization still occurs.
     submodule calls), but the resulting `loss.backward()` call below is what
     actually triggers DDP's cross-GPU gradient all-reduce, because the
     tensors in that graph were produced by parameters DDP is watching.

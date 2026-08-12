@@ -16,14 +16,16 @@ from typing import Optional
 
 import torch
 
+Tensor = torch.Tensor
+
 
 @dataclass
 class SimulatedFill:
     """Output of ExecutionSimulator.simulate_fill(). All fields [n_envs]."""
-    filled_qty: torch.Tensor      # signed shares actually filled (0 if no fill / rejected)
-    fill_price: torch.Tensor      # tick-snapped executed price
-    is_partial: torch.Tensor      # bool: True where requested size > filled size
-    slippage_bps: torch.Tensor    # signed slippage vs. mid, in bps, for logging/diagnostics
+    filled_qty: Tensor      # signed shares actually filled (0 if no fill / rejected)
+    fill_price: Tensor      # tick-snapped executed price
+    is_partial: Tensor      # bool: True where requested size > filled size
+    slippage_bps: Tensor    # signed slippage vs. mid, in bps, for logging/diagnostics
 
 
 class ExecutionSimulator:
@@ -62,7 +64,7 @@ class ExecutionSimulator:
         platform_fee_per_trade: float = 1.0,
         overtrade_surcharge_bps: float = 3.0,
         device: Optional[str] = None,
-    ):
+    ) -> None:
         """
         Args:
             tick_size: minimum price increment for this instrument (e.g. 0.01 for US equities)
@@ -81,6 +83,7 @@ class ExecutionSimulator:
                 real cost of churning a position on fast (5-minute) bars: the more frequently
                 a stream has been trading in its recent lookback window, the worse its
                 effective execution gets. Set to 0.0 to disable.
+            device: torch device string (e.g. "cpu", "cuda"). Defaults to CUDA if available.
         """
         self.tick_size = tick_size
         self.spread_bps = spread_bps
@@ -95,18 +98,22 @@ class ExecutionSimulator:
             "cuda" if torch.cuda.is_available() else "cpu"
         )
 
-    def snap_to_tick(self, price: torch.Tensor) -> torch.Tensor:
+    def snap_to_tick(self, price: Tensor) -> Tensor:
         """Round price to the nearest valid tick increment."""
         return torch.round(price / self.tick_size) * self.tick_size
 
+    # ------------------------------------------------------------------
+    # simulate_fill and its private helpers
+    # ------------------------------------------------------------------
+
     def simulate_fill(
         self,
-        direction: torch.Tensor,      # [n_envs], values in {-1, 0, 1}
-        size: torch.Tensor,           # [n_envs], requested shares (>= 0, unsigned magnitude)
-        limit_offset: torch.Tensor,   # [n_envs], offset from mid in ticks; agent's continuous limit control
-        mid_price: torch.Tensor,      # [n_envs], current bar mid/reference price
-        bar_liquidity_proxy: torch.Tensor,  # [n_envs], e.g. bar volume, used to bound fill size
-        overtrading_factor: Optional[torch.Tensor] = None,  # [n_envs], in [0, 1], see __init__ docstring
+        direction: Tensor,      # [n_envs], values in {-1, 0, 1}
+        size: Tensor,           # [n_envs], requested shares (>= 0, unsigned magnitude)
+        limit_offset: Tensor,   # [n_envs], offset from mid in ticks; agent's continuous limit control
+        mid_price: Tensor,      # [n_envs], current bar mid/reference price
+        bar_liquidity_proxy: Tensor,  # [n_envs], e.g. bar volume, used to bound fill size
+        overtrading_factor: Optional[Tensor] = None,  # [n_envs], in [0, 1], see __init__ docstring
     ) -> SimulatedFill:
         """
         Simulates one step's fill for one ticker across all envs.
@@ -136,55 +143,28 @@ class ExecutionSimulator:
         policy/action-postprocessing bug loudly instead of letting it train
         (or trade) on a silently wrong action semantics.
         """
-        direction = direction.to(self.device).float()
-        valid_direction = torch.isclose(direction, torch.round(direction)) & (direction.abs() <= 1.0 + 1e-6)
-        if not bool(valid_direction.all()):
-            bad = direction[~valid_direction].tolist()
-            raise ValueError(
-                f"ExecutionSimulator.simulate_fill(): direction must be exactly in {{-1, 0, 1}}, "
-                f"got out-of-contract value(s) {bad}. Discretize the policy's direction head "
-                f"(e.g. torch.sign() after rounding, or an argmax/Categorical index mapped through "
-                f"IDX_TO_DIRECTION) before calling this."
-            )
-
+        direction = self._validate_direction(direction)
         size = size.to(self.device).float().clamp(min=0.0)
         limit_offset = limit_offset.to(self.device).float()
         mid_price = mid_price.to(self.device).float()
         bar_liquidity_proxy = bar_liquidity_proxy.to(self.device).float().clamp(min=1e-6)
-
-        if overtrading_factor is None:
-            overtrading_factor = torch.zeros_like(mid_price)
-        else:
-            overtrading_factor = overtrading_factor.to(self.device).float().clamp(0.0, 1.0)
+        overtrading_factor = self._prepare_overtrading_factor(overtrading_factor, mid_price)
 
         no_order = (direction == 0) | (size == 0)
 
-        # --- Partial fill sizing based on participation cap
-        max_fillable = self.max_participation * bar_liquidity_proxy
-        filled_size = torch.minimum(size, max_fillable)
-        is_partial = (filled_size < size) & ~no_order
+        filled_size, is_partial = self._apply_participation_cap(size, bar_liquidity_proxy, no_order)
 
-        # --- Slippage: half-spread + sqrt-impact, both working against the taker
-        participation = (filled_size / bar_liquidity_proxy).clamp(0.0, 1.0)
-        half_spread_cost = (self.spread_bps / 1e4) * mid_price
-        impact_cost = self.impact_coef * torch.sqrt(participation) * mid_price
-        overtrade_cost = (self.overtrade_surcharge_bps / 1e4) * overtrading_factor * mid_price
-
-        # Effective price = mid + side*(spread + impact + overtrade_surcharge) - side*limit_offset_in_price
-        # (a favorable limit_offset, e.g. requesting a better price, reduces
-        # the effective adverse move; ticks -> price via tick_size)
-        limit_offset_price = limit_offset * self.tick_size
-        raw_price = (
-            mid_price
-            + direction * (half_spread_cost + impact_cost + overtrade_cost)
-            - direction * limit_offset_price
+        fill_price = self._compute_fill_price(
+            direction=direction,
+            mid_price=mid_price,
+            limit_offset=limit_offset,
+            filled_size=filled_size,
+            bar_liquidity_proxy=bar_liquidity_proxy,
+            overtrading_factor=overtrading_factor,
         )
-
-        fill_price = self.snap_to_tick(raw_price)
-        fill_price = torch.clamp(fill_price, min=self.tick_size)  # never let price go non-positive
+        fill_price = torch.where(no_order, mid_price, fill_price)
 
         filled_qty = torch.where(no_order, torch.zeros_like(filled_size), direction * filled_size)
-        fill_price = torch.where(no_order, mid_price, fill_price)
 
         slippage_bps = torch.where(
             no_order,
@@ -199,23 +179,90 @@ class ExecutionSimulator:
             slippage_bps=slippage_bps,
         )
 
-    def compute_commission(self, filled_qty: torch.Tensor, fill_price: torch.Tensor) -> torch.Tensor:
+    def _validate_direction(self, direction: Tensor) -> Tensor:
+        """Cast direction to this device/dtype and enforce the {-1, 0, 1} contract."""
+        direction = direction.to(self.device).float()
+        valid = torch.isclose(direction, torch.round(direction)) & (direction.abs() <= 1.0 + 1e-6)
+        if not bool(valid.all()):
+            bad_values = direction[~valid].tolist()
+            raise ValueError(
+                f"ExecutionSimulator.simulate_fill(): direction must be exactly in {{-1, 0, 1}}, "
+                f"got out-of-contract value(s) {bad_values}. Discretize the policy's direction head "
+                f"(e.g. torch.sign() after rounding, or an argmax/Categorical index mapped through "
+                f"IDX_TO_DIRECTION) before calling this."
+            )
+        return direction
+
+    def _prepare_overtrading_factor(self, overtrading_factor: Optional[Tensor], mid_price: Tensor) -> Tensor:
+        """Default to zero (no surcharge) when not supplied; otherwise cast and clip to [0, 1]."""
+        if overtrading_factor is None:
+            return torch.zeros_like(mid_price)
+        return overtrading_factor.to(self.device).float().clamp(0.0, 1.0)
+
+    def _apply_participation_cap(
+        self, size: Tensor, bar_liquidity_proxy: Tensor, no_order: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """Cap requested size at `max_participation` of bar liquidity; flag the remainder as partial."""
+        max_fillable = self.max_participation * bar_liquidity_proxy
+        filled_size = torch.minimum(size, max_fillable)
+        is_partial = (filled_size < size) & ~no_order
+        return filled_size, is_partial
+
+    def _compute_fill_price(
+        self,
+        direction: Tensor,
+        mid_price: Tensor,
+        limit_offset: Tensor,
+        filled_size: Tensor,
+        bar_liquidity_proxy: Tensor,
+        overtrading_factor: Tensor,
+    ) -> Tensor:
+        """
+        effective_price = mid + side*(half_spread + sqrt-impact + overtrade_surcharge) - side*limit_offset_price
+
+        A favorable limit_offset (requesting a better price) reduces the
+        effective adverse move; ticks are converted to price via tick_size.
+        The result is tick-snapped and floored at one tick to avoid a
+        non-positive price.
+        """
+        participation = (filled_size / bar_liquidity_proxy).clamp(0.0, 1.0)
+        half_spread_cost = (self.spread_bps / 1e4) * mid_price
+        impact_cost = self.impact_coef * torch.sqrt(participation) * mid_price
+        overtrade_cost = (self.overtrade_surcharge_bps / 1e4) * overtrading_factor * mid_price
+
+        limit_offset_price = limit_offset * self.tick_size
+        raw_price = (
+            mid_price
+            + direction * (half_spread_cost + impact_cost + overtrade_cost)
+            - direction * limit_offset_price
+        )
+
+        fill_price = self.snap_to_tick(raw_price)
+        return torch.clamp(fill_price, min=self.tick_size)
+
+    # ------------------------------------------------------------------
+    # Costs
+    # ------------------------------------------------------------------
+
+    def compute_commission(self, filled_qty: Tensor, fill_price: Tensor) -> Tensor:
         """Commission for a fill batch: flat per-share + bps of notional, with a floor. [n_envs]."""
         shares = filled_qty.abs()
         notional = shares * fill_price
         commission = shares * self.commission_per_share + notional * (self.commission_bps / 1e4)
-        commission = torch.where(shares > 0, torch.clamp(commission, min=self.min_commission), torch.zeros_like(commission))
-        return commission
+        return torch.where(
+            shares > 0,
+            torch.clamp(commission, min=self.min_commission),
+            torch.zeros_like(commission),
+        )
 
-    def compute_platform_fee(self, filled_qty: torch.Tensor) -> torch.Tensor:
+    def compute_platform_fee(self, filled_qty: Tensor) -> Tensor:
         """
         Flat per-trade platform/broker ticket fee, charged whenever a non-zero
         fill occurred this step, independent of size or notional. [n_envs].
         """
         shares = filled_qty.abs()
-        fee = torch.where(
+        return torch.where(
             shares > 0,
             torch.full_like(shares, self.platform_fee_per_trade),
             torch.zeros_like(shares),
         )
-        return fee

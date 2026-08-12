@@ -72,6 +72,9 @@ from training.config import TrainingConfig
 
 from vec_trading_env import VecTradingEnv, StepResult
 
+Tensor = torch.Tensor
+TickCallback = Callable[[int, "StepResult", Tensor, Tensor, "KillSwitch"], None]
+
 
 # --------------------------------------------------------------------------
 # Combined actor-critic network: cnn -> lstm -> cross-attention -> fusion,
@@ -79,7 +82,7 @@ from vec_trading_env import VecTradingEnv, StepResult
 # --------------------------------------------------------------------------
 
 class HybridActorCritic(nn.Module):
-    def __init__(self, n_features: int, cfg: TrainingConfig):
+    def __init__(self, n_features: int, cfg: TrainingConfig) -> None:
         super().__init__()
         m = cfg.model
 
@@ -124,7 +127,7 @@ class HybridActorCritic(nn.Module):
     def init_hidden(self, batch_size: int, device: torch.device) -> Hidden:
         return self.lstm.init_hidden(batch_size, device)
 
-    def forward_features(self, obs: torch.Tensor, hidden: Hidden) -> Tuple[torch.Tensor, Hidden]:
+    def forward_features(self, obs: Tensor, hidden: Hidden) -> Tuple[Tensor, Hidden]:
         """
         obs: [batch, window, n_features] for this single rollout step
              (batch == n_envs == n_tickers, per the project's convention).
@@ -148,25 +151,72 @@ class HybridActorCritic(nn.Module):
 
 @dataclass
 class RolloutBuffer:
-    obs: torch.Tensor              # [T, n_envs, window, n_features]
-    direction_idx: torch.Tensor    # [T, n_envs] long
-    size: torch.Tensor             # [T, n_envs] -- normalized (0,1), as sampled by act()
-    limit_offset: torch.Tensor     # [T, n_envs] -- normalized (0,1), as sampled by act()
-    log_prob_old: torch.Tensor     # [T, n_envs]
-    value_old: torch.Tensor        # [T, n_envs] -- dual-critic-selected value at rollout time
-    position_before: torch.Tensor  # [T, n_envs] -- sign of position entering each step, for value-head selection
-    filled_qty: torch.Tensor       # [T, n_envs] -- signed shares actually filled that step (0 = no trade), for
-                                     # trade-count/turnover metrics -- see vec_trading_env.py's info["filled_qty"]
-    reward: torch.Tensor           # [T, n_envs] -- shaped reward actually used for GAE
-    done: torch.Tensor             # [T, n_envs] bool
-    initial_hidden: Hidden         # (h0, c0) at the START of this rollout -- replayed from fresh each PPO epoch
-    advantages: Optional[torch.Tensor] = None  # [T, n_envs], filled in by compute_gae()
-    returns: Optional[torch.Tensor] = None     # [T, n_envs], filled in by compute_gae()
+    obs: Tensor              # [T, n_envs, window, n_features]
+    direction_idx: Tensor    # [T, n_envs] long
+    size: Tensor             # [T, n_envs] -- normalized (0,1), as sampled by act()
+    limit_offset: Tensor     # [T, n_envs] -- normalized (0,1), as sampled by act()
+    log_prob_old: Tensor     # [T, n_envs]
+    value_old: Tensor        # [T, n_envs] -- dual-critic-selected value at rollout time
+    position_before: Tensor  # [T, n_envs] -- sign of position entering each step, for value-head selection
+    filled_qty: Tensor       # [T, n_envs] -- signed shares actually filled that step (0 = no trade), for
+                               # trade-count/turnover metrics -- see vec_trading_env.py's info["filled_qty"]
+    reward: Tensor           # [T, n_envs] -- shaped reward actually used for GAE
+    done: Tensor              # [T, n_envs] bool
+    initial_hidden: Hidden   # (h0, c0) at the START of this rollout -- replayed from fresh each PPO epoch
+    advantages: Optional[Tensor] = None  # [T, n_envs], filled in by compute_gae()
+    returns: Optional[Tensor] = None     # [T, n_envs], filled in by compute_gae()
 
 
 # --------------------------------------------------------------------------
 # Rollout collection
 # --------------------------------------------------------------------------
+
+def _run_action_pipeline(
+    actor_critic: HybridActorCritic,
+    action_sample: HybridActionSample,
+    kelly_sizer: KellySizer,
+    risk_manager: RiskManager,
+    kill_switch: KillSwitch,
+    env: VecTradingEnv,
+    mid_price: Tensor,
+    equity_before: Tensor,
+    current_position_notional: Tensor,
+    cfg: TrainingConfig,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """
+    Runs the fixed post-policy action pipeline for one rollout step:
+    normalized policy output -> raw shares/ticks -> Kelly soft cap ->
+    RiskManager hard caps -> KillSwitch hard halt.
+
+    Returns (final_direction, final_size, final_limit_offset), exactly the
+    triple env.step() expects. Must be called under the same no_grad scope
+    as the rest of collect_rollout() -- see that function's docstring.
+    """
+    size_shares_uncapped = HybridPolicyHead.rescale_size(
+        action_sample.size, torch.full_like(action_sample.size, cfg.risk.max_order_shares)
+    )
+    limit_offset_ticks = HybridPolicyHead.rescale_limit_offset(
+        action_sample.limit_offset, cfg.risk.max_limit_offset_ticks
+    )
+
+    kelly_result = kelly_sizer.apply(
+        size=size_shares_uncapped,
+        direction=action_sample.direction,
+        mid_price=mid_price,
+        equity=equity_before,
+        current_position_notional=current_position_notional,
+    )
+    risk_result = risk_manager.apply(
+        direction=action_sample.direction,
+        size=kelly_result.size,
+        limit_offset=limit_offset_ticks,
+        mid_price=mid_price,
+        portfolio=env.portfolio,
+        ticker_idx=0,
+    )
+    final_direction, final_size = kill_switch.apply(risk_result.direction, risk_result.size)
+    return final_direction, final_size, risk_result.limit_offset
+
 
 def collect_rollout(
     env: VecTradingEnv,
@@ -175,11 +225,11 @@ def collect_rollout(
     risk_manager: RiskManager,
     kill_switch: KillSwitch,
     reward_shaper: DifferentialSharpeReward,
-    obs: torch.Tensor,
+    obs: Tensor,
     hidden: Hidden,
     cfg: TrainingConfig,
-    tick_callback: Optional[Callable[[int, "StepResult", torch.Tensor, torch.Tensor, "KillSwitch"], None]] = None,
-) -> Tuple[RolloutBuffer, torch.Tensor, torch.Tensor, Hidden]:
+    tick_callback: Optional[TickCallback] = None,
+) -> Tuple[RolloutBuffer, Tensor, Tensor, Hidden]:
     """
     Runs cfg.ppo.rollout_length steps across all streams simultaneously.
 
@@ -206,20 +256,18 @@ def collect_rollout(
     given, and final_position_sign / final_obs / final_hidden are also used
     right here to compute the GAE bootstrap value.
     """
-    device = next(actor_critic.parameters()).device
     T = cfg.ppo.rollout_length
-    n_envs = env.n_envs
 
-    obs_buf: List[torch.Tensor] = []
-    direction_idx_buf: List[torch.Tensor] = []
-    size_buf: List[torch.Tensor] = []
-    limit_offset_buf: List[torch.Tensor] = []
-    log_prob_buf: List[torch.Tensor] = []
-    value_buf: List[torch.Tensor] = []
-    position_before_buf: List[torch.Tensor] = []
-    filled_qty_buf: List[torch.Tensor] = []
-    reward_buf: List[torch.Tensor] = []
-    done_buf: List[torch.Tensor] = []
+    obs_buf: List[Tensor] = []
+    direction_idx_buf: List[Tensor] = []
+    size_buf: List[Tensor] = []
+    limit_offset_buf: List[Tensor] = []
+    log_prob_buf: List[Tensor] = []
+    value_buf: List[Tensor] = []
+    position_before_buf: List[Tensor] = []
+    filled_qty_buf: List[Tensor] = []
+    reward_buf: List[Tensor] = []
+    done_buf: List[Tensor] = []
 
     initial_hidden = (hidden[0].clone().detach(), hidden[1].clone().detach())
 
@@ -246,33 +294,21 @@ def collect_rollout(
             values = actor_critic.critic_head(trunk)
             value_selected = DualCriticHead.select(values, position_before)
 
-            # --- action pipeline: normalized policy output -> raw shares/ticks -> soft cap -> hard caps -> halt
-            size_shares_uncapped = HybridPolicyHead.rescale_size(
-                action_sample.size, torch.full_like(action_sample.size, cfg.risk.max_order_shares)
-            )
-            limit_offset_ticks = HybridPolicyHead.rescale_limit_offset(
-                action_sample.limit_offset, cfg.risk.max_limit_offset_ticks
-            )
-
-            kelly_result = kelly_sizer.apply(
-                size=size_shares_uncapped,
-                direction=action_sample.direction,
+            final_direction, final_size, final_limit_offset = _run_action_pipeline(
+                actor_critic=actor_critic,
+                action_sample=action_sample,
+                kelly_sizer=kelly_sizer,
+                risk_manager=risk_manager,
+                kill_switch=kill_switch,
+                env=env,
                 mid_price=mid_price,
-                equity=equity_before,
+                equity_before=equity_before,
                 current_position_notional=current_position_notional,
+                cfg=cfg,
             )
-            risk_result = risk_manager.apply(
-                direction=action_sample.direction,
-                size=kelly_result.size,
-                limit_offset=limit_offset_ticks,
-                mid_price=mid_price,
-                portfolio=env.portfolio,
-                ticker_idx=0,
-            )
-            final_direction, final_size = kill_switch.apply(risk_result.direction, risk_result.size)
 
             step_result: StepResult = env.step(
-                direction=final_direction, size=final_size, limit_offset=risk_result.limit_offset
+                direction=final_direction, size=final_size, limit_offset=final_limit_offset
             )
 
             kelly_sizer.record_realized_pnl(step_result.info["realized_delta"])
@@ -347,7 +383,7 @@ def collect_rollout(
 # GAE(lambda)
 # --------------------------------------------------------------------------
 
-def compute_gae(buffer: RolloutBuffer, final_value: torch.Tensor, gamma: float, gae_lambda: float) -> None:
+def compute_gae(buffer: RolloutBuffer, final_value: Tensor, gamma: float, gae_lambda: float) -> None:
     """
     Fills in buffer.advantages and buffer.returns in place. final_value is
     the bootstrap V(s_{T}) returned by collect_rollout() -- the value of the
@@ -374,6 +410,56 @@ def compute_gae(buffer: RolloutBuffer, final_value: torch.Tensor, gamma: float, 
 # --------------------------------------------------------------------------
 # PPO update
 # --------------------------------------------------------------------------
+
+def _replay_trunk_sequence(
+    actor_critic: HybridActorCritic,
+    flat_obs: Tensor,
+    T: int,
+    n_envs: int,
+    window: int,
+    hidden: Hidden,
+    use_amp: bool,
+    use_checkpoint: bool,
+) -> Tensor:
+    """
+    Replays the CNN -> (sequential) LSTM -> cross-attention -> fusion trunk
+    over a stored trajectory, under the given autocast setting.
+
+    CRITICAL: the LSTM loop over `t` MUST stay a sequential Python loop --
+    the hidden state is genuinely recurrent across steps within a rollout.
+    Batching across t would silently feed every step the same (wrong)
+    initial hidden state. See this module's docstring before changing
+    anything here.
+
+    Returns flat_trunk of shape [T * n_envs, trunk_dim], still under
+    autocast dtype if use_amp was True (the caller casts back to float()
+    immediately after, once outside this function's `with autocast` scope).
+    """
+    with torch.cuda.amp.autocast(enabled=use_amp):
+        if use_checkpoint and torch.is_grad_enabled():
+            # CNN is stateless/side-effect-free (see cnn_encoder.py), so
+            # checkpointing its forward is safe: recomputed during
+            # backward instead of keeping every conv block's activations
+            # around for all T*n_envs rows simultaneously -- this is the
+            # single biggest activation-memory line item as n_envs grows
+            # (see training/config.py's ModelConfig docstring).
+            cnn_seq_all = torch.utils.checkpoint.checkpoint(
+                actor_critic.cnn, flat_obs, use_reentrant=False
+            )
+        else:
+            cnn_seq_all = actor_critic.cnn(flat_obs)
+        cnn_seq_all = cnn_seq_all.reshape(T, n_envs, window, -1)
+
+        trunks: List[Tensor] = []
+        for t in range(T):  # MUST stay sequential -- see module docstring
+            lstm_seq_t, hidden = actor_critic.lstm(cnn_seq_all[t], hidden)
+            lstm_last_t = lstm_seq_t[:, -1, :]
+            cnn_last_t = cnn_seq_all[t][:, -1, :]
+            attn_out_t = actor_critic.cross_attn(lstm_last_t)
+            trunks.append(actor_critic.fusion(cnn_last_t, attn_out_t))
+        trunk_all = torch.stack(trunks, dim=0)  # [T, n_envs, trunk_dim]
+        return trunk_all.reshape(T * n_envs, -1)
+
 
 def ppo_update(
     actor_critic: HybridActorCritic,
@@ -417,6 +503,7 @@ def ppo_update(
     flat_position_before = buffer.position_before.reshape(T * n_envs)
     flat_advantages = buffer.advantages.reshape(T * n_envs)
     flat_returns = buffer.returns.reshape(T * n_envs)
+    flat_obs = buffer.obs.reshape(T * n_envs, window, n_features)
 
     adv_mean, adv_std = flat_advantages.mean(), flat_advantages.std()
     flat_advantages_norm = (flat_advantages - adv_mean) / adv_std.clamp(min=1e-8)
@@ -431,33 +518,18 @@ def ppo_update(
         # bug before changing anything below.
         hidden = (buffer.initial_hidden[0].clone(), buffer.initial_hidden[1].clone())
 
-        with torch.cuda.amp.autocast(enabled=use_amp):
-            flat_obs = buffer.obs.reshape(T * n_envs, window, n_features)
-            if use_checkpoint and torch.is_grad_enabled():
-                # CNN is stateless/side-effect-free (see cnn_encoder.py), so
-                # checkpointing its forward is safe: recomputed during
-                # backward instead of keeping every conv block's activations
-                # around for all T*n_envs rows simultaneously -- this is the
-                # single biggest activation-memory line item as n_envs grows
-                # (see training/config.py's ModelConfig docstring).
-                cnn_seq_all = torch.utils.checkpoint.checkpoint(
-                    actor_critic.cnn, flat_obs, use_reentrant=False
-                )
-            else:
-                cnn_seq_all = actor_critic.cnn(flat_obs)
-            cnn_seq_all = cnn_seq_all.reshape(T, n_envs, window, -1)
+        flat_trunk = _replay_trunk_sequence(
+            actor_critic=actor_critic,
+            flat_obs=flat_obs,
+            T=T,
+            n_envs=n_envs,
+            window=window,
+            hidden=hidden,
+            use_amp=use_amp,
+            use_checkpoint=use_checkpoint,
+        )
 
-            trunks: List[torch.Tensor] = []
-            for t in range(T):  # MUST stay sequential -- see module docstring
-                lstm_seq_t, hidden = actor_critic.lstm(cnn_seq_all[t], hidden)
-                lstm_last_t = lstm_seq_t[:, -1, :]
-                cnn_last_t = cnn_seq_all[t][:, -1, :]
-                attn_out_t = actor_critic.cross_attn(lstm_last_t)
-                trunks.append(actor_critic.fusion(cnn_last_t, attn_out_t))
-            trunk_all = torch.stack(trunks, dim=0)  # [T, n_envs, trunk_dim]
-            flat_trunk = trunk_all.reshape(T * n_envs, -1)
-
-        # --- exit autocast here, deliberately: everything below is
+        # --- deliberately outside autocast here: everything below is
         # policy_head/critic_head distribution math and the PPO loss
         # itself, kept fp32 regardless of use_amp (see this function's
         # docstring).

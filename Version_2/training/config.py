@@ -31,7 +31,7 @@ since "which of three named regimes" isn't naturally a single tunable value.
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # paths.py lives at the project root; training/config.py is one level down.
 # Bootstrap the root onto sys.path so this works standalone (e.g. a test
@@ -47,6 +47,39 @@ from paths import (  # noqa: E402
     OVERTRADE_SURCHARGE_BPS,
     PLATFORM_FEE_PER_TRADE,
 )
+
+
+# --------------------------------------------------------------------------
+# Ticker universe -- MUST match fetch_alpaca.py's TICKERS list. Only used by
+# dataset.py/training indirectly (auto-discovered from metadata.json
+# instead); but live_loop.py's LiveLoop/AlpacaBarPoller read this list
+# directly (no dataset object exists in live mode) -- keep the two lists in
+# sync manually whenever either changes, nothing enforces it automatically.
+# --------------------------------------------------------------------------
+
+DEFAULT_TICKERS: List[str] = [
+    # Broad ETFs (10)
+    "SPY", "QQQ", "IWM", "DIA", "XLK", "XLF", "XLE", "XLV", "XLY", "XLP",
+    # Technology & Software (18)
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AVGO", "AMD",
+    "QCOM", "INTC", "MU", "TXN", "ORCL", "CRM", "ADBE", "NOW", "PANW",
+    # Financials & FinTech (15)
+    "JPM", "BAC", "GS", "MS", "C", "WFC", "BLK", "SCHW", "V", "MA",
+    "AXP", "PYPL", "SQ", "COIN", "BRK.B",
+    # Healthcare & Biotechnology (14)
+    "JNJ", "PFE", "UNH", "LLY", "ABBV", "MRK", "TMO", "ABT", "DHR",
+    "BMY", "AMGN", "GILD", "ISRG", "VRTX",
+    # Consumer Discretionary & Staples (15)
+    "WMT", "COST", "PG", "KO", "PEP", "NKE", "HD", "MCD", "SBUX",
+    "TGT", "LOW", "PM", "MO", "CL", "MDLZ",
+    # Energy & Utilities (10)
+    "XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "NEE", "DUK",
+    # Industrials, Aerospace & Defense (12)
+    "CAT", "GE", "BA", "LMT", "RTX", "HON", "DE", "UNP", "UPS",
+    "FDX", "MMM", "GD",
+    # Communications & Entertainment (6)
+    "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS",
+]
 
 
 # --------------------------------------------------------------------------
@@ -78,7 +111,7 @@ from paths import (  # noqa: E402
 #     cfg.env = EnvConfig.for_friction("low", tickers=my_tickers)  # preset + explicit overrides
 # --------------------------------------------------------------------------
 
-FRICTION_PRESETS = {
+FRICTION_PRESETS: Dict[str, Dict[str, Any]] = {
     "low": dict(
         spread_bps=0.1,
         impact_coef=0.01,
@@ -119,33 +152,7 @@ FRICTION_PRESETS = {
 class EnvConfig:
     """Mirrors vec_trading_env.VecTradingEnv's constructor -- keep these in sync if that file's defaults change."""
 
-    tickers: List[str] = field(default_factory=lambda: [
-        # Broad ETFs (10)
-        "SPY", "QQQ", "IWM", "DIA", "XLK", "XLF", "XLE", "XLV", "XLY", "XLP",
-        # # Technology & Software (18)
-        # "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AVGO", "AMD",
-        # "QCOM", "INTC", "MU", "TXN", "ORCL", "CRM", "ADBE", "NOW", "PANW",
-        # # Financials & FinTech (15)
-        # "JPM", "BAC", "GS", "MS", "C", "WFC", "BLK", "SCHW", "V", "MA",
-        # "AXP", "PYPL", "SQ", "COIN", "BRK.B",
-        # # Healthcare & Biotechnology (14)
-        # "JNJ", "PFE", "UNH", "LLY", "ABBV", "MRK", "TMO", "ABT", "DHR",
-        # "BMY", "AMGN", "GILD", "ISRG", "VRTX",
-        # # Consumer Discretionary & Staples (15)
-        # "WMT", "COST", "PG", "KO", "PEP", "NKE", "HD", "MCD", "SBUX",
-        # "TGT", "LOW", "PM", "MO", "CL", "MDLZ",
-        # # Energy & Utilities (10)
-        # "XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "NEE", "DUK",
-        # # Industrials, Aerospace & Defense (12)
-        # "CAT", "GE", "BA", "LMT", "RTX", "HON", "DE", "UNP", "UPS",
-        # "FDX", "MMM", "GD",
-        # # Communications & Entertainment (6)
-        # "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS",
-    ])  # MUST match fetch_alpaca.py's TICKERS list. Only used by dataset.py/training
-        # indirectly (auto-discovered from metadata.json instead); but
-        # live_loop.py's LiveLoop/AlpacaBarPoller read THIS list directly
-        # (no dataset object exists in live mode) -- keep the two lists in
-        # sync manually whenever either changes, nothing enforces it automatically.
+    tickers: List[str] = field(default_factory=lambda: list(DEFAULT_TICKERS))
     window_size: int = 60
     initial_cash: float = 10_000.0
     max_position_frac: float = 1.0
@@ -171,7 +178,7 @@ class EnvConfig:
     diversity_bonus_coef: float = DIVERSITY_COEF
 
     @classmethod
-    def for_friction(cls, level: str, **overrides) -> "EnvConfig":
+    def for_friction(cls, level: str, **overrides: Any) -> "EnvConfig":
         """
         Builds an EnvConfig starting from the named friction preset
         (FRICTION_PRESETS above), then applies any explicit field overrides
@@ -229,6 +236,7 @@ class ModelConfig:
     # threading LSTM replay is a correctness risk this project's own
     # ppo_hybrid.py docstring warns about at length; not attempted.
     use_gradient_checkpointing: bool = False
+
 
 @dataclass
 class RiskConfig:
@@ -310,6 +318,16 @@ class RewardConfig:
                                   # Sharpe-shaped signal; raise this if you want the env's own shaping
                                   # (in particular the directional-bias diversity bonus) to also count.
 
+    # training/reward.py's DifferentialSharpeReward -- symmetric checkpoint
+    # bonus/penalty layered on top of D_t whenever a stream's cumulative
+    # return since the last reset crosses a NEW multiple of dsr_checkpoint_step
+    # (in either direction -- see that file's module docstring). Disable
+    # entirely with dsr_enable_checkpoint_bonus=False to recover the plain
+    # differential-Sharpe reward.
+    dsr_enable_checkpoint_bonus: bool = True
+    dsr_checkpoint_step: float = 0.025          # 2.5% cumulative-return milestone spacing
+    dsr_checkpoint_bonus_frac: float = 0.10     # +/- 10% of |D_t| per new milestone crossed
+
 
 @dataclass
 class PPOConfig:
@@ -363,6 +381,20 @@ class RunConfig:
     # /kaggle/working and see real I/O contention, raise this back toward
     # 2-5 rather than assuming something else is wrong.
     tick_log_every_n_ticks: int = 1
+
+    # MetricsWriter's tick-log rotation threshold, in bytes -- once
+    # metrics_path (the tick-level log, not the whole logs/ dir) would
+    # exceed this size, MetricsWriter rotates it (see its own docstring for
+    # the exact rotation scheme) rather than letting a single run's file
+    # grow unbounded. Was previously hardcoded inside MetricsWriter itself;
+    # pulled out here so it's tunable per-run the same way tick_log_every_n_
+    # ticks and dashboard_poll_interval_seconds are, without editing that
+    # module directly. 100 MB is comfortably larger than a full 1000-rollout
+    # run at tick_log_every_n_ticks=1 produces on this project's tick record
+    # schema -- lower it if you're disk-constrained (e.g. a small Kaggle
+    # /kaggle/working quota), raise it if you extend total_rollouts well
+    # past the default or log_every_n_ticks stays at 1 for a much longer run.
+    max_tick_log_bytes: int = 100 * 1024 * 1024   # 100 MB
 
     # How often the SEPARATE notebook cell running
     # TrainingDashboard.run_polling_loop() (or a manual polling loop) re-reads

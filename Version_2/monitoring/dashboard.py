@@ -40,7 +40,7 @@ import json
 import os
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -69,45 +69,122 @@ except ImportError:
 # --------------------------------------------------------------------------
 
 class MetricsWriter:
-    """
-    Append-only structured metrics log (JSONL). One line per log() call.
+    """Write metrics to durable rollout and bounded tick JSONL logs.
+
+    ``path`` remains the durable rollout log used by existing callers. Records
+    with ``record_type == "tick"`` are routed to a separate bounded log.
+    Legacy records without ``record_type`` continue to be treated as rollouts.
     """
 
-    def __init__(self, path: str, flush_every_call: bool = True):
+    _TICK_SUFFIX = ".ticks.jsonl"
+    _DEFAULT_TICK_MAX_BYTES = 8 * 1024 * 1024
+    _DEFAULT_TICK_BACKUP_COUNT = 2
+
+    def __init__(
+        self,
+        path: str,
+        flush_every_call: bool = True,
+        tick_path: Optional[str] = None,
+        tick_max_bytes: int = _DEFAULT_TICK_MAX_BYTES,
+        tick_backup_count: int = _DEFAULT_TICK_BACKUP_COUNT,
+    ):
         self.path = path
         self.flush_every_call = flush_every_call
+        self.tick_path = tick_path or self._derive_tick_path(path)
+        self.tick_max_bytes = max(1, int(tick_max_bytes))
+        self.tick_backup_count = max(0, int(tick_backup_count))
+
+        self._fh = self._open_append(path)
+        self._tick_fh = self._open_append(self.tick_path)
+
+    @classmethod
+    def _derive_tick_path(cls, path: str) -> str:
+        if path.endswith(".jsonl"):
+            return path[:-6] + cls._TICK_SUFFIX
+        return path + cls._TICK_SUFFIX
+
+    @staticmethod
+    def _open_append(path: str):
         parent = os.path.dirname(os.path.abspath(path))
         os.makedirs(parent, exist_ok=True)
-        self._fh = open(path, "a", buffering=1)
+        return open(path, "a", buffering=1, encoding="utf-8")
+
+    def _rotate_tick_log_if_needed(self, line_size: int) -> None:
+        """Rotate the tick stream before it exceeds the configured bound."""
+        try:
+            current_size = os.path.getsize(self.tick_path)
+        except OSError:
+            current_size = 0
+
+        if current_size == 0 or current_size + line_size <= self.tick_max_bytes:
+            return
+
+        self._tick_fh.close()
+
+        if self.tick_backup_count > 0:
+            oldest = f"{self.tick_path}.{self.tick_backup_count}"
+            try:
+                os.remove(oldest)
+            except FileNotFoundError:
+                pass
+
+            for index in range(self.tick_backup_count - 1, 0, -1):
+                source = f"{self.tick_path}.{index}"
+                target = f"{self.tick_path}.{index + 1}"
+                try:
+                    os.replace(source, target)
+                except FileNotFoundError:
+                    pass
+
+            try:
+                os.replace(self.tick_path, f"{self.tick_path}.1")
+            except FileNotFoundError:
+                pass
+        else:
+            try:
+                os.remove(self.tick_path)
+            except FileNotFoundError:
+                pass
+
+        self._tick_fh = self._open_append(self.tick_path)
+
+    def _write(
+        self,
+        file_handle,
+        path: str,
+        record: Dict[str, Any],
+        fsync: bool,
+    ) -> None:
+        line = json.dumps(record, default=_json_default) + "\n"
+        if path == self.tick_path:
+            self._rotate_tick_log_if_needed(len(line.encode("utf-8")))
+            file_handle = self._tick_fh
+
+        file_handle.write(line)
+        if self.flush_every_call:
+            file_handle.flush()
+            if fsync:
+                os.fsync(file_handle.fileno())
 
     def log(self, step: int, fsync: bool = True, **metrics: Any) -> None:
-        """
-        fsync=True (default) is what every rollout-level log() call should
-        keep using -- one call per ~256 env-steps, fsync cost is
-        negligible. Tick-level logging (once per env-step -- see
-        train.py's per-tick MetricsWriter usage) calls this with
-        fsync=False: flush() still happens (so a concurrent reader sees the
-        line immediately -- MetricsReader.tail() does a plain file read,
-        not an OS-buffered one), but the disk-sync syscall is skipped,
-        since paying an fsync 256x per rollout instead of once is a real,
-        avoidable cost for data that's inherently disposable (a lost tick
-        record on a crash is nothing like a lost checkpoint).
-        """
+        """Append one metric record to the appropriate JSONL stream."""
         record = {"step": step, "wall_time": time.time(), **metrics}
-        self._fh.write(json.dumps(record, default=_json_default) + "\n")
-        if self.flush_every_call:
-            self._fh.flush()
-            if fsync:
-                os.fsync(self._fh.fileno())
+        if record.get("record_type") == "tick":
+            self._write(self._tick_fh, self.tick_path, record, fsync)
+        else:
+            self._write(self._fh, self.path, record, fsync)
 
     def close(self) -> None:
-        self._fh.close()
+        for file_handle in (self._fh, self._tick_fh):
+            if not file_handle.closed:
+                file_handle.close()
 
     def __enter__(self) -> "MetricsWriter":
         return self
 
     def __exit__(self, *exc) -> None:
         self.close()
+
 
 
 def _json_default(obj: Any) -> Any:
@@ -131,62 +208,105 @@ def _json_default(obj: Any) -> Any:
 # --------------------------------------------------------------------------
 
 class MetricsReader:
-    def __init__(self, path: str):
-        self.path = path
+    """Read recent metrics from the durable rollout and tick log streams."""
 
-    def tail(self, n: int) -> List[Dict[str, Any]]:
-        """
-        Reads only the last ~n lines, not the whole file. The previous
-        implementation did `f.readlines()` on the ENTIRE file every single
-        call -- fine for a short run, but with tick-level logging now
-        writing far more lines than the old rollout-only cadence, the file
-        keeps growing for the whole training run, and re-reading all of it
-        every poll gets progressively slower as it grows -- exactly the
-        kind of bug that looks like "updates aren't frequent enough" and
-        gets WORSE the longer training runs, not better. This reads
-        backward from the end of the file in chunks until it has at least
-        n newlines, which keeps the cost roughly constant regardless of
-        total file size.
-        """
-        if not os.path.exists(self.path):
+    def __init__(
+        self,
+        path: str,
+        tick_path: Optional[str] = None,
+        tick_backup_count: int = MetricsWriter._DEFAULT_TICK_BACKUP_COUNT,
+    ):
+        self.path = path
+        self.tick_path = tick_path
+        self.tick_backup_count = max(0, int(tick_backup_count))
+
+    def _paths(self) -> List[str]:
+        if self.tick_path is None:
+            return [self.path]
+        return [
+            self.path,
+            self.tick_path,
+            *(
+                f"{self.tick_path}.{index}"
+                for index in range(1, self.tick_backup_count + 1)
+            ),
+        ]
+
+    @staticmethod
+    def _tail_file(path: str, n: int) -> List[Dict[str, Any]]:
+        """Read the last ``n`` complete JSONL records from one file."""
+        if n <= 0 or not os.path.exists(path):
             return []
 
         chunk_size = 65536
-        file_size = os.path.getsize(self.path)
+        try:
+            file_size = os.path.getsize(path)
+        except OSError:
+            return []
         if file_size == 0:
             return []
 
-        with open(self.path, "rb") as f:
+        with open(path, "rb") as file_handle:
             data = b""
-            pos = file_size
-            newline_count = 0
-            # +1 target: we need n complete lines, which means n+1 newlines
-            # scanned from EOF in the worst case (a trailing partial/no
-            # final newline) -- overshoot by one chunk rather than
-            # under-read and silently return fewer than n records.
-            while pos > 0 and newline_count <= n:
-                read_size = min(chunk_size, pos)
-                pos -= read_size
-                f.seek(pos)
-                data = f.read(read_size) + data
-                newline_count = data.count(b"\n")
-
-        text = data.decode("utf-8", errors="ignore")
-        lines = text.splitlines()[-n:]
+            position = file_size
+            while position > 0 and data.count(b"\n") <= n:
+                read_size = min(chunk_size, position)
+                position -= read_size
+                file_handle.seek(position)
+                data = file_handle.read(read_size) + data
 
         records: List[Dict[str, Any]] = []
-        for line in lines:
+        for line in data.decode("utf-8", errors="ignore").splitlines()[-n:]:
             line = line.strip()
             if not line:
                 continue
             try:
-                records.append(json.loads(line))
+                record = json.loads(line)
             except json.JSONDecodeError:
-                # a torn read of a line split mid-write (either the file's
-                # true last line still being flushed, or a chunk boundary
-                # landing mid-line) -- skip it, it'll read fine next poll.
+                # A concurrent write may leave the final line temporarily torn.
                 continue
+            if isinstance(record, dict):
+                records.append(record)
         return records
+
+    @staticmethod
+    def _sort_key(
+        record: Dict[str, Any],
+        source_index: int,
+        record_index: int,
+    ) -> Tuple[float, int, int]:
+        try:
+            wall_time = float(record.get("wall_time"))
+        except (TypeError, ValueError):
+            wall_time = float("-inf")
+        return wall_time, source_index, record_index
+
+    def tail(self, n: int) -> List[Dict[str, Any]]:
+        """Return recent records, merging rollout and tick streams chronologically.
+
+        For a single path, this preserves the historical ``tail(n)`` behavior.
+        With a tick path configured, ``n`` records are collected per source
+        (including rotated tick files), then globally ordered by ``wall_time``.
+        """
+        if n <= 0:
+            return []
+
+        per_path_records = [
+            self._tail_file(path, n)
+            for path in self._paths()
+        ]
+
+        merged: List[Tuple[Tuple[float, int, int], Dict[str, Any]]] = []
+        for source_index, records in enumerate(per_path_records):
+            for record_index, record in enumerate(records):
+                merged.append((
+                    self._sort_key(record, source_index, record_index),
+                    record,
+                ))
+
+        merged.sort(key=lambda item: item[0])
+        return [record for _, record in merged]
+
 
 
 # --------------------------------------------------------------------------
@@ -263,8 +383,15 @@ class TrainingDashboard:
         mode: DisplayMode = DisplayMode.AUTO,
         history_window: int = 200,
         console: Optional[Console] = None,
+        tick_metrics_path: Optional[str] = None,
+        tick_backup_count: int = MetricsWriter._DEFAULT_TICK_BACKUP_COUNT,
     ):
-        self.reader = MetricsReader(metrics_path)
+        resolved_tick_path = tick_metrics_path or MetricsWriter._derive_tick_path(metrics_path)
+        self.reader = MetricsReader(
+            metrics_path,
+            tick_path=resolved_tick_path,
+            tick_backup_count=tick_backup_count,
+        )
         self.mode = resolve_display_mode(mode)
         self.history_window = history_window
 

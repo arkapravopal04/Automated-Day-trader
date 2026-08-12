@@ -47,7 +47,7 @@ direction head, dual critics) live in the policy/loss code, not here.
 import os
 import sys
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -68,8 +68,38 @@ from paths import (  # noqa: E402
 from execution_sim import ExecutionSimulator, SimulatedFill  # noqa: E402
 from portfolio_state import PortfolioState, Fill  # noqa: E402
 
+Tensor = torch.Tensor
 
-def load_aligned_close_prices(tickers, aligned_dates: pd.DatetimeIndex) -> np.ndarray:
+
+def _load_aligned_column(
+    tickers: Sequence[str],
+    aligned_dates: pd.DatetimeIndex,
+    column: str,
+    fill: Callable[[pd.DataFrame], pd.DataFrame],
+) -> np.ndarray:
+    """
+    Shared loader: reads `column` from each ticker's parquet in RAW_DIR,
+    reindexes onto `aligned_dates` (the same timestamp index
+    MultiTickerRolloutDataset produced), and applies the caller-supplied
+    `fill` strategy for gaps -- the only real difference between the price
+    and volume loaders below.
+
+    Returns: np.ndarray of shape [T, n_tickers], float32.
+    """
+    series_by_ticker = {}
+    for ticker in tickers:
+        path = os.path.join(RAW_DIR, f"{ticker}.parquet")
+        df = pd.read_parquet(path, columns=[column])
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        series_by_ticker[ticker] = df[column]
+
+    frame = pd.DataFrame(series_by_ticker).reindex(aligned_dates)
+    frame = fill(frame)
+    return frame[tickers].values.astype(np.float32)
+
+
+def load_aligned_close_prices(tickers: Sequence[str], aligned_dates: pd.DatetimeIndex) -> np.ndarray:
     """
     Loads raw close prices per ticker from RAW_DIR and reindexes them onto
     `aligned_dates` (the same timestamp index MultiTickerRolloutDataset
@@ -78,20 +108,10 @@ def load_aligned_close_prices(tickers, aligned_dates: pd.DatetimeIndex) -> np.nd
 
     Returns: np.ndarray of shape [T, n_tickers], float32.
     """
-    closes = {}
-    for ticker in tickers:
-        path = os.path.join(RAW_DIR, f"{ticker}.parquet")
-        df = pd.read_parquet(path, columns=["close"])
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
-        closes[ticker] = df["close"]
-
-    price_df = pd.DataFrame(closes)
-    price_df = price_df.reindex(aligned_dates).ffill().bfill()
-    return price_df[tickers].values.astype(np.float32)
+    return _load_aligned_column(tickers, aligned_dates, "close", lambda df: df.ffill().bfill())
 
 
-def load_aligned_volumes(tickers, aligned_dates: pd.DatetimeIndex) -> np.ndarray:
+def load_aligned_volumes(tickers: Sequence[str], aligned_dates: pd.DatetimeIndex) -> np.ndarray:
     """
     Same alignment as load_aligned_close_prices(), but for raw bar volume --
     used as the real liquidity proxy for execution_sim.py's partial-fill
@@ -106,25 +126,15 @@ def load_aligned_volumes(tickers, aligned_dates: pd.DatetimeIndex) -> np.ndarray
 
     Returns: np.ndarray of shape [T, n_tickers], float32.
     """
-    volumes = {}
-    for ticker in tickers:
-        path = os.path.join(RAW_DIR, f"{ticker}.parquet")
-        df = pd.read_parquet(path, columns=["volume"])
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
-        volumes[ticker] = df["volume"]
-
-    volume_df = pd.DataFrame(volumes)
-    volume_df = volume_df.reindex(aligned_dates).fillna(0.0)
-    return volume_df[tickers].values.astype(np.float32)
+    return _load_aligned_column(tickers, aligned_dates, "volume", lambda df: df.fillna(0.0))
 
 
 @dataclass
 class StepResult:
-    obs: torch.Tensor       # [n_envs, window, features] - next observation window
-    reward: torch.Tensor    # [n_envs]
-    done: torch.Tensor      # [n_envs] bool
-    info: Dict[str, torch.Tensor]
+    obs: Tensor              # [n_envs, window, features] - next observation window
+    reward: Tensor           # [n_envs]
+    done: Tensor              # [n_envs] bool
+    info: Dict[str, Tensor]
 
 
 class VecTradingEnv:
@@ -157,7 +167,7 @@ class VecTradingEnv:
         bias_window: int = DIVERSITY_WINDOW,
         diversity_bonus_coef: float = DIVERSITY_COEF,
         device: Optional[str] = None,
-    ):
+    ) -> None:
         self.dataset = dataset
         self.window_size = dataset.window_size
         self.n_envs = dataset.n_envs  # == n_tickers, one stream per ticker
@@ -177,24 +187,8 @@ class VecTradingEnv:
         self.bias_window = bias_window
         self.diversity_bonus_coef = diversity_bonus_coef
 
-        # --- Raw prices, aligned to the dataset's own date index
-        prices_np = load_aligned_close_prices(self.tickers, dataset.aligned_dates)
-        self.prices = torch.tensor(prices_np, device=self.device, dtype=torch.float32)  # [T, n_envs]
-
-        # --- Raw bar volume, aligned the same way -- real liquidity proxy
-        # for execution_sim.py's partial-fill sizing (see
-        # _bar_liquidity_proxy()), replacing the earlier fixed placeholder.
-        volumes_np = load_aligned_volumes(self.tickers, dataset.aligned_dates)
-        self.volumes = torch.tensor(volumes_np, device=self.device, dtype=torch.float32)  # [T, n_envs]
-
-        # --- Synthetic mirrored price path per ticker: negate log-returns,
-        # keep the same starting price, so a mirrored bull ticker behaves like
-        # a bear ticker (and vice versa) for the whole pass. Precomputed once
-        # since it only depends on the raw price series, not on the episode.
-        log_prices = torch.log(self.prices.clamp(min=1e-6))
-        log_returns = torch.diff(log_prices, dim=0, prepend=log_prices[:1])
-        mirrored_log_prices = torch.cumsum(-log_returns, dim=0) + log_prices[0]
-        self.mirrored_prices = torch.exp(mirrored_log_prices)  # [T, n_envs]
+        self._load_market_data()
+        self._precompute_mirrored_prices()
 
         # --- Feature indices whose sign is direction-sensitive (returns,
         # momentum, etc.) — these get flipped in obs for mirrored streams so
@@ -244,7 +238,30 @@ class VecTradingEnv:
         self.mirror_mask = torch.zeros(self.n_envs, dtype=torch.bool, device=self.device)
         self.active_prices = self.prices
 
-    def reset(self) -> torch.Tensor:
+    def _load_market_data(self) -> None:
+        """Loads and aligns raw close prices and bar volume onto the dataset's date index."""
+        prices_np = load_aligned_close_prices(self.tickers, self.dataset.aligned_dates)
+        self.prices = torch.tensor(prices_np, device=self.device, dtype=torch.float32)  # [T, n_envs]
+
+        # Real liquidity proxy for execution_sim.py's partial-fill sizing
+        # (see _bar_liquidity_proxy()), replacing the earlier fixed placeholder.
+        volumes_np = load_aligned_volumes(self.tickers, self.dataset.aligned_dates)
+        self.volumes = torch.tensor(volumes_np, device=self.device, dtype=torch.float32)  # [T, n_envs]
+
+    def _precompute_mirrored_prices(self) -> None:
+        """
+        Builds the synthetic mirrored price path per ticker: negate log-
+        returns, keep the same starting price, so a mirrored bull ticker
+        behaves like a bear ticker (and vice versa) for the whole pass.
+        Precomputed once since it only depends on the raw price series, not
+        on the episode.
+        """
+        log_prices = torch.log(self.prices.clamp(min=1e-6))
+        log_returns = torch.diff(log_prices, dim=0, prepend=log_prices[:1])
+        mirrored_log_prices = torch.cumsum(-log_returns, dim=0) + log_prices[0]
+        self.mirrored_prices = torch.exp(mirrored_log_prices)  # [T, n_envs]
+
+    def reset(self) -> Tensor:
         """Resets the episode to the start of the split and returns the first observation."""
         self.current_idx = 0
         self.portfolio.reset()
@@ -267,7 +284,7 @@ class VecTradingEnv:
         obs = self.dataset[self.current_idx].to(self.device)  # [n_envs, window, features]
         return self._apply_mirror_to_obs(obs)
 
-    def _apply_mirror_to_obs(self, obs: torch.Tensor) -> torch.Tensor:
+    def _apply_mirror_to_obs(self, obs: Tensor) -> Tensor:
         """
         Flips the sign of direction-sensitive features (returns/momentum) for
         streams whose price path was mirrored this pass, so the observation
@@ -283,12 +300,12 @@ class VecTradingEnv:
             obs[:, :, f] = torch.where(flip, -obs[:, :, f], obs[:, :, f])
         return obs
 
-    def _current_prices(self) -> torch.Tensor:
+    def _current_prices(self) -> Tensor:
         """Mark/mid price for 'now' = last bar of the current window."""
         t = self.current_idx + self.window_size - 1
         return self.active_prices[t]  # [n_envs]
 
-    def _bar_liquidity_proxy(self) -> torch.Tensor:
+    def _bar_liquidity_proxy(self) -> Tensor:
         """
         Real per-bar liquidity proxy: this stream's actual traded volume for
         the current bar (same time index _current_prices() uses), fed into
@@ -302,9 +319,9 @@ class VecTradingEnv:
 
     def step(
         self,
-        direction: torch.Tensor,      # [n_envs], in {-1, 0, 1}
-        size: torch.Tensor,           # [n_envs], requested shares (unsigned)
-        limit_offset: torch.Tensor,   # [n_envs], in ticks
+        direction: Tensor,      # [n_envs], in {-1, 0, 1}
+        size: Tensor,           # [n_envs], requested shares (unsigned)
+        limit_offset: Tensor,   # [n_envs], in ticks
     ) -> StepResult:
         """
         Advances every stream by one window-step. Each stream i trades only
@@ -333,12 +350,7 @@ class VecTradingEnv:
         fill = Fill(ticker_idx=0, qty=sim_fill.filled_qty, price=sim_fill.fill_price, commission=total_fees)
         realized_delta = self.portfolio.step_apply(fill)
 
-        # --- update rolling trade-direction history (overtrading + diversity)
-        trade_sign = torch.sign(sim_fill.filled_qty)
-        self._trade_hist[:, self._trade_hist_ptr % self.overtrade_window] = trade_sign
-        self._trade_hist_ptr += 1
-        self._bias_hist[:, self._bias_hist_ptr % self.bias_window] = trade_sign
-        self._bias_hist_ptr += 1
+        self._record_trade_direction(sim_fill.filled_qty)
 
         self.current_idx = min(self.current_idx + 1, self.max_idx)
         done_time = self.current_idx >= self.max_idx
@@ -374,7 +386,15 @@ class VecTradingEnv:
 
         return StepResult(obs=next_obs, reward=reward, done=done, info=info)
 
-    def _overtrading_factor(self) -> torch.Tensor:
+    def _record_trade_direction(self, filled_qty: Tensor) -> None:
+        """Pushes this step's realized trade sign into both rolling circular buffers."""
+        trade_sign = torch.sign(filled_qty)
+        self._trade_hist[:, self._trade_hist_ptr % self.overtrade_window] = trade_sign
+        self._trade_hist_ptr += 1
+        self._bias_hist[:, self._bias_hist_ptr % self.bias_window] = trade_sign
+        self._bias_hist_ptr += 1
+
+    def _overtrading_factor(self) -> Tensor:
         """
         Fraction in [0, 1] of how far each stream is over its "free" trade
         budget within the rolling `overtrade_window` (in bars — 5-minute bars
@@ -389,13 +409,13 @@ class VecTradingEnv:
 
     def _compute_reward(
         self,
-        equity_before: torch.Tensor,
-        equity_after: torch.Tensor,
-        mid_price_before: torch.Tensor,
-        mid_price_after: torch.Tensor,
+        equity_before: Tensor,
+        equity_after: Tensor,
+        mid_price_before: Tensor,
+        mid_price_after: Tensor,
         is_terminal: bool,
-        next_obs: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        next_obs: Tensor,
+    ) -> Tuple[Tensor, Dict[str, Tensor]]:
         """
         Vol-normalized step reward + terminal alpha-vs-buy-and-hold reward +
         a hold-loser penalty + a directional-diversity bonus, matching the
@@ -409,31 +429,9 @@ class VecTradingEnv:
         re-slice/re-mirror the dataset here).
         """
         step_pnl = equity_after - equity_before
-
-        if self._rv_feature_idx is not None:
-            # next_obs: [n_envs, window, features] -> take last timestep's rv feature per stream
-            current_vol = next_obs[:, -1, self._rv_feature_idx].abs().clamp(min=1e-4)
-        else:
-            current_vol = torch.full_like(step_pnl, 1.0)
-
-        step_reward = self.r_step_scale * (step_pnl / (equity_before.clamp(min=1e-6) * current_vol))
-
-        # Hold-loser penalty: small drag applied when holding a position that's
-        # currently underwater, scaled by |position| so bigger losers cost more
-        pos = self.portfolio.positions[:, 0]
-        unrealized = self.portfolio.unrealized_pnl(mid_price_after.unsqueeze(1))
-        is_loser = (pos != 0) & (unrealized < 0)
-        hold_penalty = torch.where(
-            is_loser, self.hold_loser_penalty * pos.abs(), torch.zeros_like(pos)
-        )
-
-        # Directional diversity bonus: penalize streams whose recent trade
-        # direction has been persistently one-sided (|mean sign| close to 1),
-        # regardless of whether that's because the underlying data (or its
-        # mirrored counterpart) happens to be trending. This is a light-touch
-        # complement to the mirroring above, not a substitute for it.
-        bias_mean = self._bias_hist.mean(dim=1)
-        diversity_bonus = -self.diversity_bonus_coef * bias_mean.abs()
+        step_reward = self._vol_normalized_step_reward(step_pnl, equity_before, next_obs)
+        hold_penalty = self._hold_loser_penalty(mid_price_after)
+        diversity_bonus = self._diversity_bonus()
 
         reward = step_reward - hold_penalty + diversity_bonus
 
@@ -450,6 +448,32 @@ class VecTradingEnv:
             "hold_penalty": hold_penalty,
             "diversity_bonus": diversity_bonus,
         }
+
+    def _vol_normalized_step_reward(self, step_pnl: Tensor, equity_before: Tensor, next_obs: Tensor) -> Tensor:
+        """position_bar_return / current_atr, using the dataset's 'rv' feature as the vol proxy when available."""
+        if self._rv_feature_idx is not None:
+            # next_obs: [n_envs, window, features] -> take last timestep's rv feature per stream
+            current_vol = next_obs[:, -1, self._rv_feature_idx].abs().clamp(min=1e-4)
+        else:
+            current_vol = torch.full_like(step_pnl, 1.0)
+        return self.r_step_scale * (step_pnl / (equity_before.clamp(min=1e-6) * current_vol))
+
+    def _hold_loser_penalty(self, mid_price_after: Tensor) -> Tensor:
+        """Small drag applied when holding a position that's currently underwater, scaled by |position|."""
+        pos = self.portfolio.positions[:, 0]
+        unrealized = self.portfolio.unrealized_pnl(mid_price_after.unsqueeze(1))
+        is_loser = (pos != 0) & (unrealized < 0)
+        return torch.where(is_loser, self.hold_loser_penalty * pos.abs(), torch.zeros_like(pos))
+
+    def _diversity_bonus(self) -> Tensor:
+        """
+        Penalizes streams whose recent trade direction has been persistently
+        one-sided (|mean sign| close to 1), regardless of whether that's
+        because the underlying data (or its mirrored counterpart) happens to
+        be trending. A light-touch complement to mirroring, not a substitute.
+        """
+        bias_mean = self._bias_hist.mean(dim=1)
+        return -self.diversity_bonus_coef * bias_mean.abs()
 
     def __len__(self) -> int:
         return len(self.dataset)

@@ -51,7 +51,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "env"))
 
 from dataset import MultiTickerRolloutDataset  # noqa: E402
 from paths import is_kaggle  # noqa: E402
-from vec_trading_env import VecTradingEnv, StepResult  # noqa: E402
+from env.vec_trading_env import VecTradingEnv, StepResult  # noqa: E402
 
 from training.config import TrainingConfig  # noqa: E402
 from training.ppo_hybrid import HybridActorCritic, collect_rollout, compute_gae, ppo_update  # noqa: E402
@@ -131,16 +131,18 @@ def make_tick_callback(
     env: VecTradingEnv, metrics_writer: MetricsWriter, state: _TickState, log_every_n_ticks: int = 2
 ):
     """
-    Returns a closure matching training/ppo_hybrid.py's collect_rollout()
-    tick_callback signature. Every real env-step still advances state
-    (global_tick, trade tallies) so those numbers are always accurate --
-    only the metrics_writer.log() WRITE is throttled to every
-    log_every_n_ticks-th tick (default 5, see training/config.py's
-    RunConfig.tick_log_every_n_ticks). fsync=False on every write: see
-    MetricsWriter.log's docstring on why paying a disk-sync syscall dozens
-    of times per rollout instead of once is worth avoiding for data this
-    disposable.
+    Returns a closure matching training/ppo_hybrid.py's ``collect_rollout``
+    tick-callback signature.
+
+    Every real environment step advances ``global_tick`` and trade counters.
+    Only the JSONL write is throttled by ``log_every_n_ticks``; the
+    ``record_type="tick"`` field lets ``MetricsWriter`` route the record to
+    its bounded tick log. ``fsync=False`` is intentional because tick
+    telemetry is disposable compared with rollout/checkpoint state.
     """
+
+    if log_every_n_ticks < 0:
+        raise ValueError("log_every_n_ticks must be >= 0")
 
     def tick_callback(
         local_t: int,
@@ -291,6 +293,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         device=str(device),
     )
 
+    # MetricsWriter routes record_type="tick" records to its bounded tick log
+    # automatically; rollout records stay in cfg.run.metrics_path. Keep the
+    # construction here backwards-compatible and let the writer own routing
+    # and rotation policy/defaults.
     metrics_writer = MetricsWriter(cfg.run.metrics_path)
     tick_callback = make_tick_callback(env, metrics_writer, state, log_every_n_ticks=cfg.run.tick_log_every_n_ticks)
 

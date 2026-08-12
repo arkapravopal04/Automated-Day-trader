@@ -25,11 +25,13 @@ single position cap).
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
-from portfolio_state import PortfolioState
+from env.portfolio_state import PortfolioState
+
+Tensor = torch.Tensor
 
 
 @dataclass
@@ -43,12 +45,12 @@ class RiskLimits:
 
 @dataclass
 class RiskAdjustedAction:
-    direction: torch.Tensor     # [n_envs], possibly zeroed where size was clipped to 0
-    size: torch.Tensor          # [n_envs], clipped requested size (never increased)
-    limit_offset: torch.Tensor  # [n_envs], passed through unchanged
-    reduce_only: torch.Tensor   # [n_envs] bool, True where the drawdown halt is active this step
-    breached: torch.Tensor      # [n_envs] bool, True where any hard limit actually clipped this step's order
-    drawdown: torch.Tensor      # [n_envs], current drawdown fraction from peak equity
+    direction: Tensor     # [n_envs], possibly zeroed where size was clipped to 0
+    size: Tensor          # [n_envs], clipped requested size (never increased)
+    limit_offset: Tensor  # [n_envs], passed through unchanged
+    reduce_only: Tensor   # [n_envs] bool, True where the drawdown halt is active this step
+    breached: Tensor      # [n_envs] bool, True where any hard limit actually clipped this step's order
+    drawdown: Tensor      # [n_envs], current drawdown fraction from peak equity
 
 
 class RiskManager:
@@ -59,7 +61,7 @@ class RiskManager:
     that could block you from de-risking would be actively dangerous.
     """
 
-    def __init__(self, limits: RiskLimits, device: Optional[str] = None):
+    def __init__(self, limits: RiskLimits, device: Optional[str] = None) -> None:
         self.limits = limits
         self.device = torch.device(device) if device is not None else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -67,21 +69,30 @@ class RiskManager:
 
     def apply(
         self,
-        direction: torch.Tensor,
-        size: torch.Tensor,
-        limit_offset: torch.Tensor,
-        mid_price: torch.Tensor,                     # [n_envs], this ticker's price
+        direction: Tensor,
+        size: Tensor,
+        limit_offset: Tensor,
+        mid_price: Tensor,                     # [n_envs], this ticker's price
         portfolio: PortfolioState,
         ticker_idx: int = 0,
-        all_prices: Optional[torch.Tensor] = None,    # [n_envs, n_tickers], needed for gross-exposure/concentration when n_tickers > 1
+        all_prices: Optional[Tensor] = None,    # [n_envs, n_tickers], needed for gross-exposure/concentration when n_tickers > 1
     ) -> RiskAdjustedAction:
+        """
+        Runs the fixed cap sequence -- per-order notional, per-ticker
+        position, portfolio gross exposure, per-ticker concentration,
+        drawdown halt -- clipping `size` (never increasing it) and zeroing
+        `direction` wherever the clipped size lands at 0. Every cap only
+        restricts exposure-increasing orders; reducing/closing an existing
+        position always passes through untouched.
+        """
         direction = direction.to(self.device).float()
         size = size.to(self.device).float().clamp(min=0.0)
         limit_offset = limit_offset.to(self.device).float()
         mid_price = mid_price.to(self.device).float()
+        all_prices = all_prices.to(self.device) if all_prices is not None else None
 
         equity = portfolio.equity(
-            all_prices.to(self.device) if all_prices is not None else mid_price.unsqueeze(1)
+            all_prices if all_prices is not None else mid_price.unsqueeze(1)
         ).clamp(min=1e-6)
 
         breached = torch.zeros_like(size, dtype=torch.bool)
@@ -96,51 +107,17 @@ class RiskManager:
         current_notional_ticker = portfolio.positions[:, ticker_idx] * mid_price
         increasing = (torch.sign(direction) == torch.sign(current_notional_ticker)) | (current_notional_ticker == 0)
 
-        # --- per-order notional cap (independent of resulting position)
-        max_order_notional = self.limits.max_order_notional_frac * equity
-        max_order_qty = max_order_notional / mid_price.clamp(min=1e-6)
-        breached = breached | (size > max_order_qty)
-        size = torch.minimum(size, max_order_qty)
+        size, breached = self._cap_order_notional(size, breached, equity, mid_price)
+        size, breached = self._cap_ticker_position(
+            size, breached, increasing, current_notional_ticker, equity, mid_price
+        )
 
-        # --- per-ticker position cap
-        max_position_notional = self.limits.max_position_frac * equity
-        headroom = (max_position_notional - current_notional_ticker.abs()).clamp(min=0.0)
-        max_qty_position_cap = headroom / mid_price.clamp(min=1e-6)
-        would_exceed_position_cap = increasing & (size > max_qty_position_cap)
-        size = torch.where(increasing, torch.minimum(size, max_qty_position_cap), size)
-        breached = breached | would_exceed_position_cap
-
-        # --- portfolio-level gross exposure + per-ticker concentration
-        # (only bites when the portfolio actually spans multiple tickers
-        # sharing one capital pool -- see module docstring)
         if all_prices is not None and portfolio.n_tickers > 1:
-            all_prices = all_prices.to(self.device)
-            gross_exposure = portfolio.gross_exposure(all_prices)
-
-            max_gross = self.limits.max_gross_exposure_frac * equity
-            gross_headroom = (max_gross - gross_exposure).clamp(min=0.0)
-            max_qty_gross_cap = gross_headroom / mid_price.clamp(min=1e-6)
-            would_exceed_gross = increasing & (size > max_qty_gross_cap)
-            size = torch.where(increasing, torch.minimum(size, max_qty_gross_cap), size)
-            breached = breached | would_exceed_gross
-
-            target_ticker_notional = self.limits.max_ticker_concentration_frac * gross_exposure.clamp(min=1e-6)
-            conc_headroom = (target_ticker_notional - current_notional_ticker.abs()).clamp(min=0.0)
-            max_qty_conc_cap = conc_headroom / mid_price.clamp(min=1e-6)
-            projected_ticker_notional = current_notional_ticker.abs() + size * mid_price
-            over_concentrated = increasing & (gross_exposure > 0) & (
-                projected_ticker_notional > target_ticker_notional
+            size, breached = self._cap_gross_exposure_and_concentration(
+                size, breached, increasing, current_notional_ticker, portfolio, all_prices, equity, mid_price
             )
-            size = torch.where(over_concentrated, torch.minimum(size, max_qty_conc_cap), size)
-            breached = breached | over_concentrated
 
-        # --- drawdown halt: block any exposure-increasing order entirely.
-        # Tracked as a breach BEFORE zeroing so callers can distinguish "the
-        # policy asked for something we trimmed" from "the policy asked for
-        # something we trimmed AND we're in a drawdown halt" via reduce_only.
-        would_be_blocked_by_halt = reduce_only & increasing & (size > 0)
-        size = torch.where(reduce_only & increasing, torch.zeros_like(size), size)
-        breached = breached | would_be_blocked_by_halt
+        size, breached = self._apply_drawdown_halt(size, breached, reduce_only, increasing)
 
         direction = torch.where(size == 0, torch.zeros_like(direction), direction)
 
@@ -152,3 +129,84 @@ class RiskManager:
             breached=breached,
             drawdown=drawdown,
         )
+
+    def _cap_order_notional(
+        self, size: Tensor, breached: Tensor, equity: Tensor, mid_price: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        """Per-order notional cap, independent of the resulting position (applies regardless of direction)."""
+        max_order_notional = self.limits.max_order_notional_frac * equity
+        max_order_qty = max_order_notional / mid_price.clamp(min=1e-6)
+        breached = breached | (size > max_order_qty)
+        size = torch.minimum(size, max_order_qty)
+        return size, breached
+
+    def _cap_ticker_position(
+        self,
+        size: Tensor,
+        breached: Tensor,
+        increasing: Tensor,
+        current_notional_ticker: Tensor,
+        equity: Tensor,
+        mid_price: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        """Per-ticker position cap: bounds |position notional| for this ticker, only on exposure-increasing orders."""
+        max_position_notional = self.limits.max_position_frac * equity
+        headroom = (max_position_notional - current_notional_ticker.abs()).clamp(min=0.0)
+        max_qty_position_cap = headroom / mid_price.clamp(min=1e-6)
+        would_exceed = increasing & (size > max_qty_position_cap)
+        size = torch.where(increasing, torch.minimum(size, max_qty_position_cap), size)
+        breached = breached | would_exceed
+        return size, breached
+
+    def _cap_gross_exposure_and_concentration(
+        self,
+        size: Tensor,
+        breached: Tensor,
+        increasing: Tensor,
+        current_notional_ticker: Tensor,
+        portfolio: PortfolioState,
+        all_prices: Tensor,
+        equity: Tensor,
+        mid_price: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Portfolio-level gross exposure cap + per-ticker concentration-of-
+        gross-exposure cap. Only meaningful (and only called) when the
+        portfolio actually spans multiple tickers sharing one capital pool
+        -- see module docstring.
+        """
+        gross_exposure = portfolio.gross_exposure(all_prices)
+
+        max_gross = self.limits.max_gross_exposure_frac * equity
+        gross_headroom = (max_gross - gross_exposure).clamp(min=0.0)
+        max_qty_gross_cap = gross_headroom / mid_price.clamp(min=1e-6)
+        would_exceed_gross = increasing & (size > max_qty_gross_cap)
+        size = torch.where(increasing, torch.minimum(size, max_qty_gross_cap), size)
+        breached = breached | would_exceed_gross
+
+        target_ticker_notional = self.limits.max_ticker_concentration_frac * gross_exposure.clamp(min=1e-6)
+        conc_headroom = (target_ticker_notional - current_notional_ticker.abs()).clamp(min=0.0)
+        max_qty_conc_cap = conc_headroom / mid_price.clamp(min=1e-6)
+        projected_ticker_notional = current_notional_ticker.abs() + size * mid_price
+        over_concentrated = increasing & (gross_exposure > 0) & (
+            projected_ticker_notional > target_ticker_notional
+        )
+        size = torch.where(over_concentrated, torch.minimum(size, max_qty_conc_cap), size)
+        breached = breached | over_concentrated
+
+        return size, breached
+
+    def _apply_drawdown_halt(
+        self, size: Tensor, breached: Tensor, reduce_only: Tensor, increasing: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Blocks any exposure-increasing order entirely while reduce_only is
+        active. Tracked as a breach BEFORE zeroing so callers can
+        distinguish "the policy asked for something we trimmed" from "the
+        policy asked for something we trimmed AND we're in a drawdown halt"
+        via reduce_only.
+        """
+        would_be_blocked = reduce_only & increasing & (size > 0)
+        size = torch.where(reduce_only & increasing, torch.zeros_like(size), size)
+        breached = breached | would_be_blocked
+        return size, breached

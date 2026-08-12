@@ -47,6 +47,7 @@ from eval.metrics import (
 
 @dataclass
 class BacktestOutput:
+    """Outputs captured from one deterministic backtest pass."""
     equity_curve: torch.Tensor      # [T+1, n_envs]
     price_curve: torch.Tensor       # [T+1, n_envs]
     trade_pnls: torch.Tensor        # [T, n_envs], NaN where no trade closed that step
@@ -137,60 +138,65 @@ def run_backtest(
     price_hist = [start_mid_price]
     trade_pnl_hist = []
 
+    was_training = actor_critic.training
     actor_critic.eval()
-    with torch.no_grad():
-        for _ in range(T):
-            mid_price = env._current_prices()  # noqa: SLF001
-            equity_before = env.portfolio.equity(mid_price.unsqueeze(1))
-            current_position_notional = env.portfolio.positions[:, 0] * mid_price
+    try:
+        with torch.no_grad():
+            for _ in range(T):
+                mid_price = env._current_prices()  # noqa: SLF001
+                equity_before = env.portfolio.equity(mid_price.unsqueeze(1))
+                current_position_notional = env.portfolio.positions[:, 0] * mid_price
 
-            trunk, hidden = actor_critic.forward_features(obs, hidden)
-            action_sample = actor_critic.policy_head.act(trunk, deterministic=True)
+                trunk, hidden = actor_critic.forward_features(obs, hidden)
+                action_sample = actor_critic.policy_head.act(trunk, deterministic=True)
 
-            size_shares = HybridPolicyHead.rescale_size(
-                action_sample.size, torch.full_like(action_sample.size, cfg.risk.max_order_shares)
-            )
-            limit_offset_ticks = HybridPolicyHead.rescale_limit_offset(
-                action_sample.limit_offset, cfg.risk.max_limit_offset_ticks
-            )
-
-            if use_risk_pipeline:
-                kelly_result = kelly_sizer.apply(
-                    size=size_shares,
-                    direction=action_sample.direction,
-                    mid_price=mid_price,
-                    equity=equity_before,
-                    current_position_notional=current_position_notional,
+                size_shares = HybridPolicyHead.rescale_size(
+                    action_sample.size, torch.full_like(action_sample.size, cfg.risk.max_order_shares)
                 )
-                risk_result = risk_manager.apply(
-                    direction=action_sample.direction,
-                    size=kelly_result.size,
-                    limit_offset=limit_offset_ticks,
-                    mid_price=mid_price,
-                    portfolio=env.portfolio,
-                    ticker_idx=0,
+                limit_offset_ticks = HybridPolicyHead.rescale_limit_offset(
+                    action_sample.limit_offset, cfg.risk.max_limit_offset_ticks
                 )
-                final_direction, final_size = kill_switch.apply(risk_result.direction, risk_result.size)
-                final_limit_offset = risk_result.limit_offset
-            else:
-                final_direction = action_sample.direction
-                final_size = size_shares
-                final_limit_offset = limit_offset_ticks
 
-            step_result = env.step(direction=final_direction, size=final_size, limit_offset=final_limit_offset)
+                if use_risk_pipeline:
+                    kelly_result = kelly_sizer.apply(
+                        size=size_shares,
+                        direction=action_sample.direction,
+                        mid_price=mid_price,
+                        equity=equity_before,
+                        current_position_notional=current_position_notional,
+                    )
+                    risk_result = risk_manager.apply(
+                        direction=action_sample.direction,
+                        size=kelly_result.size,
+                        limit_offset=limit_offset_ticks,
+                        mid_price=mid_price,
+                        portfolio=env.portfolio,
+                        ticker_idx=0,
+                    )
+                    final_direction, final_size = kill_switch.apply(risk_result.direction, risk_result.size)
+                    final_limit_offset = risk_result.limit_offset
+                else:
+                    final_direction = action_sample.direction
+                    final_size = size_shares
+                    final_limit_offset = limit_offset_ticks
 
-            if use_risk_pipeline:
-                kelly_sizer.record_realized_pnl(step_result.info["realized_delta"])
-                kill_switch.check_daily_loss(step_result.info["equity"])
+                step_result = env.step(direction=final_direction, size=final_size, limit_offset=final_limit_offset)
 
-            equity_hist.append(step_result.info["equity"].clone())
-            price_hist.append(env._current_prices().clone())  # noqa: SLF001 -- mark AFTER this step, for the next bar
-            realized = step_result.info["realized_delta"]
-            trade_pnl_hist.append(torch.where(realized != 0, realized, torch.full_like(realized, float("nan"))))
+                if use_risk_pipeline:
+                    kelly_sizer.record_realized_pnl(step_result.info["realized_delta"])
+                    kill_switch.check_daily_loss(step_result.info["equity"])
 
-            obs = step_result.obs
-            if step_result.done.any():
-                break  # single deterministic pass -- stop rather than auto-reset into a new pass
+                equity_hist.append(step_result.info["equity"].clone())
+                price_hist.append(env._current_prices().clone())  # noqa: SLF001 -- mark AFTER this step, for the next bar
+                realized = step_result.info["realized_delta"]
+                trade_pnl_hist.append(torch.where(realized != 0, realized, torch.full_like(realized, float("nan"))))
+
+                obs = step_result.obs
+                if step_result.done.any():
+                    break  # single deterministic pass -- stop rather than auto-reset into a new pass
+
+    finally:
+        actor_critic.train(was_training)
 
     equity_curve = torch.stack(equity_hist, dim=0)   # [T+1, n_envs]
     price_curve = torch.stack(price_hist, dim=0)     # [T+1, n_envs]
@@ -241,6 +247,7 @@ def run_backtest(
 # --------------------------------------------------------------------------
 
 def plot_equity_vs_bh(output: BacktestOutput, out_path: str) -> None:
+    """Save portfolio strategy equity versus buy-and-hold as a PNG."""
     portfolio_equity = aggregate_equity(output.equity_curve).cpu().numpy()
     # each stream starts at its own initial_cash, which is the same value
     # across streams by construction (vec_trading_env.py's initial_cash arg
@@ -263,6 +270,7 @@ def plot_equity_vs_bh(output: BacktestOutput, out_path: str) -> None:
 
 
 def plot_drawdown(output: BacktestOutput, out_path: str) -> None:
+    """Save the portfolio drawdown series as a PNG."""
     portfolio_equity = aggregate_equity(output.equity_curve)
     dd = drawdown_series(portfolio_equity).cpu().numpy()
 
@@ -278,6 +286,7 @@ def plot_drawdown(output: BacktestOutput, out_path: str) -> None:
 
 
 def plot_per_ticker_attribution(output: BacktestOutput, tickers: List[str], out_path: str) -> None:
+    """Save per-ticker total-return and alpha attribution as a PNG."""
     total_return = output.per_ticker_metrics.total_return.cpu().numpy()
     alpha = output.per_ticker_metrics.alpha_vs_bh.cpu().numpy()
 
@@ -303,6 +312,7 @@ def plot_per_ticker_attribution(output: BacktestOutput, tickers: List[str], out_
 # --------------------------------------------------------------------------
 
 def _fmt_metrics_row(name: str, m: MetricsResult, idx: Optional[int] = None) -> str:
+    """Format one metrics object as a markdown table row."""
     def g(t: torch.Tensor) -> float:
         return float(t[idx].item()) if idx is not None else float(t.item())
 
@@ -365,7 +375,7 @@ def generate_report(output: BacktestOutput, tickers: List[str], out_dir: str) ->
 ![Per-Ticker Attribution](per_ticker_attribution.png)
 """
     report_path = os.path.join(out_dir, "backtest_report.md")
-    with open(report_path, "w") as f:
-        f.write(report)
+    with open(report_path, "w", encoding="utf-8") as report_file:
+        report_file.write(report)
 
     return report_path

@@ -28,9 +28,11 @@ Trip conditions:
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
+
+Tensor = torch.Tensor
 
 
 class HaltReason(Enum):
@@ -43,7 +45,7 @@ class HaltReason(Enum):
 
 @dataclass
 class KillSwitchStatus:
-    halted: torch.Tensor       # [n_envs] bool
+    halted: Tensor             # [n_envs] bool
     reason: List[HaltReason]   # length n_envs -- first reason that tripped each env, kept until reset()
 
 
@@ -55,7 +57,7 @@ class KillSwitch:
         broker_error_streak_limit: int = 3,
         state_mismatch_tolerance: float = 1e-3,
         device: Optional[str] = None,
-    ):
+    ) -> None:
         self.n_envs = n_envs
         self.daily_loss_limit_frac = daily_loss_limit_frac
         self.broker_error_streak_limit = broker_error_streak_limit
@@ -71,31 +73,32 @@ class KillSwitch:
 
     # --- setup / lifecycle ---------------------------------------------
 
-    def start_new_day(self, equity: torch.Tensor, env_mask: Optional[torch.Tensor] = None) -> None:
+    def start_new_day(self, equity: Tensor, env_mask: Optional[Tensor] = None) -> None:
         """Call once at the start of each trading day/session to set the daily-loss reference point."""
         equity = equity.to(self.device)
         if env_mask is None:
             self._day_start_equity = equity.clone()
-        else:
-            env_mask = env_mask.to(self.device)
-            self._day_start_equity[env_mask] = equity[env_mask]
+            return
+        env_mask = env_mask.to(self.device)
+        self._day_start_equity[env_mask] = equity[env_mask]
 
-    def reset(self, env_mask: Optional[torch.Tensor] = None) -> None:
+    def reset(self, env_mask: Optional[Tensor] = None) -> None:
         """Manually clears a halt. Not automatic -- a human/supervisor decides it's safe to resume."""
         if env_mask is None:
             self._halted.zero_()
             self._reason = [HaltReason.NONE] * self.n_envs
             self._broker_error_streak.zero_()
-        else:
-            env_mask = env_mask.to(self.device)
-            for i in torch.nonzero(env_mask, as_tuple=True)[0].tolist():
-                self._reason[i] = HaltReason.NONE
-            self._halted[env_mask] = False
-            self._broker_error_streak[env_mask] = 0
+            return
+
+        env_mask = env_mask.to(self.device)
+        for i in torch.nonzero(env_mask, as_tuple=True)[0].tolist():
+            self._reason[i] = HaltReason.NONE
+        self._halted[env_mask] = False
+        self._broker_error_streak[env_mask] = 0
 
     # --- trip conditions -------------------------------------------------
 
-    def record_broker_error(self, env_mask: torch.Tensor) -> None:
+    def record_broker_error(self, env_mask: Tensor) -> None:
         """Call from live_loop.py whenever a broker/API call fails for the given envs (bool mask)."""
         env_mask = env_mask.to(self.device)
         self._broker_error_streak = torch.where(
@@ -103,18 +106,18 @@ class KillSwitch:
         )
         self._trip(env_mask & (self._broker_error_streak >= self.broker_error_streak_limit), HaltReason.BROKER_ERROR_STREAK)
 
-    def record_broker_success(self, env_mask: torch.Tensor) -> None:
+    def record_broker_success(self, env_mask: Tensor) -> None:
         """Call on a clean broker/API round-trip to reset that env's error streak."""
         env_mask = env_mask.to(self.device)
         self._broker_error_streak = torch.where(env_mask, torch.zeros_like(self._broker_error_streak), self._broker_error_streak)
 
-    def check_daily_loss(self, equity: torch.Tensor) -> None:
+    def check_daily_loss(self, equity: Tensor) -> None:
         """Call once per step (backtest) or once per broker sync (live) with current equity."""
         equity = equity.to(self.device)
         loss_frac = (self._day_start_equity - equity) / self._day_start_equity.clamp(min=1e-6)
         self._trip(loss_frac >= self.daily_loss_limit_frac, HaltReason.DAILY_LOSS_LIMIT)
 
-    def check_state_mismatch(self, internal_positions: torch.Tensor, broker_positions: torch.Tensor) -> None:
+    def check_state_mismatch(self, internal_positions: Tensor, broker_positions: Tensor) -> None:
         """
         Compares the internal ledger (e.g. PortfolioState.positions[:, i] for
         ticker i) against what the broker actually reports. Anything beyond
@@ -126,11 +129,12 @@ class KillSwitch:
         mismatch = (internal_positions - broker_positions).abs() > self.state_mismatch_tolerance
         self._trip(mismatch, HaltReason.STATE_MISMATCH)
 
-    def trip_manual(self, env_mask: torch.Tensor) -> None:
+    def trip_manual(self, env_mask: Tensor) -> None:
         """Explicit operator-initiated halt."""
         self._trip(env_mask.to(self.device), HaltReason.MANUAL)
 
-    def _trip(self, mask: torch.Tensor, reason: HaltReason) -> None:
+    def _trip(self, mask: Tensor, reason: HaltReason) -> None:
+        """Sets halted=True for every env in `mask`, recording `reason` only for envs not already halted."""
         if not mask.any():
             return
         self._halted = self._halted | mask
@@ -140,14 +144,14 @@ class KillSwitch:
 
     # --- polling -----------------------------------------------------------
 
-    def is_halted(self) -> torch.Tensor:
+    def is_halted(self) -> Tensor:
         """[n_envs] bool. Safe to call from anywhere, independent of any step loop."""
         return self._halted.clone()
 
     def status(self) -> KillSwitchStatus:
         return KillSwitchStatus(halted=self._halted.clone(), reason=list(self._reason))
 
-    def apply(self, direction: torch.Tensor, size: torch.Tensor):
+    def apply(self, direction: Tensor, size: Tensor) -> Tuple[Tensor, Tensor]:
         """
         Convenience helper: zero direction/size for any currently-halted env.
         This freezes NEW orders; it does not itself submit a flattening

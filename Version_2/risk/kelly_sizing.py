@@ -26,18 +26,20 @@ not tick-by-tick mark-to-market.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import torch
+
+Tensor = torch.Tensor
 
 
 @dataclass
 class KellySizingResult:
-    size: torch.Tensor            # [n_envs], adjusted (never increased) requested size
-    kelly_fraction: torch.Tensor  # [n_envs], the fractional-Kelly cap actually applied (post-multiplier)
-    win_rate: torch.Tensor        # [n_envs], rolling win rate estimate
-    payoff_ratio: torch.Tensor    # [n_envs], rolling payoff ratio estimate
-    is_warm: torch.Tensor         # [n_envs] bool, whether enough trade history exists to trust the estimate
+    size: Tensor            # [n_envs], adjusted (never increased) requested size
+    kelly_fraction: Tensor  # [n_envs], the fractional-Kelly cap actually applied (post-multiplier)
+    win_rate: Tensor        # [n_envs], rolling win rate estimate
+    payoff_ratio: Tensor    # [n_envs], rolling payoff ratio estimate
+    is_warm: Tensor         # [n_envs] bool, whether enough trade history exists to trust the estimate
 
 
 class KellySizer:
@@ -50,7 +52,7 @@ class KellySizer:
         kelly_cap: float = 1.0,             # never let raw f* exceed this before the multiplier
         default_fraction: float = 0.02,     # conservative fallback while warming up / no history
         device: Optional[str] = None,
-    ):
+    ) -> None:
         self.n_envs = n_envs
         self.lookback_trades = lookback_trades
         self.min_trades_for_estimate = min_trades_for_estimate
@@ -67,22 +69,24 @@ class KellySizer:
         self._pnl_hist = torch.full(
             (self.n_envs, self.lookback_trades), float("nan"), device=self.device
         )
-        self._ptr = [0] * self.n_envs
+        self._ptr: List[int] = [0] * self.n_envs
         self._count = torch.zeros(self.n_envs, dtype=torch.long, device=self.device)
 
-    def reset(self, env_mask: Optional[torch.Tensor] = None) -> None:
+    def reset(self, env_mask: Optional[Tensor] = None) -> None:
+        """Clears trade history for all envs, or only those selected by env_mask."""
         if env_mask is None:
             self._pnl_hist.fill_(float("nan"))
             self._ptr = [0] * self.n_envs
             self._count.zero_()
-        else:
-            idx = torch.nonzero(env_mask.to(self.device), as_tuple=True)[0].tolist()
-            for i in idx:
-                self._pnl_hist[i] = float("nan")
-                self._ptr[i] = 0
-            self._count[env_mask.to(self.device)] = 0
+            return
 
-    def record_realized_pnl(self, realized_delta: torch.Tensor) -> None:
+        env_mask = env_mask.to(self.device)
+        for i in torch.nonzero(env_mask, as_tuple=True)[0].tolist():
+            self._pnl_hist[i] = float("nan")
+            self._ptr[i] = 0
+        self._count[env_mask] = 0
+
+    def record_realized_pnl(self, realized_delta: Tensor) -> None:
         """
         Call once per env-step with PortfolioState.step_apply()'s return
         value. Rows where realized_delta == 0 (nothing closed this step) are
@@ -98,7 +102,13 @@ class KellySizer:
             self._ptr[i] += 1
             self._count[i] = min(self._count[i].item() + 1, self.lookback_trades)
 
-    def _edge_estimate(self):
+    def _edge_estimate(self) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """
+        Computes the rolling win rate, payoff ratio, and clamped raw Kelly
+        fraction f* from the current PnL history buffer, per env.
+
+        Returns (win_rate, payoff_ratio, raw_kelly, is_warm), each [n_envs].
+        """
         valid = ~torch.isnan(self._pnl_hist)                       # [n_envs, lookback]
         n_valid = valid.sum(dim=1).float().clamp(min=1.0)
 
@@ -125,12 +135,20 @@ class KellySizer:
 
     def apply(
         self,
-        size: torch.Tensor,                          # [n_envs], requested shares (unsigned)
-        direction: torch.Tensor,                      # [n_envs]
-        mid_price: torch.Tensor,                      # [n_envs]
-        equity: torch.Tensor,                         # [n_envs]
-        current_position_notional: torch.Tensor,      # [n_envs], signed, this ticker's current notional
+        size: Tensor,                          # [n_envs], requested shares (unsigned)
+        direction: Tensor,                      # [n_envs]
+        mid_price: Tensor,                      # [n_envs]
+        equity: Tensor,                         # [n_envs]
+        current_position_notional: Tensor,      # [n_envs], signed, this ticker's current notional
     ) -> KellySizingResult:
+        """
+        Shrinks (never grows) `size` so that, if the fill goes through in
+        the requested direction, the resulting position notional does not
+        exceed this stream's current fractional-Kelly cap on equity.
+        Reducing/closing trades (opposite sign to the existing position, or
+        opening from flat) pass through unchanged -- the cap only bites when
+        a fill would grow exposure.
+        """
         size = size.to(self.device).float().clamp(min=0.0)
         direction = direction.to(self.device).float()
         mid_price = mid_price.to(self.device).float()
@@ -138,20 +156,16 @@ class KellySizer:
         current_position_notional = current_position_notional.to(self.device).float()
 
         win_rate, payoff_ratio, raw_kelly, is_warm = self._edge_estimate()
+        fractional_kelly = self._fractional_kelly(raw_kelly, is_warm)
 
-        fractional_kelly = torch.where(
-            is_warm,
-            raw_kelly * self.kelly_multiplier,
-            torch.full_like(raw_kelly, self.default_fraction),
+        adjusted_size = self._cap_growing_size(
+            size=size,
+            direction=direction,
+            mid_price=mid_price,
+            equity=equity,
+            current_position_notional=current_position_notional,
+            fractional_kelly=fractional_kelly,
         )
-
-        max_notional = fractional_kelly * equity.clamp(min=1e-6)
-        increasing = (torch.sign(direction) == torch.sign(current_position_notional)) | (current_position_notional == 0)
-
-        headroom = (max_notional - current_position_notional.abs()).clamp(min=0.0)
-        max_qty = headroom / mid_price.clamp(min=1e-6)
-
-        adjusted_size = torch.where(increasing, torch.minimum(size, max_qty), size)
 
         return KellySizingResult(
             size=adjusted_size,
@@ -160,3 +174,35 @@ class KellySizer:
             payoff_ratio=payoff_ratio,
             is_warm=is_warm,
         )
+
+    def _fractional_kelly(self, raw_kelly: Tensor, is_warm: Tensor) -> Tensor:
+        """Applies kelly_multiplier where warm, falls back to default_fraction otherwise."""
+        return torch.where(
+            is_warm,
+            raw_kelly * self.kelly_multiplier,
+            torch.full_like(raw_kelly, self.default_fraction),
+        )
+
+    @staticmethod
+    def _cap_growing_size(
+        size: Tensor,
+        direction: Tensor,
+        mid_price: Tensor,
+        equity: Tensor,
+        current_position_notional: Tensor,
+        fractional_kelly: Tensor,
+    ) -> Tensor:
+        """
+        Caps `size` at whatever headroom remains under fractional_kelly *
+        equity, but only for fills that would INCREASE exposure (same sign
+        as the existing position, or opening from flat). Reducing/closing
+        fills are left untouched, since Kelly sizing governs how big a
+        position gets, not how quickly it can be unwound.
+        """
+        max_notional = fractional_kelly * equity.clamp(min=1e-6)
+        increasing = (torch.sign(direction) == torch.sign(current_position_notional)) | (current_position_notional == 0)
+
+        headroom = (max_notional - current_position_notional.abs()).clamp(min=0.0)
+        max_qty = headroom / mid_price.clamp(min=1e-6)
+
+        return torch.where(increasing, torch.minimum(size, max_qty), size)
