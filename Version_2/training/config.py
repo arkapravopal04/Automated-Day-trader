@@ -61,24 +61,24 @@ DEFAULT_TICKERS: List[str] = [
     # Broad ETFs (10)
     "SPY", "QQQ", "IWM", "DIA", "XLK", "XLF", "XLE", "XLV", "XLY", "XLP",
     # Technology & Software (18)
-    # "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AVGO", "AMD",
-    # "QCOM", "INTC", "MU", "TXN", "ORCL", "CRM", "ADBE", "NOW", "PANW",
-    # # Financials & FinTech (15)
-    # "JPM", "BAC", "GS", "MS", "C", "WFC", "BLK", "SCHW", "V", "MA",
-    # "AXP", "PYPL", "SQ", "COIN", "BRK.B",
-    # # Healthcare & Biotechnology (14)
-    # "JNJ", "PFE", "UNH", "LLY", "ABBV", "MRK", "TMO", "ABT", "DHR",
-    # "BMY", "AMGN", "GILD", "ISRG", "VRTX",
-    # # Consumer Discretionary & Staples (15)
-    # "WMT", "COST", "PG", "KO", "PEP", "NKE", "HD", "MCD", "SBUX",
-    # "TGT", "LOW", "PM", "MO", "CL", "MDLZ",
-    # # Energy & Utilities (10)
-    # "XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "NEE", "DUK",
-    # # Industrials, Aerospace & Defense (12)
-    # "CAT", "GE", "BA", "LMT", "RTX", "HON", "DE", "UNP", "UPS",
-    # "FDX", "MMM", "GD",
-    # # Communications & Entertainment (6)
-    # "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS",
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AVGO", "AMD",
+    "QCOM", "INTC", "MU", "TXN", "ORCL", "CRM", "ADBE", "NOW", "PANW",
+    # Financials & FinTech (15)
+    "JPM", "BAC", "GS", "MS", "C", "WFC", "BLK", "SCHW", "V", "MA",
+    "AXP", "PYPL", "SQ", "COIN", "BRK.B",
+    # Healthcare & Biotechnology (14)
+    "JNJ", "PFE", "UNH", "LLY", "ABBV", "MRK", "TMO", "ABT", "DHR",
+    "BMY", "AMGN", "GILD", "ISRG", "VRTX",
+    # Consumer Discretionary & Staples (15)
+    "WMT", "COST", "PG", "KO", "PEP", "NKE", "HD", "MCD", "SBUX",
+    "TGT", "LOW", "PM", "MO", "CL", "MDLZ",
+    # Energy & Utilities (10)
+    "XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "NEE", "DUK",
+    # Industrials, Aerospace & Defense (12)
+    "CAT", "GE", "BA", "LMT", "RTX", "HON", "DE", "UNP", "UPS",
+    "FDX", "MMM", "GD",
+    # Communications & Entertainment (6)
+    "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS",
 ]
 
 

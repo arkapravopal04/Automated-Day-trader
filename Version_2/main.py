@@ -63,7 +63,7 @@ def cmd_train(args: argparse.Namespace) -> None:
 def cmd_backtest(args: argparse.Namespace) -> None:
     from dataset import MultiTickerRolloutDataset  # noqa: E402 -- see train.py's module docstring assumption note
     from eval.backtest_report import generate_report, run_backtest
-    from vec_trading_env import VecTradingEnv
+    from env.vec_trading_env import VecTradingEnv
 
     cfg = TrainingConfig()
     device = torch.device(cfg.run.device if torch.cuda.is_available() else "cpu")
