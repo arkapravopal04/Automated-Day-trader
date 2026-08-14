@@ -104,9 +104,6 @@ def process_ticker(ticker: str) -> pd.DataFrame:
             "to compute rolling features"
         )
 
-    if (df["close"] <= 0).any():
-        raise ValueError(f"{ticker}: found non-positive close price(s); cannot compute log returns")
-
     if df.columns.duplicated().any():
         dupe_cols = df.columns[df.columns.duplicated()].tolist()
         raise ValueError(f"{ticker}: raw data has duplicate column names {dupe_cols}")
@@ -124,6 +121,32 @@ def process_ticker(ticker: str) -> pd.DataFrame:
         n_dupes = int(df.index.duplicated().sum())
         print(f"  [WARN] {ticker}: dropping {n_dupes} duplicate-timestamp rows")
         df = df[~df.index.duplicated(keep="first")]
+
+    # Drop individual bars with non-positive OHLC values -- these are
+    # zero/garbage-filled placeholder rows (e.g. a no-trade gap the vendor
+    # zero-filled rather than omitted), not real prices. A handful of these
+    # shouldn't sink an entire ticker; only failing to compute log returns
+    # would (a single close<=0 row poisons that row AND, via shift(), the
+    # next H rows too, which is exactly why we drop the row itself here
+    # rather than letting log() emit -inf/NaN and relying on later dropna).
+    bad_price_mask = (df[["open", "high", "low", "close"]] <= 0).any(axis=1)
+    if bad_price_mask.any():
+        n_bad = int(bad_price_mask.sum())
+        bad_frac = n_bad / len(df)
+        print(f"  [WARN] {ticker}: dropping {n_bad} row(s) ({bad_frac:.2%}) with non-positive OHLC")
+        if bad_frac > 0.05:
+            raise ValueError(
+                f"{ticker}: {n_bad}/{len(df)} rows ({bad_frac:.2%}) have non-positive OHLC -- "
+                "this looks like a data quality problem, not occasional bad ticks; refusing to "
+                "silently drop that much data"
+            )
+        df = df[~bad_price_mask]
+
+    if len(df) < MIN_ROWS_REQUIRED:
+        raise ValueError(
+            f"{ticker}: only {len(df)} rows remain after dropping bad-price rows, need at least "
+            f"{MIN_ROWS_REQUIRED} to compute rolling features"
+        )
 
     # 1. Immediate Log Returns (t vs t-1)
     df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
