@@ -6,33 +6,67 @@ volume z-scores, session time embeddings). Critically, it computes normalisation
 statistics (mean/std) strictly on the training dataset to prevent lookahead bias,
 then applies these scaling factors across the entire dataset.
 
-Kaggle cached-input behavior: if a Kaggle input Dataset with a "data/processed"
-folder is attached (see paths.py's module docstring), paths.py bootstraps it
-into PROCESSED_DIR automatically before this script runs. In that case
-generate_features_and_metadata() detects the already-complete cache via
-paths.is_cache_ready() and skips reprocessing entirely -- this is what makes
-attaching that input "just work" instead of silently reprocessing 6 years of
-5-min bars again every session. Set TRADING_FORCE_PREPROCESS=1 to bypass this
-and force a full reprocess regardless of what's already in PROCESSED_DIR.
+This script always reprocesses raw data end-to-end -- it does not trust or
+reuse any pre-existing contents of PROCESSED_DIR (e.g. from an attached
+Kaggle input Dataset). Every run regenerates *_features.parquet and
+metadata.json from RAW_DIR from scratch, so there is no stale-cache class of
+bug to worry about. Writes are atomic (temp file + os.replace) so a crash or
+interrupt mid-run can never leave a half-written or corrupted output file.
 """
 
 import os
 import sys
 import json
+import tempfile
 import numpy as np
 import pandas as pd
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd())
-from paths import RAW_DIR, PROCESSED_DIR, TRAIN_FRAC, is_kaggle, is_cache_ready
+from paths import RAW_DIR, PROCESSED_DIR, TRAIN_FRAC, is_kaggle
 
 # Configuration Parameters
 HORIZONS = [3, 6, 12] # Lag steps representing 15m, 30m, and 1h past returns
 RV_WINDOW = 12 # Realized volatility rolling window (1 hour)
 VOL_WINDOW = 78 # Volume z-score rolling window (1 full trading day)
 
-# Set to force a full reprocess even if PROCESSED_DIR already looks complete
-# (e.g. bootstrapped from a Kaggle input cache dataset -- see paths.py).
-FORCE_PREPROCESS = os.getenv("TRADING_FORCE_PREPROCESS", "0") == "1"
+if len(HORIZONS) != len(set(HORIZONS)):
+    raise ValueError(f"HORIZONS contains duplicate values: {HORIZONS} -- would create duplicate feature columns")
+
+REQUIRED_RAW_COLUMNS = {"open", "high", "low", "close", "volume"}
+# Longest rolling window used anywhere below -- used to sanity-check that a
+# ticker has enough history to produce any non-NaN feature rows.
+MIN_ROWS_REQUIRED = max(VOL_WINDOW, RV_WINDOW, max(HORIZONS)) + 1
+
+
+def _atomic_write_parquet(df: pd.DataFrame, out_path: str) -> None:
+    """Write a parquet file atomically: write to a temp file in the same
+    directory, then os.replace() it into place. Guarantees readers never see
+    a partially-written file, and a crash mid-write leaves only a stray temp
+    file, never a corrupted out_path."""
+    out_dir = os.path.dirname(out_path)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".parquet", dir=out_dir)
+    os.close(fd)
+    try:
+        df.to_parquet(tmp_path, engine="pyarrow")
+        os.replace(tmp_path, out_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
+def _atomic_write_json(obj: dict, out_path: str) -> None:
+    out_dir = os.path.dirname(out_path)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".json", dir=out_dir)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, indent=4)
+        os.replace(tmp_path, out_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
 
 def process_ticker(ticker: str) -> pd.DataFrame:
     """
@@ -43,11 +77,40 @@ def process_ticker(ticker: str) -> pd.DataFrame:
         
     Returns:
         pd.DataFrame: A dataframe containing the engineered features, with NaN values dropped.
+
+    Raises:
+        FileNotFoundError: if the raw parquet file is missing.
+        ValueError: if the raw data is empty, missing required columns,
+            contains non-positive close prices (breaks log returns), or
+            has too few rows to produce any valid feature rows.
     """
     file_path = os.path.join(RAW_DIR, f"{ticker}.parquet")
-    
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Raw data file not found for {ticker}: {file_path}")
+
     print(f"[PREPROCESS] Importing 5-min candles for {ticker} from {file_path}...")
     df = pd.read_parquet(file_path)
+
+    if df.empty:
+        raise ValueError(f"{ticker}: raw parquet file is empty ({file_path})")
+
+    missing_cols = REQUIRED_RAW_COLUMNS - set(df.columns)
+    if missing_cols:
+        raise ValueError(f"{ticker}: raw data missing required columns {sorted(missing_cols)}")
+
+    if len(df) < MIN_ROWS_REQUIRED:
+        raise ValueError(
+            f"{ticker}: only {len(df)} raw rows, need at least {MIN_ROWS_REQUIRED} "
+            "to compute rolling features"
+        )
+
+    if (df["close"] <= 0).any():
+        raise ValueError(f"{ticker}: found non-positive close price(s); cannot compute log returns")
+
+    if df.columns.duplicated().any():
+        dupe_cols = df.columns[df.columns.duplicated()].tolist()
+        raise ValueError(f"{ticker}: raw data has duplicate column names {dupe_cols}")
+
     print(f"Successfully loaded {len(df)} raw 5-min candles for {ticker}.")
 
     # Standardize the datetime index to UTC
@@ -55,7 +118,13 @@ def process_ticker(ticker: str) -> pd.DataFrame:
         df.index = df.index.tz_localize("UTC")
     df = df.sort_index()
 
-    
+    # Drop exact duplicate timestamps (keep first) -- duplicated bars would
+    # silently corrupt the rolling-window calculations below.
+    if df.index.duplicated().any():
+        n_dupes = int(df.index.duplicated().sum())
+        print(f"  [WARN] {ticker}: dropping {n_dupes} duplicate-timestamp rows")
+        df = df[~df.index.duplicated(keep="first")]
+
     # 1. Immediate Log Returns (t vs t-1)
     df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
     
@@ -85,6 +154,19 @@ def process_ticker(ticker: str) -> pd.DataFrame:
     
     # Remove leading rows that contain NaNs due to rolling window calculations
     df.dropna(inplace=True)
+
+    if df.empty:
+        raise ValueError(
+            f"{ticker}: no rows survived feature engineering (all NaN after rolling windows) "
+            "-- raw history is too short or too gappy"
+        )
+
+    # Any remaining non-finite values (e.g. inf from a pathological std==0
+    # edge case) would silently poison training -- fail loudly instead.
+    feature_cols = ['log_ret', 'rv', 'vol_z', 'time_sin', 'time_cos'] + [f'log_ret_{h}' for h in HORIZONS]
+    if not np.isfinite(df[feature_cols].to_numpy()).all():
+        raise ValueError(f"{ticker}: non-finite (inf/NaN) values remain in engineered features")
+
     return df
 
 def generate_features_and_metadata():
@@ -93,24 +175,43 @@ def generate_features_and_metadata():
     constants based strictly on the training set limit, and saves normalized features
     and metadata for the PyTorch DataLoader.
 
-    Skips entirely if PROCESSED_DIR already contains a complete cache (metadata.json
-    plus every *_features.parquet file -- see paths.is_cache_ready()), e.g. bootstrapped
-    from an attached Kaggle input dataset. Set TRADING_FORCE_PREPROCESS=1 to override.
+    Always does a full reprocess from RAW_DIR -- any existing contents of
+    PROCESSED_DIR (including a Kaggle input-dataset bootstrap) are treated as
+    stale and unconditionally overwritten. This removes an entire class of
+    "stale/mismatched cache" bugs (e.g. an attached cache built with different
+    HORIZONS/windows/TRAIN_FRAC silently being reused). Writes are atomic per
+    file, so a failure partway through leaves already-written tickers intact
+    and never leaves a half-written file on disk; metadata.json is written
+    last, only after every ticker succeeds, so its presence is a reliable
+    signal that the whole cache is complete and consistent.
     """
-    if not FORCE_PREPROCESS and is_cache_ready():
-        print(
-            f"[PREPROCESS] PROCESSED_DIR ({PROCESSED_DIR}) already has a complete "
-            "processed cache (metadata.json + feature files) -- skipping preprocessing. "
-            "Set TRADING_FORCE_PREPROCESS=1 to force a rebuild."
-        )
-        return
-
     if not os.path.exists(RAW_DIR):
         raise FileNotFoundError(f"Directory {RAW_DIR} not found. Run fetch_alpaca.py first.")
 
-    tickers = [f[:-len(".parquet")] for f in os.listdir(RAW_DIR) if f.endswith(".parquet")]
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
+
+    raw_files = [f for f in os.listdir(RAW_DIR) if f.endswith(".parquet")]
+    tickers = [f[:-len(".parquet")] for f in raw_files]
+
+    if not tickers:
+        raise FileNotFoundError(f"No .parquet files found in {RAW_DIR}. Run fetch_alpaca.py first.")
+
+    # Guard against two raw files mapping to the same ticker key (e.g. a
+    # case-collision like AAPL.parquet / aapl.parquet on a case-insensitive
+    # filesystem) -- silently processing both would make the second one
+    # overwrite the first's entry in norm_constants/tick_sizes with no
+    # indication anything was lost.
+    if len(tickers) != len(set(tickers)):
+        seen, dupes = set(), set()
+        for t in tickers:
+            (dupes if t in seen else seen).add(t)
+        raise ValueError(
+            f"Duplicate ticker key(s) derived from {RAW_DIR}: {sorted(dupes)} "
+            "-- check for case-collisions or stray duplicate files"
+        )
+
     tickers.sort()
-    
+
     print("=" * 60)
     print(f"STARTING PREPROCESSING FOR {len(tickers)} TICKERS")
     print(f"Environment: {'Kaggle' if is_kaggle() else 'Local'} | Raw: {RAW_DIR} | Processed: {PROCESSED_DIR}")
@@ -122,38 +223,65 @@ def generate_features_and_metadata():
         "norm_constants": {},
         "tick_sizes": {ticker: 0.01 for ticker in tickers} # Assuming $0.01 standard US equity tick size
     }
-    
-    for ticker in tickers:
-        df = process_ticker(ticker)
-        
-        # Determine the training set mask as the first TRAIN_FRAC of this
-        # ticker's history (row-position based, not a fixed calendar date) so
-        # it scales automatically with however much history was fetched, and
-        # stays consistent with the split dataset.py uses at training time.
-        train_cutoff_idx = int(len(df) * TRAIN_FRAC)
-        train_df = df.iloc[:train_cutoff_idx][metadata["features"]]
-        
-        # Compute mean and standard deviation ONLY on training data
-        mean = train_df.mean()
-        std = train_df.std() + 1e-8
-        
-        metadata["norm_constants"][ticker] = {
-            "mean": mean.to_dict(),
-            "std": std.to_dict()
-        }
-        
-        # Normalize the full dataset using the pre-computed training statistics
-        df[metadata["features"]] = (df[metadata["features"]] - mean) / std
-        
-        # Save processed features
-        out_path = os.path.join(PROCESSED_DIR, f"{ticker}_features.parquet")
-        df[metadata["features"]].to_parquet(out_path, engine="pyarrow")
-        print(f"  └─ Feature tensor exported: {df.shape[0]} rows, {df.shape[1]} columns -> {out_path}\n")
 
-    # Persist normalization and metadata for the environment/model layers to use
+    failures = {}
+
+    for ticker in tickers:
+        try:
+            df = process_ticker(ticker)
+
+            # Determine the training set mask as the first TRAIN_FRAC of this
+            # ticker's history (row-position based, not a fixed calendar date) so
+            # it scales automatically with however much history was fetched, and
+            # stays consistent with the split dataset.py uses at training time.
+            train_cutoff_idx = int(len(df) * TRAIN_FRAC)
+            if train_cutoff_idx < 2:
+                raise ValueError(
+                    f"{ticker}: training split only has {train_cutoff_idx} rows "
+                    f"(TRAIN_FRAC={TRAIN_FRAC}, total rows={len(df)}) -- too few to "
+                    "compute stable normalization statistics"
+                )
+            train_df = df.iloc[:train_cutoff_idx][metadata["features"]]
+
+            # Compute mean and standard deviation ONLY on training data
+            mean = train_df.mean()
+            std = train_df.std() + 1e-8
+
+            metadata["norm_constants"][ticker] = {
+                "mean": mean.to_dict(),
+                "std": std.to_dict()
+            }
+
+            # Normalize the full dataset using the pre-computed training statistics
+            df[metadata["features"]] = (df[metadata["features"]] - mean) / std
+
+            if not np.isfinite(df[metadata["features"]].to_numpy()).all():
+                raise ValueError(f"{ticker}: non-finite values after normalization")
+
+            # Save processed features atomically
+            out_path = os.path.join(PROCESSED_DIR, f"{ticker}_features.parquet")
+            _atomic_write_parquet(df[metadata["features"]], out_path)
+            print(f"  └─ Feature tensor exported: {df.shape[0]} rows, {df.shape[1]} columns -> {out_path}\n")
+
+        except Exception as e:
+            failures[ticker] = str(e)
+            print(f"  └─ [FAILED] {ticker}: {e}\n")
+
+    if failures:
+        # Don't write a metadata.json that references tickers whose feature
+        # files don't actually exist -- that would silently corrupt
+        # downstream training with a cache that looks complete but isn't.
+        summary = "\n".join(f"  - {t}: {msg}" for t, msg in failures.items())
+        raise RuntimeError(
+            f"Preprocessing failed for {len(failures)}/{len(tickers)} ticker(s); "
+            f"metadata.json NOT written.\n{summary}"
+        )
+
+    # Persist normalization and metadata for the environment/model layers to use.
+    # Written last and atomically, so its existence + completeness is a
+    # reliable signal that every ticker's feature file is present and valid.
     meta_path = os.path.join(PROCESSED_DIR, "metadata.json")
-    with open(meta_path, "w") as f:
-        json.dump(metadata, f, indent=4)
+    _atomic_write_json(metadata, meta_path)
     print(f"Preprocessing complete. Metadata saved to {meta_path}")
 
 if __name__ == "__main__":
