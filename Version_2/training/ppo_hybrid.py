@@ -70,7 +70,7 @@ from risk.kill_switch import KillSwitch
 from training.reward import DifferentialSharpeReward
 from training.config import TrainingConfig
 
-from vec_trading_env import VecTradingEnv, StepResult
+from env.vec_trading_env import VecTradingEnv, StepResult
 
 Tensor = torch.Tensor
 TickCallback = Callable[[int, "StepResult", Tensor, Tensor, "KillSwitch"], None]

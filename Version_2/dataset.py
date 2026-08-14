@@ -108,7 +108,7 @@ class MultiTickerRolloutDataset(Dataset):
         for ticker in self.tickers:
             path = os.path.join(PROCESSED_DIR, f"{ticker}_features.parquet")
             
-            print(f"📊 [DATASET] Importing preprocessed 5-min candles for {ticker}...")
+            print(f"[DATASET] Importing preprocessed 5-min candles for {ticker}...")
             df = pd.read_parquet(path)
             print(f"  └─ Loaded {len(df)} processed 5-min candles across {len(df.columns)} features.")
             
@@ -116,7 +116,7 @@ class MultiTickerRolloutDataset(Dataset):
             df.columns = pd.MultiIndex.from_product([[ticker], df.columns])
             dfs.append(df)
             
-        print("\n⏳ Aligning timestamps across all 14 tickers (Outer Join)...")
+        print("\nAligning timestamps across all 14 tickers (Outer Join)...")
         master_df = pd.concat(dfs, axis=1)
         
         # Handle misaligned market schedules (e.g. trading halts for a specific asset)
@@ -140,7 +140,7 @@ class MultiTickerRolloutDataset(Dataset):
         Validates the integrity of the final tensor. Ensures no NaNs leaked through, 
         checks for abnormally large chronological gaps, and verifies dimensions.
         """
-        print(f"🔍 Running sanity checks on [{self.split.upper()}] split...")
+        print(f" Running sanity checks on [{self.split.upper()}] split...")
         
         # 1. Verification of missing values
         assert not torch.isnan(self.data_tensor).any(), "Sanity Check Failed: NaNs detected in tensor!"

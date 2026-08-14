@@ -1,0 +1,272 @@
+{
+  "swept_params": [
+    {
+      "dotted_path": "ppo.entropy_coef_discrete",
+      "defined_in": "training/config.py -- PPOConfig.entropy_coef_discrete",
+      "consumed_by": [
+        "training/ppo_hybrid.py -- ppo_update() (entropy_bonus term)"
+      ],
+      "description": "Entropy bonus weight on the discrete direction head (SHORT/FLAT/LONG). Leading suspect for policy collapse to always-FLAT -- see this project's diagnostic history: low values let PPO settle on 'never trade' as a locally safe optimum against real transaction costs.",
+      "values_tried": [
+        0.02,
+        0.05,
+        0.1
+      ]
+    },
+    {
+      "dotted_path": "ppo.entropy_coef_continuous",
+      "defined_in": "training/config.py -- PPOConfig.entropy_coef_continuous",
+      "consumed_by": [
+        "training/ppo_hybrid.py -- ppo_update() (entropy_bonus term)",
+        "model/hybrid_policy.py -- HybridPolicyHead (FLAT-masked, see its docstring point 2)"
+      ],
+      "description": "Entropy bonus weight on the (FLAT-masked) size/limit_offset Beta heads.",
+      "values_tried": [
+        0.01,
+        0.03
+      ]
+    },
+    {
+      "dotted_path": "risk.kelly_multiplier",
+      "defined_in": "training/config.py -- RiskConfig.kelly_multiplier",
+      "consumed_by": [
+        "risk/kelly_sizing.py -- KellySizer.apply()"
+      ],
+      "description": "Fractional-Kelly scaling (0.25 = quarter-Kelly). A rolling losing streak can push the RAW Kelly fraction to exactly 0 (see kelly_sizing.py's _edge_estimate() clamp), silently zeroing every exposure-increasing order regardless of this multiplier -- included here to see whether a larger multiplier changes how often that floor gets hit in practice.",
+      "values_tried": [
+        0.25,
+        0.5
+      ]
+    },
+    {
+      "dotted_path": "ppo.learning_rate",
+      "defined_in": "training/config.py -- PPOConfig.learning_rate",
+      "consumed_by": [
+        "train.py -- torch.optim.Adam(..., lr=cfg.ppo.learning_rate)"
+      ],
+      "description": "Adam learning rate for the whole actor-critic.",
+      "values_tried": [
+        0.0003,
+        0.0001
+      ]
+    }
+  ],
+  "runs": [
+    {
+      "run_id": "000",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.02,
+        "ppo.entropy_coef_continuous": 0.01,
+        "risk.kelly_multiplier": 0.25,
+        "ppo.learning_rate": 0.0003
+      }
+    },
+    {
+      "run_id": "001",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.02,
+        "ppo.entropy_coef_continuous": 0.01,
+        "risk.kelly_multiplier": 0.25,
+        "ppo.learning_rate": 0.0001
+      }
+    },
+    {
+      "run_id": "002",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.02,
+        "ppo.entropy_coef_continuous": 0.01,
+        "risk.kelly_multiplier": 0.5,
+        "ppo.learning_rate": 0.0003
+      }
+    },
+    {
+      "run_id": "003",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.02,
+        "ppo.entropy_coef_continuous": 0.01,
+        "risk.kelly_multiplier": 0.5,
+        "ppo.learning_rate": 0.0001
+      }
+    },
+    {
+      "run_id": "004",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.02,
+        "ppo.entropy_coef_continuous": 0.03,
+        "risk.kelly_multiplier": 0.25,
+        "ppo.learning_rate": 0.0003
+      }
+    },
+    {
+      "run_id": "005",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.02,
+        "ppo.entropy_coef_continuous": 0.03,
+        "risk.kelly_multiplier": 0.25,
+        "ppo.learning_rate": 0.0001
+      }
+    },
+    {
+      "run_id": "006",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.02,
+        "ppo.entropy_coef_continuous": 0.03,
+        "risk.kelly_multiplier": 0.5,
+        "ppo.learning_rate": 0.0003
+      }
+    },
+    {
+      "run_id": "007",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.02,
+        "ppo.entropy_coef_continuous": 0.03,
+        "risk.kelly_multiplier": 0.5,
+        "ppo.learning_rate": 0.0001
+      }
+    },
+    {
+      "run_id": "008",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.05,
+        "ppo.entropy_coef_continuous": 0.01,
+        "risk.kelly_multiplier": 0.25,
+        "ppo.learning_rate": 0.0003
+      }
+    },
+    {
+      "run_id": "009",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.05,
+        "ppo.entropy_coef_continuous": 0.01,
+        "risk.kelly_multiplier": 0.25,
+        "ppo.learning_rate": 0.0001
+      }
+    },
+    {
+      "run_id": "010",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.05,
+        "ppo.entropy_coef_continuous": 0.01,
+        "risk.kelly_multiplier": 0.5,
+        "ppo.learning_rate": 0.0003
+      }
+    },
+    {
+      "run_id": "011",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.05,
+        "ppo.entropy_coef_continuous": 0.01,
+        "risk.kelly_multiplier": 0.5,
+        "ppo.learning_rate": 0.0001
+      }
+    },
+    {
+      "run_id": "012",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.05,
+        "ppo.entropy_coef_continuous": 0.03,
+        "risk.kelly_multiplier": 0.25,
+        "ppo.learning_rate": 0.0003
+      }
+    },
+    {
+      "run_id": "013",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.05,
+        "ppo.entropy_coef_continuous": 0.03,
+        "risk.kelly_multiplier": 0.25,
+        "ppo.learning_rate": 0.0001
+      }
+    },
+    {
+      "run_id": "014",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.05,
+        "ppo.entropy_coef_continuous": 0.03,
+        "risk.kelly_multiplier": 0.5,
+        "ppo.learning_rate": 0.0003
+      }
+    },
+    {
+      "run_id": "015",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.05,
+        "ppo.entropy_coef_continuous": 0.03,
+        "risk.kelly_multiplier": 0.5,
+        "ppo.learning_rate": 0.0001
+      }
+    },
+    {
+      "run_id": "016",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.1,
+        "ppo.entropy_coef_continuous": 0.01,
+        "risk.kelly_multiplier": 0.25,
+        "ppo.learning_rate": 0.0003
+      }
+    },
+    {
+      "run_id": "017",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.1,
+        "ppo.entropy_coef_continuous": 0.01,
+        "risk.kelly_multiplier": 0.25,
+        "ppo.learning_rate": 0.0001
+      }
+    },
+    {
+      "run_id": "018",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.1,
+        "ppo.entropy_coef_continuous": 0.01,
+        "risk.kelly_multiplier": 0.5,
+        "ppo.learning_rate": 0.0003
+      }
+    },
+    {
+      "run_id": "019",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.1,
+        "ppo.entropy_coef_continuous": 0.01,
+        "risk.kelly_multiplier": 0.5,
+        "ppo.learning_rate": 0.0001
+      }
+    },
+    {
+      "run_id": "020",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.1,
+        "ppo.entropy_coef_continuous": 0.03,
+        "risk.kelly_multiplier": 0.25,
+        "ppo.learning_rate": 0.0003
+      }
+    },
+    {
+      "run_id": "021",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.1,
+        "ppo.entropy_coef_continuous": 0.03,
+        "risk.kelly_multiplier": 0.25,
+        "ppo.learning_rate": 0.0001
+      }
+    },
+    {
+      "run_id": "022",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.1,
+        "ppo.entropy_coef_continuous": 0.03,
+        "risk.kelly_multiplier": 0.5,
+        "ppo.learning_rate": 0.0003
+      }
+    },
+    {
+      "run_id": "023",
+      "overrides": {
+        "ppo.entropy_coef_discrete": 0.1,
+        "ppo.entropy_coef_continuous": 0.03,
+        "risk.kelly_multiplier": 0.5,
+        "ppo.learning_rate": 0.0001
+      }
+    }
+  ]
+}
