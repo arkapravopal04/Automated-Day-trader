@@ -10,12 +10,27 @@ or Kaggle Secrets, in that order of preference.
 
 Kaggle cached-input behavior: if a Kaggle input Dataset with a "data/parquet"
 folder is attached (see paths.py's module docstring), paths.py bootstraps it
-into RAW_DIR automatically before this script ever runs. On a Kaggle session
-with no Alpaca credentials configured, this script no longer treats that as
-fatal -- any ticker with existing cached data is left as-is (a warning is
-printed instead of raising), so a cache-only Kaggle run completes instead of
-crashing partway through. Set TRADING_SKIP_FETCH=1 to skip the network step
-entirely and just use whatever is already on disk (bootstrapped or local).
+into RAW_DIR automatically before this script ever runs. Once that cache is
+present, this script defaults to SKIPPING the network fetch step entirely
+for every already-cached ticker (see _default_skip_fetch()) -- otherwise
+every run would still make a slow incremental "any new bars?" API call per
+ticker, and any ticker missing from the cache would silently trigger a full
+multi-year fetch that can hang a session. Tickers with no cache at all are
+still fetched in full by default (see SKIP_MISSING_TICKERS below).
+
+On a Kaggle session with no Alpaca credentials configured, this script also
+no longer treats that as fatal -- any ticker with existing cached data is
+left as-is (a warning is printed instead of raising), so a cache-only
+Kaggle run completes instead of crashing partway through.
+
+Env var overrides:
+    TRADING_SKIP_FETCH=0|1   -> force-disable/force-enable skipping the
+                                 network step entirely, overriding the
+                                 Kaggle-cache-based auto-default below.
+    TRADING_SKIP_MISSING=1   -> when SKIP_FETCH is active, also skip tickers
+                                 that have NO cached data at all (strict
+                                 "use only what's cached" mode) instead of
+                                 fetching them in full.
 """
 
 import os
@@ -71,10 +86,38 @@ TICKERS = [
 HISTORY_YEARS = int(os.getenv("ALPACA_HISTORY_YEARS", "6"))
 DEFAULT_DATA_FEED = "iex"
 
-# Set to skip the network fetch step entirely and just use whatever is
-# already on disk in RAW_DIR (e.g. bootstrapped from a Kaggle input cache
-# dataset -- see paths.py). Useful for a fully offline/cache-only run.
-SKIP_FETCH = os.getenv("TRADING_SKIP_FETCH", "0") == "1"
+
+def _default_skip_fetch() -> bool:
+    """
+    Decides whether to skip the network fetch step entirely for
+    already-cached tickers:
+      - Explicit TRADING_SKIP_FETCH=0/1 always wins if set.
+      - Otherwise, on Kaggle with ANY cached parquet already present in
+        DATA_DIR (typically bootstrapped from an attached input dataset --
+        see paths.py), default to skipping. This is what makes "attach a
+        cached data/ folder" behave like an actual cache instead of
+        triggering a per-ticker incremental API round-trip (slow) and a
+        full multi-year fetch for any ticker not already cached (very
+        slow, can hang a session).
+      - Off Kaggle, or on Kaggle with no cache at all yet, default to
+        fetching as before (this script's original behavior).
+    """
+    explicit = os.getenv("TRADING_SKIP_FETCH")
+    if explicit is not None:
+        return explicit == "1"
+    if not is_kaggle():
+        return False
+    has_any_cache = os.path.isdir(DATA_DIR) and any(f.endswith(".parquet") for f in os.listdir(DATA_DIR))
+    return has_any_cache
+
+
+SKIP_FETCH = _default_skip_fetch()
+
+# When SKIP_FETCH is active: tickers with NO cached parquet at all are still
+# fetched in full by default (a partially-uploaded cache shouldn't silently
+# leave permanent gaps in the ticker universe). Set TRADING_SKIP_MISSING=1
+# for strict "use only what's already cached, fetch nothing" mode.
+SKIP_MISSING_TICKERS = os.getenv("TRADING_SKIP_MISSING", "0") == "1"
 
 API_KEY, SECRET_KEY = None, None
 
@@ -173,7 +216,7 @@ def fetch_incremental_data(ticker: str, end_date: datetime) -> None:
     file_path = os.path.join(DATA_DIR, f"{ticker}.parquet")
 
     if os.path.exists(file_path):
-        print(f"\n📂 Loading cached 5-min candles for {ticker} from local Parquet...")
+        print(f"\nLoading cached 5-min candles for {ticker} from local Parquet...")
         existing_df = pd.read_parquet(file_path)
         latest_timestamp = existing_df.index.max()
         print(
@@ -274,11 +317,23 @@ if __name__ == "__main__":
     print("=" * 60)
 
     if SKIP_FETCH:
+        missing = [t for t in TICKERS if not os.path.exists(os.path.join(DATA_DIR, f"{t}.parquet"))]
         print(
-            "TRADING_SKIP_FETCH=1 -- skipping the network fetch step entirely, "
-            f"using whatever is already present in {DATA_DIR} (e.g. bootstrapped "
-            "from a Kaggle input cache dataset)."
+            f"SKIP_FETCH active (cached data detected in {DATA_DIR}) -- "
+            "no incremental API calls will be made for already-cached tickers."
         )
+        if missing:
+            if SKIP_MISSING_TICKERS:
+                print(
+                    f"  └─ {len(missing)} ticker(s) have no cache and TRADING_SKIP_MISSING=1: "
+                    f"{missing} -- leaving them unfetched."
+                )
+            else:
+                print(f"  └─ {len(missing)} ticker(s) have no cache and will still be fetched in full: {missing}")
+                for ticker in missing:
+                    fetch_incremental_data(ticker, current_time)
+        else:
+            print("  └─ Every configured ticker already has cached data. Nothing to do.")
     else:
         for ticker in TICKERS:
             fetch_incremental_data(ticker, current_time)
