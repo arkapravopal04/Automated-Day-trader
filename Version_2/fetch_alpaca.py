@@ -1,4 +1,3 @@
-
 """
 Incremental Alpaca 5-minute OHLCV data fetcher.
 
@@ -8,6 +7,15 @@ new tickers receive a configurable historical warm-up period.
 
 Credentials are resolved from environment variables, local ``.env`` files,
 or Kaggle Secrets, in that order of preference.
+
+Kaggle cached-input behavior: if a Kaggle input Dataset with a "data/parquet"
+folder is attached (see paths.py's module docstring), paths.py bootstraps it
+into RAW_DIR automatically before this script ever runs. On a Kaggle session
+with no Alpaca credentials configured, this script no longer treats that as
+fatal -- any ticker with existing cached data is left as-is (a warning is
+printed instead of raising), so a cache-only Kaggle run completes instead of
+crashing partway through. Set TRADING_SKIP_FETCH=1 to skip the network step
+entirely and just use whatever is already on disk (bootstrapped or local).
 """
 
 import os
@@ -62,6 +70,11 @@ TICKERS = [
 
 HISTORY_YEARS = int(os.getenv("ALPACA_HISTORY_YEARS", "6"))
 DEFAULT_DATA_FEED = "iex"
+
+# Set to skip the network fetch step entirely and just use whatever is
+# already on disk in RAW_DIR (e.g. bootstrapped from a Kaggle input cache
+# dataset -- see paths.py). Useful for a fully offline/cache-only run.
+SKIP_FETCH = os.getenv("TRADING_SKIP_FETCH", "0") == "1"
 
 API_KEY, SECRET_KEY = None, None
 
@@ -131,7 +144,8 @@ client = _create_client()
 if client is None:
     print(
         "Warning: Alpaca API credentials not found. "
-        "API fetching will fail unless keys are provided."
+        "Any ticker without existing cached data will be skipped; "
+        "cached tickers will be used as-is without incremental updates."
     )
 
 
@@ -147,8 +161,13 @@ def fetch_incremental_data(ticker: str, end_date: datetime) -> None:
         ticker: Stock symbol to fetch.
         end_date: Timezone-aware upper bound for the Alpaca request.
 
-    Raises:
-        ValueError: If Alpaca credentials are unavailable.
+    Note:
+        If Alpaca credentials are unavailable, a ticker with NO existing
+        cache is skipped with a warning (nothing to fall back on). A ticker
+        WITH existing cache (e.g. bootstrapped from a Kaggle input dataset --
+        see paths.py) is also skipped with a warning rather than raising --
+        this lets a credential-less, cache-only Kaggle session complete
+        using stale-but-present data instead of crashing the whole pipeline.
     """
     os.makedirs(DATA_DIR, exist_ok=True)
     file_path = os.path.join(DATA_DIR, f"{ticker}.parquet")
@@ -184,9 +203,14 @@ def fetch_incremental_data(ticker: str, end_date: datetime) -> None:
         return
 
     if client is None:
-        raise ValueError(
-            f"Cannot fetch data for {ticker}. Missing Alpaca API credentials."
-        )
+        if existing_df is not None:
+            print(
+                f"  └─ [{ticker}] No Alpaca credentials -- using existing cached data "
+                f"as-is (last timestamp: {latest_timestamp}, not refreshed)."
+            )
+        else:
+            print(f"  └─ [{ticker}] No Alpaca credentials and no existing cache -- skipping this ticker.")
+        return
 
     feed = os.getenv("ALPACA_DATA_FEED", DEFAULT_DATA_FEED)
     request_params = StockBarsRequest(
@@ -249,5 +273,12 @@ if __name__ == "__main__":
     )
     print("=" * 60)
 
-    for ticker in TICKERS:
-        fetch_incremental_data(ticker, current_time)
+    if SKIP_FETCH:
+        print(
+            "TRADING_SKIP_FETCH=1 -- skipping the network fetch step entirely, "
+            f"using whatever is already present in {DATA_DIR} (e.g. bootstrapped "
+            "from a Kaggle input cache dataset)."
+        )
+    else:
+        for ticker in TICKERS:
+            fetch_incremental_data(ticker, current_time)

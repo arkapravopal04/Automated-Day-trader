@@ -12,6 +12,19 @@ Behavior:
                   it and bootstrap /kaggle/working/data on first run, so you don't
                   re-download 3 years of history every session.
 
+Kaggle input cache layout: attach a Kaggle input Dataset containing a
+top-level (or one-level-nested) folder named "data" with "parquet" and
+"processed" subfolders inside it -- e.g.:
+
+    /kaggle/input/<your-dataset-slug>/data/parquet/AAPL.parquet, ...
+    /kaggle/input/<your-dataset-slug>/data/processed/AAPL_features.parquet, ...
+    /kaggle/input/<your-dataset-slug>/data/processed/metadata.json
+
+find_kaggle_input_dir() below searches both the dataset root AND one level
+of subfolders (so "data/parquet" and "data/processed" are both found), and
+is tolerant of the "paraquet" misspelling in case that's how the folder
+actually got named on upload.
+
 Override anything explicitly with environment variables:
     TRADING_DATA_ROOT   -> overrides the base "data" directory entirely
     TRADING_RAW_DIR      -> overrides just the raw parquet directory
@@ -20,6 +33,22 @@ Override anything explicitly with environment variables:
 
 import os
 import shutil
+from typing import Dict, List, Optional
+
+# Folder-name aliases to search for on Kaggle input datasets, keyed by the
+# canonical name used everywhere else in this module. Add an alias here
+# (rather than renaming your uploaded folder) if your Kaggle dataset uses a
+# different spelling -- e.g. "paraquet" as a typo for "parquet".
+SUBFOLDER_ALIASES: Dict[str, List[str]] = {
+    "parquet": ["parquet", "paraquet"],
+    "processed": ["processed"],
+}
+
+# Extensions bootstrap_dir() will copy from a matched Kaggle input folder.
+# Kept as an allowlist (rather than copying everything) so stray files in
+# the uploaded dataset (.DS_Store, notebook checkpoints, etc.) don't end up
+# cluttering the working cache.
+_CACHE_FILE_EXTENSIONS = (".parquet", ".json")
 
 
 def is_kaggle() -> bool:
@@ -48,37 +77,78 @@ def get_base_dir() -> str:
     return os.path.join(_script_dir(), "data")
 
 
-def find_kaggle_input_dir(target_subfolder: str):
+def _candidate_names(target_subfolder: str) -> List[str]:
+    """Resolves a canonical subfolder name (e.g. 'parquet') to every alias to search for."""
+    return SUBFOLDER_ALIASES.get(target_subfolder, [target_subfolder])
+
+
+def find_kaggle_input_dir(target_subfolder: str) -> Optional[str]:
     """
     Search read-only /kaggle/input/*/ datasets for a folder matching
-    `target_subfolder` (e.g. 'parquet' or 'processed'). Returns the first
-    match, or None. Used to bootstrap a previously-uploaded cache dataset.
+    `target_subfolder` (e.g. 'parquet' or 'processed'), or any of its
+    aliases (see SUBFOLDER_ALIASES). Returns the first match, or None.
+    Used to bootstrap a previously-uploaded cache dataset.
+
+    Checks, per attached input dataset:
+        1. Direct:  /kaggle/input/<dataset>/<alias>
+        2. Nested:  /kaggle/input/<dataset>/<anything>/<alias>
+                    (this is what matches your "data/parquet",
+                    "data/processed" layout -- <anything> == "data")
     """
     input_root = "/kaggle/input"
     if not os.path.isdir(input_root):
         return None
+
+    names = _candidate_names(target_subfolder)
+
     for dataset_name in sorted(os.listdir(input_root)):
         dataset_path = os.path.join(input_root, dataset_name)
         if not os.path.isdir(dataset_path):
             continue
-        # Direct match: /kaggle/input/<dataset>/<target_subfolder>
-        direct = os.path.join(dataset_path, target_subfolder)
-        if os.path.isdir(direct) and os.listdir(direct):
-            return direct
-        # One level deeper: /kaggle/input/<dataset>/<anything>/<target_subfolder>
+
+        for name in names:
+            direct = os.path.join(dataset_path, name)
+            if os.path.isdir(direct) and os.listdir(direct):
+                return direct
+
         for sub in os.listdir(dataset_path):
-            nested = os.path.join(dataset_path, sub, target_subfolder)
-            if os.path.isdir(nested) and os.listdir(nested):
-                return nested
+            sub_path = os.path.join(dataset_path, sub)
+            if not os.path.isdir(sub_path):
+                continue
+            for name in names:
+                nested = os.path.join(sub_path, name)
+                if os.path.isdir(nested) and os.listdir(nested):
+                    return nested
+
     return None
+
+
+def _copy_cache_tree(source: str, target_dir: str) -> int:
+    """
+    Recursively copies every file under `source` matching
+    _CACHE_FILE_EXTENSIONS into `target_dir`, preserving relative
+    subdirectory structure. Returns the number of files copied.
+    """
+    copied = 0
+    for root, _dirs, files in os.walk(source):
+        rel_root = os.path.relpath(root, source)
+        dest_root = target_dir if rel_root == "." else os.path.join(target_dir, rel_root)
+        for fname in files:
+            if not fname.endswith(_CACHE_FILE_EXTENSIONS):
+                continue
+            os.makedirs(dest_root, exist_ok=True)
+            shutil.copy2(os.path.join(root, fname), os.path.join(dest_root, fname))
+            copied += 1
+    return copied
 
 
 def bootstrap_dir(target_dir: str, subfolder_name: str, quiet: bool = False) -> None:
     """
     If `target_dir` doesn't exist yet or is empty, and we're on Kaggle,
     try to seed it by copying from an attached input Dataset with a
-    matching subfolder name (e.g. your uploaded alpaca_cache dataset).
-    No-op locally, and a no-op if target_dir already has files.
+    matching subfolder name (e.g. your uploaded "data/parquet" or
+    "data/processed" folder -- see module docstring). No-op locally, and
+    a no-op if target_dir already has files.
     """
     if os.path.isdir(target_dir) and os.listdir(target_dir):
         return
@@ -87,14 +157,39 @@ def bootstrap_dir(target_dir: str, subfolder_name: str, quiet: bool = False) -> 
     source = find_kaggle_input_dir(subfolder_name)
     if source is None:
         return
+
     os.makedirs(target_dir, exist_ok=True)
-    copied = 0
-    for fname in os.listdir(source):
-        if fname.endswith((".parquet", ".json")):
-            shutil.copy2(os.path.join(source, fname), os.path.join(target_dir, fname))
-            copied += 1
+    copied = _copy_cache_tree(source, target_dir)
     if not quiet:
-        print(f"[paths] Bootstrapped {copied} file(s) into {target_dir} from Kaggle input dataset '{source}'.")
+        print(f"[paths] Bootstrapped {copied} file(s) into {target_dir} from Kaggle input cache '{source}'.")
+
+
+def is_cache_ready(require_metadata: bool = True) -> bool:
+    """
+    Cheap check for "is there already usable data on disk right now" --
+    call this from fetch_alpaca.py / preprocess.py as a guard clause so a
+    Kaggle session with an attached cache dataset skips re-fetching or
+    re-preprocessing entirely instead of just skipping the download step.
+
+    Checks:
+        - RAW_DIR contains at least one .parquet file
+        - PROCESSED_DIR contains metadata.json (if require_metadata) and at
+          least one *_features.parquet file
+
+    This only inspects the CURRENT contents of RAW_DIR/PROCESSED_DIR (i.e.
+    after bootstrap_dir() has already run at import time below) -- it does
+    not itself search /kaggle/input.
+    """
+    raw_ok = os.path.isdir(RAW_DIR) and any(f.endswith(".parquet") for f in os.listdir(RAW_DIR))
+
+    if not os.path.isdir(PROCESSED_DIR):
+        return False
+    processed_files = os.listdir(PROCESSED_DIR)
+    processed_ok = any(f.endswith("_features.parquet") for f in processed_files)
+    if require_metadata:
+        processed_ok = processed_ok and "metadata.json" in processed_files
+
+    return raw_ok and processed_ok
 
 
 BASE_DIR = get_base_dir()
@@ -153,6 +248,9 @@ PLATFORM_FEE_PER_TRADE = float(os.environ.get("TRADING_PLATFORM_FEE_PER_TRADE", 
 if is_kaggle():
     bootstrap_dir(RAW_DIR, "parquet")
     bootstrap_dir(PROCESSED_DIR, "processed")
+    if is_cache_ready():
+        print("[paths] Kaggle input cache detected and bootstrapped -- "
+              "fetch_alpaca.py/preprocess.py can skip regenerating this data.")
 
 
 if __name__ == "__main__":
@@ -160,3 +258,4 @@ if __name__ == "__main__":
     print(f"BASE_DIR    : {BASE_DIR}")
     print(f"RAW_DIR     : {RAW_DIR}")
     print(f"PROCESSED_DIR: {PROCESSED_DIR}")
+    print(f"Cache ready : {is_cache_ready()}")
