@@ -70,8 +70,8 @@ def run_diagnostics():
     print(f"{Colors.BOLD}[1/6] Checking Dependencies & Imports...{Colors.ENDC}")
     try:
         import torch
-        from portfolio_state import PortfolioState, Fill
-        from execution_sim import ExecutionSimulator, SimulatedFill
+        from env.portfolio_state import PortfolioState, Fill
+        from env.execution_sim import ExecutionSimulator, SimulatedFill
         print_status("Core env modules imported", True, f"PyTorch: {torch.__version__}")
     except Exception as e:
         print_status("Core env modules imported", False, str(e))
@@ -220,7 +220,7 @@ def run_diagnostics():
                         f"then re-run this diagnostic for the full integration test.")
         else:
             from dataset import MultiTickerRolloutDataset
-            from vec_trading_env import VecTradingEnv
+            from env.vec_trading_env import VecTradingEnv
 
             ds = MultiTickerRolloutDataset(window_size=20, split='train', device=device)
             env = VecTradingEnv(ds, initial_cash=10_000.0)
