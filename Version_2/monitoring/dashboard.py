@@ -331,28 +331,117 @@ def resolve_display_mode(mode: DisplayMode) -> DisplayMode:
 
 def resolve_mode(cfg_display_mode: str = "auto", argv: Optional[List[str]] = None) -> DisplayMode:
     argv = argv if argv is not None else sys.argv[1:]
+
     if "--kaggle" in argv:
         return DisplayMode.KAGGLE
     if "--local" in argv:
         return DisplayMode.LOCAL
+
     try:
-        cfg_mode = DisplayMode(cfg_display_mode)
+        configured = DisplayMode(cfg_display_mode)
     except ValueError:
-        cfg_mode = DisplayMode.AUTO
-    return resolve_display_mode(cfg_mode)
+        configured = DisplayMode.AUTO
+
+    return resolve_display_mode(configured)
 
 
-_SPINNER_FRAMES = ["\u28f7", "\u28ef", "\u28df", "\u287f", "\u28bf", "\u28fb", "\u28fd", "\u28fe"]  # braille spinner
-_TAPE_MAX_ROWS = 12  # Live Trade Tape -- how many recent real fills to keep on screen
-_GRID_LAYOUT_THRESHOLD = 20  # above this many tickers, switch from a tall list to a scroll-free grid
-_FULL_TABLE_MAX_VISIBLE_ROWS = 30  # portfolio table above the grid: cap simultaneous rows shown w/o paging
+# --------------------------------------------------------------------------
+# Dashboard constants
+# --------------------------------------------------------------------------
 
+_SPINNER_FRAMES = ["⠷", "⠯", "⠟", "⠿", "⡿", "⢿", "⣻", "⣾"]
+_MAX_TRADE_EVENTS = 12
+_MAX_PORTFOLIO_ROWS = 30
+_GRID_THRESHOLD = 20
+
+
+# --------------------------------------------------------------------------
+# Formatting helpers
+# --------------------------------------------------------------------------
 
 def _fmt_uptime(seconds: float) -> str:
     seconds = int(max(0, seconds))
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _as_list(value: Any, n: int) -> List[Any]:
+    if isinstance(value, list) and len(value) == n:
+        return value
+    return [None] * n
+
+
+def _number(value: Any) -> Optional[float]:
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt(value: Any, pct: bool = False) -> str:
+    if value is None:
+        return "—"
+
+    number = _number(value)
+    if number is None:
+        return str(value)
+
+    return f"{number:.2%}" if pct else f"{number:.4f}"
+
+
+def _fmt_int(value: Any) -> str:
+    if value is None:
+        return "—"
+
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _fmt_money(value: Any, signed: bool = False) -> str:
+    number = _number(value)
+    if number is None:
+        return "—"
+
+    if signed:
+        return f"${number:+,.2f}"
+    return f"${number:,.2f}"
+
+
+def _colored_money(
+    value: Any,
+    *,
+    explicit_color: Optional[str] = None,
+    signed: bool = False,
+) -> str:
+    number = _number(value)
+    if number is None:
+        return "—"
+
+    color = explicit_color
+    if color is None:
+        color = "bright_green" if number >= 0 else "bright_red"
+
+    return f"[{color}]{_fmt_money(number, signed=signed)}[/{color}]"
+
+
+def _colored_pct(value: Any, *, lower_is_better: bool = False) -> str:
+    number = _number(value)
+    if number is None:
+        return "—"
+
+    if lower_is_better:
+        color = "bright_green" if number <= 0.10 else "bright_red"
+    else:
+        color = "bright_green" if number >= 0 else "bright_red"
+
+    return f"[{color}]{number:.2%}[/{color}]"
+
+
+def _status_text(status: str, color: str = "grey62") -> Text:
+    return Text(status, style=color)
 
 
 # --------------------------------------------------------------------------
@@ -361,21 +450,17 @@ def _fmt_uptime(seconds: float) -> str:
 
 class TrainingDashboard:
     """
-    Renders structured metrics written by MetricsWriter.
+    Human-readable live view of the training process.
 
-    Rendering path, chosen once at construction:
-        notebook + ipywidgets installed:  a persistent Output widget,
-                                           .clear_output(wait=True) each
-                                           frame -- the robust in-place
-                                           update for a background-thread
-                                           poller (see module docstring).
-        notebook, no ipywidgets:          IPython.display.clear_output +
-                                           display(), same-cell in-place.
-        real terminal (isatty), no notebook: Rich Live(auto_refresh=False).
-        headless, no tty, no notebook:    manual ANSI cursor-up rewrite --
-                                           genuinely redraws in place
-                                           instead of appending a new frame
-                                           to scrollback every call.
+    Design goals:
+      1. Answer "is training alive?" immediately.
+      2. Separate training statistics from portfolio statistics.
+      3. Make risk and failures obvious.
+      4. Keep live market information compact.
+      5. Avoid duplicate or ambiguous labels.
+
+    The training process remains completely decoupled from rendering. The
+    dashboard only reads JSONL files through MetricsReader.
     """
 
     def __init__(
@@ -387,14 +472,19 @@ class TrainingDashboard:
         tick_metrics_path: Optional[str] = None,
         tick_backup_count: int = MetricsWriter._DEFAULT_TICK_BACKUP_COUNT,
     ):
-        resolved_tick_path = tick_metrics_path or MetricsWriter._derive_tick_path(metrics_path)
+        resolved_tick_path = (
+            tick_metrics_path
+            or MetricsWriter._derive_tick_path(metrics_path)
+        )
+
         self.reader = MetricsReader(
             metrics_path,
             tick_path=resolved_tick_path,
             tick_backup_count=tick_backup_count,
         )
+
         self.mode = resolve_display_mode(mode)
-        self.history_window = history_window
+        self.history_window = max(10, int(history_window))
 
         self._notebook_capable = _HAS_IPYTHON and _get_ipython() is not None
         self._widget_capable = self._notebook_capable and _HAS_IPYWIDGETS
@@ -403,49 +493,50 @@ class TrainingDashboard:
         if console is not None:
             self.console = console
         elif self._is_tty:
-            # Real terminal -- let Rich auto-detect actual columns.
             self.console = Console()
         else:
-            # No real terminal to measure (notebook/widget rendering, or a
-            # piped/redirected stdout) -- Rich's own fallback here is a
-            # narrow 80-column default, which starves _build_compact_grid()
-            # down to its 4-column floor regardless of how much actual
-            # horizontal space the notebook output area has. 160 gives the
-            # grid room to actually use multiple columns in the common case
-            # this dashboard runs in (Kaggle/Jupyter, not a real tty).
+            # Notebook/headless output has no reliable terminal width.
             self.console = Console(width=160)
 
         self._live: Optional[Live] = None
         self._output_widget = None
+
         if self._widget_capable:
             self._output_widget = _ipywidgets.Output()
         elif self.mode == DisplayMode.LOCAL and self._is_tty and not self._notebook_capable:
-            self._live = Live(console=self.console, auto_refresh=False, transient=False)
+            self._live = Live(
+                console=self.console,
+                auto_refresh=False,
+                transient=False,
+            )
 
         self._displayed_widget = False
-        self._headless_lines_printed = 0  # for the manual ANSI rewrite path
+        self._headless_lines_printed = 0
 
         self._start_time = time.time()
-        self._last_render_time: Optional[float] = None
         self._last_step: Optional[int] = None
         self._frame_count = 0
 
-        # trend state, all keyed by ticker (or None for the portfolio total)
-        self._prev_net_worth: Optional[float] = None
-        self._prev_net_worth_per_ticker: Dict[str, float] = {}
-        self._prev_price_per_ticker: Dict[str, float] = {}
-        self._prev_trades_per_ticker: Dict[str, int] = {}
+        # Used only to show actual changes between frames.
+        self._previous_prices: Dict[str, float] = {}
+        self._previous_net_worth: Optional[float] = None
+
+    # ------------------------------------------------------------------
+    # Lifecycle / rendering backend
+    # ------------------------------------------------------------------
 
     def start(self) -> None:
         if self._output_widget is not None and not self._displayed_widget:
             _ipy_display(self._output_widget)
             self._displayed_widget = True
+
         if self._live is not None:
             self._live.__enter__()
 
     def stop(self) -> None:
         if self._live is not None:
             self._live.__exit__(None, None, None)
+            self._live = None
 
     def __enter__(self) -> "TrainingDashboard":
         self.start()
@@ -458,98 +549,138 @@ class TrainingDashboard:
         history = self.reader.tail(self.history_window)
         if not history:
             return
-        latest = history[-1]  # newest record of ANY type -- used only for staleness/liveness
 
-        # Tick records now dominate the log (one per env-step vs. one per
-        # 256-step rollout), so "the last line" and "the last rollout
-        # summary" are usually different records. Find each explicitly
-        # rather than assuming history[-1] is a rollout record like the
-        # single-granularity version of this file did. record_type is
-        # absent on any log written before this revision -- treated as
-        # "rollout" for backward compatibility with old metrics files.
-        latest_tick = next((r for r in reversed(history) if r.get("record_type") == "tick"), None)
-        latest_rollout = next((r for r in reversed(history) if r.get("record_type", "rollout") != "tick"), None)
-        if latest_tick is None:
-            latest_tick = latest_rollout
-        if latest_rollout is None:
-            latest_rollout = latest_tick
+        latest_tick = self._latest_record(history, "tick")
+        latest_rollout = self._latest_rollout(history)
+
+        # A rollout-only log is still valid. This keeps the dashboard useful
+        # with older metrics files.
+        latest_tick = latest_tick or latest_rollout
+        latest_rollout = latest_rollout or latest_tick
+
         if latest_tick is None:
             return
 
-        # "is this actually new data" drives the spinner + throughput --
-        # keyed off the tick stream now (global_tick), since that's what
-        # actually updates every single poll once training is tick-logging.
         step = latest_tick.get("step")
-        now = time.time()
         is_new_step = step != self._last_step
+
         if is_new_step:
             self._frame_count += 1
+
         self._last_step = step
-        self._last_render_time = now
 
-        renderable = self._build_renderable(latest_tick, latest_rollout, history, now, is_new_step)
+        renderable = self._build_renderable(
+            tick_record=latest_tick,
+            rollout_record=latest_rollout,
+            history=history,
+            now=time.time(),
+            is_new_step=is_new_step,
+        )
 
+        self._render(renderable)
+
+    @staticmethod
+    def _latest_record(
+        history: List[Dict[str, Any]],
+        record_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        return next(
+            (
+                record
+                for record in reversed(history)
+                if record.get("record_type") == record_type
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _latest_rollout(
+        history: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        return next(
+            (
+                record
+                for record in reversed(history)
+                if record.get("record_type", "rollout") != "tick"
+            ),
+            None,
+        )
+
+    def _render(self, renderable: Any) -> None:
         if self._output_widget is not None:
             self.start()
             with self._output_widget:
                 self._output_widget.clear_output(wait=True)
                 self.console.print(renderable)
-        elif self._live is not None:
+            return
+
+        if self._live is not None:
             self._live.update(renderable)
             self._live.refresh()
-        elif self._notebook_capable:
+            return
+
+        if self._notebook_capable:
             html = self._render_html(renderable)
             _ipy_clear_output(wait=True)
             _ipy_display(_IPyHTML(html))
-        else:
-            self._render_headless_inplace(renderable)
+            return
 
-    def _render_html(self, renderable) -> str:
-        buf = io.StringIO()
-        tmp_console = Console(file=buf, record=True, width=100, force_terminal=False)
-        tmp_console.print(renderable)
-        return tmp_console.export_html(
+        self._render_headless_inplace(renderable)
+
+    def _render_html(self, renderable: Any) -> str:
+        buffer = io.StringIO()
+        temp_console = Console(
+            file=buffer,
+            record=True,
+            width=100,
+            force_terminal=False,
+        )
+        temp_console.print(renderable)
+        return temp_console.export_html(
             inline_styles=True,
             code_format='<pre style="white-space:pre-wrap;font-family:monospace">{code}</pre>',
         )
 
-    def _render_headless_inplace(self, renderable) -> None:
-        """
-        No tty, no notebook -- there's no ANSI Live()-style redraw available
-        without risking the exact race v1 hit, but a PLAIN scrolling print
-        (the old behavior) reads as "frozen, just reprinting itself" even
-        when it's actually updating, because nothing visually distinguishes
-        one frame from the next in a long log. This moves the cursor back
-        up over the previous frame's lines and overwrites them in place --
-        a single-threaded, synchronous ANSI move (cursor-up + clear-line),
-        not Live()'s background-thread redraw, so it doesn't reintroduce the
-        v1 race.
-        """
-        buf = io.StringIO()
-        tmp_console = Console(file=buf, force_terminal=True, width=self.console.width or 100)
-        tmp_console.print(renderable)
-        text = buf.getvalue()
-        n_lines = text.count("\n")
+    def _render_headless_inplace(self, renderable: Any) -> None:
+        buffer = io.StringIO()
+        temp_console = Console(
+            file=buffer,
+            force_terminal=True,
+            width=self.console.width or 100,
+        )
+        temp_console.print(renderable)
 
-        if self._headless_lines_printed > 0:
-            sys.stdout.write(f"\x1b[{self._headless_lines_printed}A")  # cursor up
-            sys.stdout.write("\x1b[J")  # clear from cursor to end of screen
+        text = buffer.getvalue()
+        line_count = text.count("\n")
+
+        if self._headless_lines_printed:
+            sys.stdout.write(f"\x1b[{self._headless_lines_printed}A")
+            sys.stdout.write("\x1b[J")
+
         sys.stdout.write(text)
         sys.stdout.flush()
-        self._headless_lines_printed = n_lines
+        self._headless_lines_printed = line_count
 
-    def run_polling_loop(self, poll_interval_seconds: float = 2.0, max_iterations: Optional[int] = None) -> None:
-        i = 0
+    def run_polling_loop(
+        self,
+        poll_interval_seconds: float = 2.0,
+        max_iterations: Optional[int] = None,
+    ) -> None:
+        iteration = 0
+
         try:
             self.start()
-            while max_iterations is None or i < max_iterations:
+
+            while max_iterations is None or iteration < max_iterations:
                 self.render_once()
-                time.sleep(poll_interval_seconds)
-                i += 1
+                time.sleep(max(0.1, poll_interval_seconds))
+                iteration += 1
         finally:
             self.stop()
 
-    # ----------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Main layout
+    # ------------------------------------------------------------------
 
     def _build_renderable(
         self,
@@ -559,415 +690,640 @@ class TrainingDashboard:
         now: float,
         is_new_step: bool,
     ) -> Group:
-        # PPO training stats (reward, sharpe, policy/value loss) only exist
-        # at rollout granularity -- read those from rollout_record. Live
-        # position/net-worth/drawdown/trades read from tick_record, which
-        # updates every single env-step, not once per 256.
-        reward = rollout_record.get("reward")
-        reward_ema = rollout_record.get("reward_ema")
-        drawdown = tick_record.get("drawdown")
-        net_worth = tick_record.get("net_worth")
-
-        net_worth_color = None
-        if net_worth is not None and self._prev_net_worth is not None:
-            if net_worth > self._prev_net_worth:
-                net_worth_color = "bright_green"
-            elif net_worth < self._prev_net_worth:
-                net_worth_color = "bright_red"
-        if net_worth is not None:
-            self._prev_net_worth = net_worth
-
-        # throughput -- ticks/sec over the visible history window (now that
-        # "step" means real env-ticks, this is real market-bar throughput,
-        # not "rollouts/sec")
-        ticks_per_sec = None
-        tick_history = [r for r in history if r.get("record_type") == "tick"]
-        if len(tick_history) >= 2:
-            span_steps = (tick_history[-1].get("step") or 0) - (tick_history[0].get("step") or 0)
-            span_time = (tick_history[-1].get("wall_time") or now) - (tick_history[0].get("wall_time") or now)
-            if span_time > 0 and span_steps > 0:
-                ticks_per_sec = span_steps / span_time
-
-        spinner = _SPINNER_FRAMES[self._frame_count % len(_SPINNER_FRAMES)] if is_new_step else "\u25cf"
-        spinner_color = "bright_green" if is_new_step else "grey62"  # dim grey, not yellow -- see this file's dark-mode color notes
-        staleness = now - (tick_record.get("wall_time") or now)
-        live_note = "" if staleness < 30 else f"  [red](no new data for {int(staleness)}s -- check the training process)[/red]"
-
-        throughput_text = f"  |  {ticks_per_sec:.1f} ticks/s" if ticks_per_sec is not None else ""
-        halted_list = tick_record.get("halted")
-        n_halted = sum(1 for h in halted_list if h) if isinstance(halted_list, list) else 0
-        halted_note = f"  [bold white on purple4] {n_halted} HALTED [/bold white on purple4] " if n_halted > 0 else ""
-
-        panel_lines = [
-            f"[{spinner_color}]{spinner}[/{spinner_color}] live  |  uptime {_fmt_uptime(now - self._start_time)}{throughput_text}{halted_note}",
-            f"tick (env-steps):  {tick_record.get('step')}{live_note}",
-            f"rollout:           {rollout_record.get('rollout', rollout_record.get('step'))}",
-            f"episode (passes):  {rollout_record.get('episode')}",
-            f"reward:            {_fmt_colored(reward, good_is='positive')}   (as of last rollout)",
-            f"reward (EMA):      {_fmt_colored(reward_ema, good_is='positive')}",
-            f"net worth (total): {_fmt_colored(net_worth, good_is=None, color=net_worth_color, dollar=True, flash=True)}",
-            f"sharpe:            {_fmt(rollout_record.get('sharpe'))}",
-            f"drawdown (avg):    {_fmt_colored(drawdown, good_is='small_pct', pct=True)}",
-            f"trades (rollout):  {_fmt_int(tick_record.get('trades_this_rollout'))}   (live)",
-            f"trades (total):    {_fmt_int(tick_record.get('total_trades'))}",
+        tick_history = [
+            record
+            for record in history
+            if record.get("record_type") == "tick"
         ]
-        header = Panel("\n".join(panel_lines), title="Training Status", expand=False)
 
-        tickers = tick_record.get("tickers")
-        position = tick_record.get("position")
-        per_ticker_rows = self._compute_per_ticker_rows(tick_record, tickers, position)
+        status = self._build_status_panel(
+            tick_record,
+            rollout_record,
+            tick_history,
+            now,
+            is_new_step,
+        )
 
-        tape_panel = Panel(self._build_ticker_tape(tick_record), title="Live Prices", expand=False)
+        performance = self._build_performance_panel(rollout_record)
+        portfolio, rows = self._build_portfolio_panel(tick_record)
 
-        n = len(per_ticker_rows)
-        if n == 0:
-            table = Table(title="Per-Environment State")
-            table.add_column("(no per-ticker breakdown in this record)")
-            table.add_row("")
-            return Group(header, tape_panel, self._build_trade_tape(tick_history), table)
+        market = self._build_market_panel(rows)
+        trades = self._build_trade_tape(tick_history)
+        environment = self._build_environment_view(rows, tick_record)
 
-        if n <= _GRID_LAYOUT_THRESHOLD:
-            # Small ticker counts: the full detailed table, unchanged from
-            # before -- every column, one row per ticker, no scrolling
-            # problem at this size.
-            body = self._build_detail_table(per_ticker_rows, tick_record)
+        return Group(
+            status,
+            performance,
+            portfolio,
+            market,
+            trades,
+            environment,
+        )
+
+    # ------------------------------------------------------------------
+    # Section 1: system/training status
+    # ------------------------------------------------------------------
+
+    def _build_status_panel(
+        self,
+        tick: Dict[str, Any],
+        rollout: Dict[str, Any],
+        tick_history: List[Dict[str, Any]],
+        now: float,
+        is_new_step: bool,
+    ) -> Panel:
+        latest_wall_time = _number(tick.get("wall_time")) or now
+        age = max(0, now - latest_wall_time)
+
+        if age < 10:
+            health = "LIVE"
+            health_style = "bold white on green"
+        elif age < 30:
+            health = "STALE"
+            health_style = "bold black on yellow"
         else:
-            # Large ticker counts (see _GRID_LAYOUT_THRESHOLD): a scroll-free
-            # multi-column board for an at-a-glance overview, PLUS the full
-            # per-ticker detail table for the entire portfolio underneath --
-            # not just the flagged (halted/bankrupt) subset. At 100 tickers
-            # that table alone runs well past typical scrollback comfort, so
-            # it's capped at _FULL_TABLE_MAX_VISIBLE_ROWS and sorted so the
-            # rows most worth looking at (flagged first, then by |unrealized
-            # PnL| descending) surface at the top instead of being cut off
-            # in whatever the API happened to return them in.
-            grid = self._build_compact_grid(per_ticker_rows)
-            full_table = self._build_detail_table(
-                per_ticker_rows,
-                tick_record,
-                title_prefix="Full Portfolio ",
-                max_rows=_FULL_TABLE_MAX_VISIBLE_ROWS,
-                prioritize_flagged=True,
-            )
-            body = Group(grid, full_table)
+            health = "STOPPED?"
+            health_style = "bold white on red"
 
-        return Group(header, tape_panel, self._build_trade_tape(tick_history), body)
+        spinner = (
+            _SPINNER_FRAMES[self._frame_count % len(_SPINNER_FRAMES)]
+            if is_new_step
+            else "●"
+        )
+
+        throughput = self._ticks_per_second(tick_history)
+        throughput_text = f"{throughput:.1f}/s" if throughput is not None else "—"
+
+        tickers = tick.get("tickers")
+        ticker_count = len(tickers) if isinstance(tickers, list) else 0
+
+        halted = tick.get("halted")
+        halted_count = (
+            sum(bool(item) for item in halted)
+            if isinstance(halted, list)
+            else 0
+        )
+
+        lines = [
+            f"[bold]TRAINING DASHBOARD[/bold]   "
+            f"[{health_style}] {health} [/{health_style}]  "
+            f"[cyan]{spinner}[/cyan]  "
+            f"[grey62]updated {age:.0f}s ago[/grey62]",
+            "",
+            f"[bold]Environment step[/bold]   {_fmt_int(tick.get('step'))}",
+            f"[bold]Rollout[/bold]           {_fmt_int(rollout.get('rollout', rollout.get('step')))}",
+            f"[bold]Episode[/bold]           {_fmt_int(rollout.get('episode'))}",
+            f"[bold]Market symbols[/bold]    {ticker_count}",
+            f"[bold]Processing rate[/bold]   {throughput_text} ticks/s",
+            f"[bold]Runtime[/bold]            {_fmt_uptime(now - self._start_time)}",
+        ]
+
+        if halted_count:
+            lines.append(
+                f"[bold]Attention[/bold]          "
+                f"[white on purple4] {halted_count} HALTED [/white on purple4]"
+            )
+        else:
+            lines.append("[bold]Attention[/bold]          none")
+
+        return Panel(
+            "\n".join(lines),
+            title="1. System Status",
+            border_style="cyan",
+            expand=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Section 2: model/training performance
+    # ------------------------------------------------------------------
+
+    def _build_performance_panel(
+        self,
+        rollout: Dict[str, Any],
+    ) -> Panel:
+        reward = rollout.get("reward")
+        reward_ema = rollout.get("reward_ema")
+        sharpe = rollout.get("sharpe")
+
+        lines = [
+            f"[bold]Reward[/bold]            {_colored_money(reward, signed=True)}",
+            f"[bold]Reward EMA[/bold]        {_colored_money(reward_ema, signed=True)}",
+            f"[bold]Sharpe[/bold]            {_fmt(sharpe)}",
+        ]
+
+        # Preserve other common PPO metrics when they exist, without making
+        # the dashboard depend on them.
+        optional_fields = (
+            ("policy_loss", "Policy loss"),
+            ("value_loss", "Value loss"),
+            ("entropy", "Entropy"),
+        )
+
+        for key, label in optional_fields:
+            if key in rollout:
+                lines.append(f"[bold]{label:<20}[/bold] {_fmt(rollout.get(key))}")
+
+        lines.append("")
+        lines.append(
+            "[grey62]Training metrics are taken from the most recent rollout; "
+            "they do not update every environment tick.[/grey62]"
+        )
+
+        return Panel(
+            "\n".join(lines),
+            title="2. Model Performance",
+            border_style="blue",
+            expand=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Section 3: portfolio health
+    # ------------------------------------------------------------------
+
+    def _build_portfolio_panel(
+        self,
+        tick: Dict[str, Any],
+    ) -> Tuple[Panel, List[Dict[str, Any]]]:
+        net_worth = tick.get("net_worth")
+        drawdown = tick.get("drawdown")
+        trades = tick.get("total_trades")
+        rollout_trades = tick.get("trades_this_rollout")
+
+        net_worth_change_style = None
+        current_net_worth = _number(net_worth)
+
+        if current_net_worth is not None and self._previous_net_worth is not None:
+            if current_net_worth > self._previous_net_worth:
+                net_worth_change_style = "bright_green"
+            elif current_net_worth < self._previous_net_worth:
+                net_worth_change_style = "bright_red"
+
+        if current_net_worth is not None:
+            self._previous_net_worth = current_net_worth
+
+        tickers = tick.get("tickers")
+        positions = tick.get("position")
+
+        rows = self._compute_per_ticker_rows(tick, tickers, positions)
+
+        halted = sum(row["is_halted"] for row in rows)
+        bankrupt = sum(row["is_bankrupt"] for row in rows)
+        active_positions = sum(
+            _number(row["position"]) not in (None, 0)
+            for row in rows
+        )
+
+        net_worth_text = _colored_money(
+            net_worth,
+            explicit_color=net_worth_change_style,
+        )
+
+        lines = [
+            f"[bold]Net worth[/bold]          {net_worth_text}",
+            f"[bold]Average drawdown[/bold]   {_colored_pct(drawdown, lower_is_better=True)}",
+            f"[bold]Trades this rollout[/bold] {_fmt_int(rollout_trades)}",
+            f"[bold]Total trades[/bold]       {_fmt_int(trades)}",
+            "",
+            f"[bold]Open positions[/bold]      {active_positions}",
+            f"[bold]Halted symbols[/bold]      {halted}",
+            f"[bold]Bankrupt symbols[/bold]    {bankrupt}",
+        ]
+
+        if bankrupt:
+            lines.append("[bold red]Risk alert: one or more symbols have zero/negative net worth.[/bold red]")
+        elif halted:
+            lines.append("[bold yellow]Operational alert: one or more symbols are halted.[/bold yellow]")
+        else:
+            lines.append("[green]Portfolio health: no halted or bankrupt symbols.[/green]")
+
+        return (
+            Panel(
+                "\n".join(lines),
+                title="3. Portfolio Health",
+                border_style="green",
+                expand=False,
+            ),
+            rows,
+        )
+
+    # ------------------------------------------------------------------
+    # Section 4: market view
+    # ------------------------------------------------------------------
+
+    def _build_market_panel(
+        self,
+        rows: List[Dict[str, Any]],
+    ) -> Panel:
+        if not rows:
+            return Panel(
+                "[grey62]No ticker price data is available in this record.[/grey62]",
+                title="4. Market",
+                border_style="grey42",
+                expand=False,
+            )
+
+        tape = Text()
+
+        for row in rows:
+            ticker = str(row["ticker"])
+            price = row["price"]
+            arrow = row["price_arrow"]
+
+            if price is None:
+                tape.append(f" {ticker} — ", style="grey50")
+                tape.append("|", style="grey35")
+                continue
+
+            price_style = row["price_color"] or "white"
+            arrow_style = row["price_color"] or "grey62"
+
+            tape.append(f" {ticker} ", style="bold white")
+            tape.append(f"{price:,.2f}", style=price_style)
+            tape.append(f" {arrow} ", style=arrow_style)
+            tape.append("|", style="grey35")
+
+        return Panel(
+            tape,
+            title=f"4. Market — {len(rows)} symbols",
+            border_style="magenta",
+            expand=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Section 5: fills/trades
+    # ------------------------------------------------------------------
+
+    def _build_trade_tape(
+        self,
+        tick_history: List[Dict[str, Any]],
+    ) -> Panel:
+        events: List[str] = []
+
+        for record in reversed(tick_history):
+            if len(events) >= _MAX_TRADE_EVENTS:
+                break
+
+            tickers = record.get("tickers")
+            filled = record.get("filled_qty_this_tick")
+            prices = record.get("price_per_ticker")
+
+            if not isinstance(tickers, list) or not isinstance(filled, list):
+                continue
+
+            step = record.get("step")
+
+            for index, quantity in enumerate(filled):
+                if len(events) >= _MAX_TRADE_EVENTS:
+                    break
+
+                quantity_number = _number(quantity)
+                if quantity_number is None or quantity_number == 0:
+                    continue
+
+                ticker = (
+                    tickers[index]
+                    if index < len(tickers)
+                    else "?"
+                )
+
+                price = (
+                    prices[index]
+                    if isinstance(prices, list) and index < len(prices)
+                    else None
+                )
+
+                if quantity_number > 0:
+                    side = "BUY "
+                    color = "bright_green"
+                else:
+                    side = "SELL"
+                    color = "bright_red"
+
+                price_text = (
+                    f" @ ${_number(price):,.2f}"
+                    if _number(price) is not None
+                    else ""
+                )
+
+                events.append(
+                    f"[grey62]t{_fmt_int(step):>7}[/grey62]  "
+                    f"[bold {color}]{side}[/bold {color}]  "
+                    f"[bold]{str(ticker):<8}[/bold]  "
+                    f"{abs(quantity_number):>8.2f} sh"
+                    f"{price_text}"
+                )
+
+        if not events:
+            body = "[grey62]No fills recorded in the visible history.[/grey62]"
+        else:
+            body = "\n".join(events)
+
+        return Panel(
+            body,
+            title="5. Recent Fills",
+            border_style="yellow",
+            expand=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Section 6: per-symbol state
+    # ------------------------------------------------------------------
+
+    def _build_environment_view(
+        self,
+        rows: List[Dict[str, Any]],
+        tick_record: Dict[str, Any],
+    ) -> Any:
+        if not rows:
+            return Panel(
+                "[grey62]No per-symbol state is available in this record.[/grey62]",
+                title="6. Symbol Details",
+                border_style="grey42",
+                expand=False,
+            )
+
+        if len(rows) <= _GRID_THRESHOLD:
+            return self._build_detail_table(rows, tick_record)
+
+        # For large portfolios, show a compact overview first, then the most
+        # important rows. This keeps the dashboard readable without hiding
+        # risk conditions.
+        grid = self._build_compact_grid(rows)
+
+        prioritized = sorted(
+            rows,
+            key=lambda row: (
+                not (row["is_bankrupt"] or row["is_halted"]),
+                -abs(_number(row.get("unrealized_value")) or 0.0),
+            ),
+        )
+
+        return Group(
+            Panel(
+                grid,
+                title=f"6. Symbol Overview — {len(rows)} symbols",
+                border_style="grey50",
+                expand=False,
+            ),
+            self._build_detail_table(
+                prioritized,
+                tick_record,
+                max_rows=_MAX_PORTFOLIO_ROWS,
+                title="Priority Symbol Details",
+            ),
+        )
 
     def _compute_per_ticker_rows(
-        self, tick_record: Dict[str, Any], tickers: Any, position: Any
+        self,
+        tick_record: Dict[str, Any],
+        tickers: Any,
+        position: Any,
     ) -> List[Dict[str, Any]]:
-        """
-        One computation pass, shared by both the detailed table and the
-        compact grid, so trend-flash state (self._prev_price_per_ticker /
-        self._prev_net_worth_per_ticker) only gets updated ONCE per ticker
-        per frame regardless of which layout ends up rendering it -- doing
-        this twice (once per layout) would double-advance the "previous
-        value" trackers and break the flash/arrow logic.
-        """
-        if not (isinstance(tickers, list) and isinstance(position, list)):
+        if not isinstance(tickers, list) or not isinstance(position, list):
             return []
-        n = len(tickers)
-        net_worth_per_ticker = _as_list(tick_record.get("net_worth_per_ticker"), n)
-        price_per_ticker = _as_list(tick_record.get("price_per_ticker"), n)
-        unrealized = _as_list(tick_record.get("unrealized_pnl"), n)
-        drawdown_per_ticker = _as_list(tick_record.get("drawdown_per_ticker"), n)
-        trades_rollout_per_ticker = _as_list(tick_record.get("trades_per_ticker_this_rollout"), n)
-        trades_total_per_ticker = _as_list(tick_record.get("total_trades_per_ticker"), n)
-        filled_this_tick = _as_list(tick_record.get("filled_qty_this_tick"), n)
-        halted_per_ticker = _as_list(tick_record.get("halted"), n)
+
+        count = len(tickers)
+
+        net_worth = _as_list(
+            tick_record.get("net_worth_per_ticker"),
+            count,
+        )
+        prices = _as_list(
+            tick_record.get("price_per_ticker"),
+            count,
+        )
+        unrealized = _as_list(
+            tick_record.get("unrealized_pnl"),
+            count,
+        )
+        drawdown = _as_list(
+            tick_record.get("drawdown_per_ticker"),
+            count,
+        )
+        trades_rollout = _as_list(
+            tick_record.get("trades_per_ticker_this_rollout"),
+            count,
+        )
+        trades_total = _as_list(
+            tick_record.get("total_trades_per_ticker"),
+            count,
+        )
+        filled = _as_list(
+            tick_record.get("filled_qty_this_tick"),
+            count,
+        )
+        halted = _as_list(
+            tick_record.get("halted"),
+            count,
+        )
 
         rows: List[Dict[str, Any]] = []
-        for i, ticker in enumerate(tickers):
-            price = price_per_ticker[i]
-            price_color = None
+
+        for index, ticker in enumerate(tickers):
+            price = _number(prices[index])
+            previous_price = self._previous_prices.get(str(ticker))
+
+            if price is None:
+                price_color = None
+                price_arrow = ""
+            elif previous_price is None:
+                price_color = None
+                price_arrow = "•"
+            elif price > previous_price:
+                price_color = "bright_green"
+                price_arrow = "▲"
+            elif price < previous_price:
+                price_color = "bright_red"
+                price_arrow = "▼"
+            else:
+                price_color = None
+                price_arrow = "•"
+
+            # Store once per frame. This fixes the old double-update problem
+            # where the market tape could lose the direction arrow.
             if price is not None:
-                prev_price = self._prev_price_per_ticker.get(ticker)
-                if prev_price is not None:
-                    if price > prev_price:
-                        price_color = "bright_green"
-                    elif price < prev_price:
-                        price_color = "bright_red"
-                self._prev_price_per_ticker[ticker] = price
-            price_text = _fmt_colored(price, good_is=None, color=price_color, dollar=True, flash=True)
-            price_arrow = "\u25b2" if price_color == "bright_green" else ("\u25bc" if price_color == "bright_red" else "")
+                self._previous_prices[str(ticker)] = price
 
-            nw = net_worth_per_ticker[i]
-            nw_color = None
-            if nw is not None:
-                prev = self._prev_net_worth_per_ticker.get(ticker)
-                if prev is not None:
-                    if nw > prev:
-                        nw_color = "bright_green"
-                    elif nw < prev:
-                        nw_color = "bright_red"
-                self._prev_net_worth_per_ticker[ticker] = nw
-            nw_text = _fmt_colored(nw, good_is=None, color=nw_color, dollar=True, flash=True)
-            if nw_color == "bright_green":
-                nw_text = "\u25b2 " + nw_text
-            elif nw_color == "bright_red":
-                nw_text = "\u25bc " + nw_text
-
-            trades_this = trades_rollout_per_ticker[i]
-            trades_total = trades_total_per_ticker[i]
-            fq = filled_this_tick[i]
-            just_traded = fq is not None and fq != 0
-            trades_this_text = f"[bold cyan]{_fmt_int(trades_this)}[/bold cyan]" if just_traded else _fmt_int(trades_this)
-
-            is_halted = bool(halted_per_ticker[i]) if halted_per_ticker[i] is not None else False
+            nw = _number(net_worth[index])
+            pnl = _number(unrealized[index])
+            is_halted = bool(halted[index]) if halted[index] is not None else False
             is_bankrupt = nw is not None and nw <= 0
+
             if is_bankrupt:
-                status_text = "[bold white on bright_red]BANKRUPT[/bold white on bright_red]"
-                row_style = "on bright_red"
+                status = "[bold white on red] BANKRUPT [/bold white on red]"
+                row_style = "on red"
             elif is_halted:
-                status_text = "[bold white on purple4]HALTED[/bold white on purple4]"
+                status = "[bold white on purple4] HALTED [/bold white on purple4]"
                 row_style = "on purple4"
             else:
-                status_text = ""
+                status = "[green]OK[/green]"
                 row_style = None
 
-            unrealized_value = unrealized[i]
-            rows.append({
-                "ticker": ticker,
-                "price": price, "price_text": price_text, "price_color": price_color, "price_arrow": price_arrow,
-                "position": position[i], "nw_text": nw_text, "nw_color": nw_color,
-                "unrealized_value": unrealized_value,
-                "unrealized_text": _fmt_colored(unrealized_value, good_is="positive"),
-                "drawdown_text": _fmt_colored(drawdown_per_ticker[i], good_is="small_pct", pct=True),
-                "trades_this_text": trades_this_text, "just_traded": just_traded,
-                "trades_total": _fmt_int(trades_total),
-                "status_text": status_text, "row_style": row_style,
-                "is_halted": is_halted, "is_bankrupt": is_bankrupt,
-            })
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "price": price,
+                    "price_color": price_color,
+                    "price_arrow": price_arrow,
+                    "position": position[index],
+                    "net_worth": nw,
+                    "unrealized_value": pnl,
+                    "drawdown": _number(drawdown[index]),
+                    "trades_rollout": trades_rollout[index],
+                    "trades_total": trades_total[index],
+                    "filled": filled[index],
+                    "is_halted": is_halted,
+                    "is_bankrupt": is_bankrupt,
+                    "status_text": status,
+                    "row_style": row_style,
+                }
+            )
+
         return rows
 
     def _build_detail_table(
         self,
         rows: List[Dict[str, Any]],
         tick_record: Dict[str, Any],
-        title_prefix: str = "",
         max_rows: Optional[int] = None,
-        prioritize_flagged: bool = False,
+        title: Optional[str] = None,
     ) -> Table:
-        """Full-column table, one row per ticker.
+        total = len(rows)
+        visible = rows if max_rows is None else rows[:max_rows]
+        hidden = max(0, total - len(visible))
 
-        At small ticker counts (<= _GRID_LAYOUT_THRESHOLD) this is called
-        directly with every row and no cap. At large ticker counts it's
-        called with the FULL portfolio (not a flagged-only subset) plus
-        max_rows, so a 100-ticker portfolio still renders as one bounded
-        table instead of either truncating to a handful of rows or dumping
-        100 rows unsorted into scrollback.
+        table = Table(
+            title=(
+                title
+                or f"Symbol Details — step {_fmt_int(tick_record.get('step'))}"
+            ),
+            expand=False,
+        )
 
-        prioritize_flagged=True sorts flagged (halted/bankrupt) rows first,
-        then remaining rows by |unrealized PnL| descending -- so if
-        max_rows caps the table, what's cut off is whatever is currently
-        least interesting (flat, untouched positions), not an arbitrary
-        prefix of the ticker list.
-        """
-        total_n = len(rows)
-        display_rows = rows
-        if prioritize_flagged:
-            def _sort_key(r: Dict[str, Any]) -> Tuple[int, float]:
-                flagged = r["is_bankrupt"] or r["is_halted"]
-                pnl = r.get("unrealized_value")
-                magnitude = abs(pnl) if isinstance(pnl, (int, float)) else 0.0
-                return (0 if flagged else 1, -magnitude)
-            display_rows = sorted(rows, key=_sort_key)
-
-        truncated = 0
-        if max_rows is not None and len(display_rows) > max_rows:
-            truncated = len(display_rows) - max_rows
-            display_rows = display_rows[:max_rows]
-
-        title = f"{title_prefix}Per-Environment State  (tick #{tick_record.get('step')}, frame #{self._frame_count}, {total_n} tickers)"
-        table = Table(title=title)
-        table.add_column("Ticker")
+        table.add_column("Symbol")
         table.add_column("Price", justify="right")
         table.add_column("Position", justify="right")
         table.add_column("Net Worth", justify="right")
         table.add_column("Unrealized PnL", justify="right")
         table.add_column("Drawdown", justify="right")
-        table.add_column("Trades (rollout)", justify="right")
-        table.add_column("Trades (total)", justify="right")
+        table.add_column("Trades", justify="right")
         table.add_column("Status")
-        for r in display_rows:
-            table.add_row(
-                str(r["ticker"]), r["price_text"], _fmt(r["position"]), r["nw_text"],
-                r["unrealized_text"], r["drawdown_text"], r["trades_this_text"], r["trades_total"],
-                r["status_text"], style=r["row_style"],
+
+        for row in visible:
+            pnl = row["unrealized_value"]
+            pnl_text = _colored_money(pnl, signed=True)
+
+            drawdown = row["drawdown"]
+            drawdown_text = (
+                _colored_pct(drawdown, lower_is_better=True)
+                if drawdown is not None
+                else "—"
             )
-        if truncated > 0:
-            table.caption = f"... {truncated} more ticker(s) not shown (sorted by flagged status, then |unrealized PnL|)"
+
+            table.add_row(
+                str(row["ticker"]),
+                (
+                    f"{row['price']:,.2f} {row['price_arrow']}"
+                    if row["price"] is not None
+                    else "—"
+                ),
+                _fmt(row["position"]),
+                _fmt_money(row["net_worth"]),
+                pnl_text,
+                drawdown_text,
+                _fmt_int(row["trades_total"]),
+                row["status_text"],
+                style=row["row_style"],
+            )
+
+        if hidden:
+            table.caption = (
+                f"{hidden} additional symbols omitted from the detailed view; "
+                "the compact overview above still includes them."
+            )
+
         return table
 
-    def _build_compact_grid(self, rows: List[Dict[str, Any]]) -> Table:
-        """
-        Scroll-free multi-column board for large ticker counts (see
-        _GRID_LAYOUT_THRESHOLD) -- wraps N tickers into as many columns as
-        the console width allows, instead of one N-row list a person has to
-        scroll through. Each tile: ticker, real price with its flash/arrow,
-        position, and a one-character status dot (colored, not just
-        text -- readable at a glance even in a small tile). This is
-        deliberately less detailed per-ticker than the full table -- see
-        _build_renderable(), which now always follows this grid with the
-        full per-ticker table for the whole portfolio.
-        """
-        col_width = 20
-        n_cols = max(4, min(12, (self.console.width or 100) // col_width))
+    def _build_compact_grid(
+        self,
+        rows: List[Dict[str, Any]],
+    ) -> Table:
+        column_width = 22
+        columns = max(
+            4,
+            min(12, (self.console.width or 100) // column_width),
+        )
 
         grid = Table.grid(padding=(0, 1))
-        for _ in range(n_cols):
+
+        for _ in range(columns):
             grid.add_column()
 
-        def tile(r: Dict[str, Any]) -> str:
-            if r["is_bankrupt"]:
-                dot = "[bright_red]\u25cf[/bright_red]"
-            elif r["is_halted"]:
-                dot = "[purple4]\u25cf[/purple4]"
-            else:
-                dot = "[grey42]\u25cf[/grey42]"
-            arrow = r["price_arrow"]
-            arrow_markup = (
-                f"[bright_green]{arrow}[/bright_green]" if r["price_color"] == "bright_green"
-                else f"[bright_red]{arrow}[/bright_red]" if r["price_color"] == "bright_red"
-                else " "
-            )
-            price_str = f"{r['price']:,.2f}" if r["price"] is not None else "-"
-            return f"{dot} [bold]{r['ticker']:<6}[/bold]\n  {price_str}{arrow_markup}  pos {_fmt(r['position'])}"
+        cells: List[str] = []
 
-        row_cells: List[str] = []
-        for r in rows:
-            row_cells.append(tile(r))
-            if len(row_cells) == n_cols:
-                grid.add_row(*row_cells)
-                row_cells = []
-        if row_cells:
-            row_cells += [""] * (n_cols - len(row_cells))
-            grid.add_row(*row_cells)
+        for row in rows:
+            if row["is_bankrupt"]:
+                marker = "[red]●[/red]"
+            elif row["is_halted"]:
+                marker = "[purple4]●[/purple4]"
+            else:
+                marker = "[grey42]●[/grey42]"
+
+            price = (
+                f"{row['price']:,.2f}"
+                if row["price"] is not None
+                else "—"
+            )
+
+            arrow = row["price_arrow"]
+            arrow_style = row["price_color"] or "grey62"
+
+            cells.append(
+                f"{marker} [bold]{str(row['ticker']):<7}[/bold]\n"
+                f"  {price} [{arrow_style}]{arrow}[/{arrow_style}]"
+                f"  pos {_fmt(row['position'])}"
+            )
+
+            if len(cells) == columns:
+                grid.add_row(*cells)
+                cells = []
+
+        if cells:
+            cells.extend([""] * (columns - len(cells)))
+            grid.add_row(*cells)
 
         return grid
 
-    def _build_ticker_tape(self, tick_record: Dict[str, Any]) -> Text:
-        """
-        A single-line, continuously-updating readout of REAL per-tick
-        prices for EVERY ticker, every frame -- tick_record["price_per_ticker"],
-        the exact mid price env.step() traded against on this tick (see
-        train.py's tick_callback). Unlike _build_trade_tape() below (which
-        only shows a row when a fill actually happened), this updates on
-        literally every render_once() call regardless of whether anything
-        traded -- a real market ticker moves even when you personally
-        aren't trading it, and that continuous real movement (not fake
-        flicker) is what gives the "watching a live market" feel.
+    @staticmethod
+    def _ticks_per_second(
+        tick_history: List[Dict[str, Any]],
+    ) -> Optional[float]:
+        if len(tick_history) < 2:
+            return None
 
-        If this tick_record predates the price_per_ticker field (an old
-        metrics.jsonl from before that field existed), this prints an
-        explicit fallback line rather than drawing a tape with fabricated
-        numbers -- same convention used everywhere else in this file.
-        """
-        tickers = tick_record.get("tickers")
-        prices = tick_record.get("price_per_ticker")
+        first = tick_history[0]
+        last = tick_history[-1]
 
-        if not isinstance(tickers, list) or not isinstance(prices, list) or len(tickers) != len(prices):
-            return Text("(no price feed in this record -- resume with the updated train.py to populate it)",
-                        style="grey50")
+        first_step = _number(first.get("step"))
+        last_step = _number(last.get("step"))
+        first_time = _number(first.get("wall_time"))
+        last_time = _number(last.get("wall_time"))
 
-        tape = Text()
-        for i, ticker in enumerate(tickers):
-            price = prices[i]
-            if price is None:
-                tape.append(f" {ticker} -- ", style="grey50")
-                continue
+        if None in (first_step, last_step, first_time, last_time):
+            return None
 
-            prev = self._prev_price_per_ticker.get(ticker)
-            if prev is None:
-                arrow, color = "\u2022", "grey62"
-            elif price > prev:
-                arrow, color = "\u25b2", "bright_green"
-            elif price < prev:
-                arrow, color = "\u25bc", "bright_red"
-            else:
-                arrow, color = "\u2022", "grey62"
-            self._prev_price_per_ticker[ticker] = price
+        step_span = last_step - first_step
+        time_span = last_time - first_time
 
-            tape.append(f" {ticker} ", style="bold white")
-            tape.append(f"{price:,.2f} ", style=color)
-            tape.append(f"{arrow} ", style=color)
-            tape.append("|", style="grey35")
+        if step_span <= 0 or time_span <= 0:
+            return None
 
-        return tape
-
-    def _build_trade_tape(self, tick_history: List[Dict[str, Any]]) -> Panel:
-        """
-        A scrolling blotter of REAL individual fills, newest first -- every
-        entry here is read directly off a real tick record's
-        filled_qty_this_tick / price_per_ticker (see train.py's
-        tick_callback: price_per_ticker is the actual mid price env.step()
-        marked that fill against, not a display-only estimate). Nothing in
-        this panel is synthesized, randomized, or interpolated -- the
-        "flicker" comes entirely from genuinely new fills appearing as
-        training actually produces them, at whatever rate that really
-        happens, not from an animation faking activity that isn't there.
-
-        Scans tick_history (already fetched for this frame, no extra I/O)
-        for any record with a nonzero fill, most recent last-in-history
-        first. Capped at the last _TAPE_MAX_ROWS fills found, so this stays
-        cheap even with a large history_window.
-        """
-        events: List[str] = []
-        for record in reversed(tick_history):
-            if len(events) >= _TAPE_MAX_ROWS:
-                break
-            tickers = record.get("tickers")
-            filled = record.get("filled_qty_this_tick")
-            prices = record.get("price_per_ticker")
-            if not (isinstance(tickers, list) and isinstance(filled, list)):
-                continue
-            step = record.get("step")
-            for i, qty in enumerate(filled):
-                if len(events) >= _TAPE_MAX_ROWS:
-                    break
-                if not qty:
-                    continue
-                ticker = tickers[i] if i < len(tickers) else "?"
-                price = prices[i] if isinstance(prices, list) and i < len(prices) else None
-                side = "BUY " if qty > 0 else "SELL"
-                color = "bright_green" if qty > 0 else "bright_red"
-                price_text = f"@ ${price:,.2f}" if price is not None else ""
-                events.append(
-                    f"[grey62]t{step:>7}[/grey62]  [bold {color}]{side}[/bold {color}]  "
-                    f"[bold]{ticker:<6}[/bold]  {abs(qty):>8.2f} sh  {price_text}"
-                )
-
-        if not events:
-            body = "[grey62](no fills yet)[/grey62]"
-        else:
-            body = "\n".join(events)
-
-        return Panel(body, title="Live Trade Tape", expand=False, border_style="grey42")
+        return step_span / time_span
 
 
-
-def _as_list(value: Any, n: int) -> List[Any]:
-    return value if isinstance(value, list) and len(value) == n else [None] * n
-
-
-def _fmt(value: Any, pct: bool = False) -> str:
-    if value is None:
-        return "-"
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return str(value)
-    return f"{v:.2%}" if pct else f"{v:.4f}"
-
-
-def _fmt_int(value: Any) -> str:
-    if value is None:
-        return "-"
-    try:
-        return str(int(value))
-    except (TypeError, ValueError):
-        return str(value)
-
+# --------------------------------------------------------------------------
+# Backwards-compatible formatting helper
+# --------------------------------------------------------------------------
 
 def _fmt_colored(
     value: Any,
@@ -978,40 +1334,35 @@ def _fmt_colored(
     flash: bool = False,
 ) -> str:
     """
-    good_is="positive"  -> green if value >= 0, red if value < 0
-    good_is="small_pct" -> green if value <= 0.10 (10%), red otherwise
-    good_is=None         -> no automatic rule; only an explicit `color` applies
-    `color`, when given, always wins over the good_is rule.
+    Compatibility helper retained for callers that imported it.
 
-    flash=True adds a reverse-video (inverted fg/bg) style on top of the
-    resolved color -- meant ONLY for values whose color already means "this
-    changed since last frame" (price, net worth -- see their call sites,
-    where color is None unless an actual tick-to-tick delta was detected).
-    Since redraws happen every poll, a value that changed gets exactly one
-    inverted frame before reverting to plain colored text on the next
-    render -- a real flash, not a persistent highlight, and only ever on
-    values that are genuinely moving. Do NOT set flash=True for
-    magnitude/sign-based coloring (e.g. unrealized PnL's good_is="positive")
-    -- that color reflects current sign, not "just changed," and would
-    flash every single frame regardless of whether anything moved.
+    The dashboard itself now uses the clearer formatting helpers above.
     """
     if value is None:
-        return "-"
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
+        return "—"
+
+    number = _number(value)
+    if number is None:
         return str(value)
 
-    text = f"${v:,.2f}" if dollar else (f"{v:.2%}" if pct else f"{v:.4f}")
+    text = (
+        f"${number:,.2f}"
+        if dollar
+        else f"{number:.2%}"
+        if pct
+        else f"{number:.4f}"
+    )
 
     resolved_color = color
+
     if resolved_color is None:
         if good_is == "positive":
-            resolved_color = "bright_green" if v >= 0 else "bright_red"
+            resolved_color = "bright_green" if number >= 0 else "bright_red"
         elif good_is == "small_pct":
-            resolved_color = "bright_green" if v <= 0.10 else "bright_red"
+            resolved_color = "bright_green" if number <= 0.10 else "bright_red"
 
     if resolved_color is None:
         return text
+
     style = f"bold reverse {resolved_color}" if flash else resolved_color
     return f"[{style}]{text}[/{style}]"
