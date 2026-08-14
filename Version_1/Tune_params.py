@@ -31,9 +31,11 @@ VAL_EPISODES   = 3       # Validation episodes per candidate
 EPISODE_STEPS  = 600     # Shortened step count for faster tuning cycles
 INITIAL_BALANCE = 10_000
 
-BASE_PATH      = '.'
-os.makedirs(f"{BASE_PATH}/tuning", exist_ok=True)
-TUNING_LOG_PATH = f"{BASE_PATH}/tuning/hyperparam_sweep.csv"
+# Resolve paths relative to this script so the tuning output follows
+# Tune_params.py even when the script is launched from another working directory.
+BASE_PATH      = os.path.dirname(os.path.abspath(__file__))
+os.makedirs(os.path.join(BASE_PATH, "tuning"), exist_ok=True)
+TUNING_LOG_PATH = os.path.join(BASE_PATH, "tuning", "hyperparam_sweep.csv")
 
 # ── Search space ───────────────────────────────────────────────────────────────
 PARAM_SPACE = {

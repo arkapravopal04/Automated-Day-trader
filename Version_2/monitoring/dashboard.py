@@ -345,6 +345,7 @@ def resolve_mode(cfg_display_mode: str = "auto", argv: Optional[List[str]] = Non
 _SPINNER_FRAMES = ["\u28f7", "\u28ef", "\u28df", "\u287f", "\u28bf", "\u28fb", "\u28fd", "\u28fe"]  # braille spinner
 _TAPE_MAX_ROWS = 12  # Live Trade Tape -- how many recent real fills to keep on screen
 _GRID_LAYOUT_THRESHOLD = 20  # above this many tickers, switch from a tall list to a scroll-free grid
+_FULL_TABLE_MAX_VISIBLE_ROWS = 30  # portfolio table above the grid: cap simultaneous rows shown w/o paging
 
 
 def _fmt_uptime(seconds: float) -> str:
@@ -632,20 +633,23 @@ class TrainingDashboard:
             body = self._build_detail_table(per_ticker_rows, tick_record)
         else:
             # Large ticker counts (see _GRID_LAYOUT_THRESHOLD): a scroll-free
-            # multi-column board instead of one tall list -- fits on screen
-            # regardless of n by wrapping into as many rows as needed, at a
-            # fixed column count sized to the console width. Full per-column
-            # detail (unrealized PnL, drawdown, trade counts) isn't shown
-            # per-tile at this density; a compact tile has ticker/price/
-            # position/status only. Anything flagged (halted/bankrupt) ALSO
-            # gets a full-detail row in the separate table below it, so
-            # nothing critical is lost to the compact view.
+            # multi-column board for an at-a-glance overview, PLUS the full
+            # per-ticker detail table for the entire portfolio underneath --
+            # not just the flagged (halted/bankrupt) subset. At 100 tickers
+            # that table alone runs well past typical scrollback comfort, so
+            # it's capped at _FULL_TABLE_MAX_VISIBLE_ROWS and sorted so the
+            # rows most worth looking at (flagged first, then by |unrealized
+            # PnL| descending) surface at the top instead of being cut off
+            # in whatever the API happened to return them in.
             grid = self._build_compact_grid(per_ticker_rows)
-            flagged = [r for r in per_ticker_rows if r["is_halted"] or r["is_bankrupt"]]
-            pieces = [grid]
-            if flagged:
-                pieces.append(self._build_detail_table(flagged, tick_record, title_prefix="Flagged "))
-            body = Group(*pieces)
+            full_table = self._build_detail_table(
+                per_ticker_rows,
+                tick_record,
+                title_prefix="Full Portfolio ",
+                max_rows=_FULL_TABLE_MAX_VISIBLE_ROWS,
+                prioritize_flagged=True,
+            )
+            body = Group(grid, full_table)
 
         return Group(header, tape_panel, self._build_trade_tape(tick_history), body)
 
@@ -721,11 +725,13 @@ class TrainingDashboard:
                 status_text = ""
                 row_style = None
 
+            unrealized_value = unrealized[i]
             rows.append({
                 "ticker": ticker,
                 "price": price, "price_text": price_text, "price_color": price_color, "price_arrow": price_arrow,
                 "position": position[i], "nw_text": nw_text, "nw_color": nw_color,
-                "unrealized_text": _fmt_colored(unrealized[i], good_is="positive"),
+                "unrealized_value": unrealized_value,
+                "unrealized_text": _fmt_colored(unrealized_value, good_is="positive"),
                 "drawdown_text": _fmt_colored(drawdown_per_ticker[i], good_is="small_pct", pct=True),
                 "trades_this_text": trades_this_text, "just_traded": just_traded,
                 "trades_total": _fmt_int(trades_total),
@@ -735,11 +741,44 @@ class TrainingDashboard:
         return rows
 
     def _build_detail_table(
-        self, rows: List[Dict[str, Any]], tick_record: Dict[str, Any], title_prefix: str = ""
+        self,
+        rows: List[Dict[str, Any]],
+        tick_record: Dict[str, Any],
+        title_prefix: str = "",
+        max_rows: Optional[int] = None,
+        prioritize_flagged: bool = False,
     ) -> Table:
-        """Full-column table, one row per ticker -- used directly for small ticker counts, and for the
-        flagged-only subset shown alongside the compact grid at large ticker counts."""
-        title = f"{title_prefix}Per-Environment State  (tick #{tick_record.get('step')}, frame #{self._frame_count})"
+        """Full-column table, one row per ticker.
+
+        At small ticker counts (<= _GRID_LAYOUT_THRESHOLD) this is called
+        directly with every row and no cap. At large ticker counts it's
+        called with the FULL portfolio (not a flagged-only subset) plus
+        max_rows, so a 100-ticker portfolio still renders as one bounded
+        table instead of either truncating to a handful of rows or dumping
+        100 rows unsorted into scrollback.
+
+        prioritize_flagged=True sorts flagged (halted/bankrupt) rows first,
+        then remaining rows by |unrealized PnL| descending -- so if
+        max_rows caps the table, what's cut off is whatever is currently
+        least interesting (flat, untouched positions), not an arbitrary
+        prefix of the ticker list.
+        """
+        total_n = len(rows)
+        display_rows = rows
+        if prioritize_flagged:
+            def _sort_key(r: Dict[str, Any]) -> Tuple[int, float]:
+                flagged = r["is_bankrupt"] or r["is_halted"]
+                pnl = r.get("unrealized_value")
+                magnitude = abs(pnl) if isinstance(pnl, (int, float)) else 0.0
+                return (0 if flagged else 1, -magnitude)
+            display_rows = sorted(rows, key=_sort_key)
+
+        truncated = 0
+        if max_rows is not None and len(display_rows) > max_rows:
+            truncated = len(display_rows) - max_rows
+            display_rows = display_rows[:max_rows]
+
+        title = f"{title_prefix}Per-Environment State  (tick #{tick_record.get('step')}, frame #{self._frame_count}, {total_n} tickers)"
         table = Table(title=title)
         table.add_column("Ticker")
         table.add_column("Price", justify="right")
@@ -750,12 +789,14 @@ class TrainingDashboard:
         table.add_column("Trades (rollout)", justify="right")
         table.add_column("Trades (total)", justify="right")
         table.add_column("Status")
-        for r in rows:
+        for r in display_rows:
             table.add_row(
                 str(r["ticker"]), r["price_text"], _fmt(r["position"]), r["nw_text"],
                 r["unrealized_text"], r["drawdown_text"], r["trades_this_text"], r["trades_total"],
                 r["status_text"], style=r["row_style"],
             )
+        if truncated > 0:
+            table.caption = f"... {truncated} more ticker(s) not shown (sorted by flagged status, then |unrealized PnL|)"
         return table
 
     def _build_compact_grid(self, rows: List[Dict[str, Any]]) -> Table:
@@ -767,8 +808,8 @@ class TrainingDashboard:
         position, and a one-character status dot (colored, not just
         text -- readable at a glance even in a small tile). This is
         deliberately less detailed per-ticker than the full table -- see
-        _build_renderable()'s docstring comment on why flagged
-        (halted/bankrupt) envs still get a full-detail row elsewhere.
+        _build_renderable(), which now always follows this grid with the
+        full per-ticker table for the whole portfolio.
         """
         col_width = 20
         n_cols = max(4, min(12, (self.console.width or 100) // col_width))

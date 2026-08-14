@@ -64,7 +64,7 @@ REQUEST_DELAY = 0.3          # seconds between paginated requests
 ET            = ZoneInfo("America/New_York")
 
 # ── Cache ─────────────────────────────────────────────────────────────────────
-CACHE_DIR = "./alpaca_cache"
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alpaca_cache")
 USE_CACHE = True             # set False to force full re-fetch
 
 
@@ -157,6 +157,10 @@ def _fetch_range(ticker: str, from_date: str, to_date: str) -> pd.DataFrame:
     total_days  = max((end - start).days, 1)
     done_days   = 0
 
+    # Nothing to fetch when the requested start is already past the end.
+    if chunk_start >= end:
+        return pd.DataFrame()
+
     while chunk_start < end:
         chunk_end = min(chunk_start + timedelta(days=CHUNK_DAYS), end)
         df_chunk  = _fetch_chunk(ticker, chunk_start, chunk_end)
@@ -170,7 +174,9 @@ def _fetch_range(ticker: str, from_date: str, to_date: str) -> pd.DataFrame:
         print(f"[alpaca_data] {chunk_start.date()} → {chunk_end.date()}"
               f"  {n:5d} candles  ({pct:.0f}% done)", end="\r")
 
-        chunk_start = chunk_end + timedelta(days=1)
+        # Use the exact end of this chunk as the next start.  The old
+        # +1-day step skipped one calendar day between every request.
+        chunk_start = chunk_end
         time.sleep(REQUEST_DELAY)
 
     print()
