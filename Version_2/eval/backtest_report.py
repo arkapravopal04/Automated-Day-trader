@@ -183,7 +183,10 @@ def run_backtest(
                 step_result = env.step(direction=final_direction, size=final_size, limit_offset=final_limit_offset)
 
                 if use_risk_pipeline:
-                    kelly_sizer.record_realized_pnl(step_result.info["realized_delta"])
+                    kelly_sizer.record_realized_pnl(
+                        step_result.info["realized_delta"],
+                        closed_mask=step_result.info.get("closed_trade"),
+                    )
                     kill_switch.check_daily_loss(step_result.info["equity"])
 
                 equity_hist.append(step_result.info["equity"].clone())

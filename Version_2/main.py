@@ -128,6 +128,7 @@ def cmd_live(args: argparse.Namespace) -> None:
         tickers=cfg.env.tickers,
         metrics_writer=metrics_writer,
         bar_interval_seconds=args.bar_interval_seconds,
+        auto_correct_mismatches=args.auto_correct_mismatches,
     )
 
     mode_str = "LIVE (real capital)" if not paper else "paper"
@@ -175,6 +176,12 @@ def build_parser() -> argparse.ArgumentParser:
     live_parser.add_argument("--bar-interval-seconds", type=float, default=300.0)
     live_parser.add_argument(
         "--live", action="store_true", help="REAL capital. Omit this for paper trading (the default).",
+    )
+    live_parser.add_argument(
+        "--auto-correct-mismatches", action="store_true",
+        help="Auto-overwrite the internal ledger to match the broker when a state mismatch "
+             "is detected (the kill-switch halt still requires a manual reset()). "
+             "Default: detect-and-halt only.",
     )
     live_parser.set_defaults(func=cmd_live)
 

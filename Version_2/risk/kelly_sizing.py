@@ -86,14 +86,27 @@ class KellySizer:
             self._ptr[i] = 0
         self._count[env_mask] = 0
 
-    def record_realized_pnl(self, realized_delta: Tensor) -> None:
+    def record_realized_pnl(self, realized_delta: Tensor, closed_mask: Optional[Tensor] = None) -> None:
         """
         Call once per env-step with PortfolioState.step_apply()'s return
-        value. Rows where realized_delta == 0 (nothing closed this step) are
-        ignored.
+        value.
+
+        closed_mask (optional bool [n_envs]): True where a position was
+        CLOSED this step (position magnitude shrank). When provided, those
+        rows are recorded even if realized_delta == 0 -- a break-even round
+        trip is a real closed trade and should count in the win-rate
+        estimate (L2 fix). When omitted (None, legacy behavior), rows where
+        realized_delta == 0 are ignored, since without the mask a zero can't
+        be distinguished from "nothing closed this step".
         """
         realized_delta = realized_delta.to(self.device)
-        closed = realized_delta != 0
+        if closed_mask is None:
+            closed = realized_delta != 0
+        else:
+            # The mask alone decides: a True row is a closed trade even when
+            # realized_delta == 0 (break-even round trip); a False row never
+            # is, regardless of delta.
+            closed = closed_mask.to(self.device)
         if not closed.any():
             return
         for i in torch.nonzero(closed, as_tuple=True)[0].tolist():
@@ -193,16 +206,27 @@ class KellySizer:
         fractional_kelly: Tensor,
     ) -> Tensor:
         """
-        Caps `size` at whatever headroom remains under fractional_kelly *
-        equity, but only for fills that would INCREASE exposure (same sign
-        as the existing position, or opening from flat). Reducing/closing
-        fills are left untouched, since Kelly sizing governs how big a
-        position gets, not how quickly it can be unwound.
+        Caps `size` so that the RESULTING position notional (after the fill)
+        never exceeds fractional_kelly * equity -- for adds, opens, AND flips
+        alike. A pure reduce (fill shrinking |position|, no reversal) passes
+        through untouched, since its resulting position is smaller than the
+        current one.
+
+        FLIP FIX: the previous version only capped "increasing" fills (same
+        sign as the existing position, or opening from flat) and passed every
+        opposite-direction fill through. A flip is technically "reducing then
+        opening", so a policy could go +10 shares -> -10,000 in ONE step and
+        sail past every cap. The cap is now derived from the resulting
+        position: for an opposite-direction fill, |pos| - qty must stay within
+        [-max, +max], i.e. qty <= |pos| + max_shares (full close plus a
+        reversal of at most max_shares of NEW exposure).
         """
         max_notional = fractional_kelly * equity.clamp(min=1e-6)
-        increasing = (torch.sign(direction) == torch.sign(current_position_notional)) | (current_position_notional == 0)
+        mid_price = mid_price.clamp(min=1e-6)
+        pos_shares = current_position_notional / mid_price
 
-        headroom = (max_notional - current_position_notional.abs()).clamp(min=0.0)
-        max_qty = headroom / mid_price.clamp(min=1e-6)
-
-        return torch.where(increasing, torch.minimum(size, max_qty), size)
+        opposite = (torch.sign(direction) != torch.sign(pos_shares)) & (pos_shares != 0) & (direction != 0)
+        max_shares = max_notional / mid_price
+        # same-sign/open: qty <= max - |pos|   |   opposite: qty <= max + |pos|
+        qty_cap = max_shares + torch.where(opposite, pos_shares.abs(), -pos_shares.abs())
+        return torch.minimum(size, qty_cap.clamp(min=0.0))

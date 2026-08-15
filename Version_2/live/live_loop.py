@@ -131,6 +131,7 @@ class LiveLoop:
         tickers: List[str],
         metrics_writer: Optional[MetricsWriter] = None,
         bar_interval_seconds: float = 300.0,
+        auto_correct_mismatches: bool = False,
     ):
         self.broker = broker
         self.bar_poller = bar_poller
@@ -141,6 +142,14 @@ class LiveLoop:
         self.n_envs = len(tickers)
         self.metrics_writer = metrics_writer
         self.bar_interval_seconds = bar_interval_seconds
+
+        # L5: when True, a broker/internal ledger mismatch found by
+        # Reconciler.sync() is AUTO-CORRECTED (ledger position overwritten
+        # to match the broker) instead of only halting. The kill switch's
+        # state-mismatch halt is deliberately NOT cleared by the correction
+        # -- an operator must still call reset() after reviewing WHY the
+        # book drifted. Default False = detect-and-halt only (safe).
+        self.auto_correct_mismatches = auto_correct_mismatches
 
         self.device = next(actor_critic.parameters()).device
 
@@ -215,6 +224,7 @@ class LiveLoop:
         # broker or a state mismatch should block new orders even if
         # nothing else looks wrong yet.
         report = self.reconciler.sync()
+        self._maybe_auto_correct(report)
 
         # --- 2b. new trading day? reset the daily-loss baseline (checked
         # every cycle, not just at process start -- see
@@ -390,8 +400,47 @@ class LiveLoop:
         commission_vec = torch.zeros(self.n_envs, device=self.device)
 
         fill = Fill(ticker_idx=0, qty=qty_vec, price=price_vec, commission=commission_vec)
-        self.portfolio.step_apply(fill)
+        realized_delta = self.portfolio.step_apply(fill)
+        # L2 fix: feed realized PnL into the Kelly sizer so it warms up live
+        # instead of running forever on kelly_default_fraction (it previously
+        # never received trade history in live mode).
+        self.kelly_sizer.record_realized_pnl(realized_delta)
         self._total_trades += 1
+
+    def _maybe_auto_correct(self, report) -> None:
+        """
+        L5: optional ledger auto-correction on broker mismatch. Off by
+        default (detect-and-halt only). When enabled, overwrites the
+        internal ledger's positions to match the broker for mismatched
+        tickers -- the kill switch's state-mismatch halt is NOT cleared
+        (see reconciliation.py's reconcile_and_correct docstring: correcting
+        the book and deciding it's safe to trade again are two decisions).
+        """
+        if not self.auto_correct_mismatches:
+            return
+        if not report.ok and report.mismatched_tickers:
+            print(
+                f"[live_loop] AUTO-CORRECT: ledger adjusted to broker for "
+                f"{report.mismatched_tickers} (halt remains -- review, then reset())"
+            )
+            self.reconciler.reconcile_and_correct(report)
+
+    def _idle_cycle(self) -> None:
+        """
+        L1: book-maintenance cycle used while the kill switch is halted.
+        Keeps the ledger honest (polls bars, reconciles against the broker,
+        cancels stale resting orders) but places NO new orders -- the whole
+        point of the halt. Previously a halted loop kept calling step_once(),
+        which re-raised the same exception and re-printed it every cycle.
+        """
+        try:
+            raw_windows = self.bar_poller.poll()
+            mid_price = self._extract_mid_price(raw_windows)
+            report = self.reconciler.sync()
+            self._maybe_auto_correct(report)
+            self._cancel_pending_orders()
+        except Exception as e:  # noqa: BLE001 -- idle maintenance must never kill the loop
+            print(f"[live_loop] idle cycle raised: {e!r} -- retrying next cycle")
 
     def _rollover_day_if_needed(self, raw_windows: Dict[str, RawBarWindow], mid_price: torch.Tensor) -> None:
         """
@@ -508,10 +557,30 @@ class LiveLoop:
         return torch.tensor(prices, device=self.device, dtype=torch.float32)
 
     def run_forever(self) -> None:
+        """
+        Main loop. While any stream is NOT halted, runs full trading cycles.
+        While ALL streams are halted (e.g. after an unexpected error trips a
+        manual halt), runs _idle_cycle() instead -- book maintenance only,
+        no new orders, no repeated error spam -- until an operator calls
+        kill_switch.reset().
+        """
+        idle_logged = False
         while True:
+            if self.kill_switch.is_halted().all():
+                if not idle_logged:
+                    print(
+                        "[live_loop] all streams halted -- running idle cycles (book "
+                        "maintenance only, no new orders). Call kill_switch.reset() to resume."
+                    )
+                    idle_logged = True
+                self._idle_cycle()
+                time.sleep(self.bar_interval_seconds)
+                continue
+
+            idle_logged = False
             try:
                 self.step_once()
             except Exception as e:  # noqa: BLE001 -- a live trading loop must never die silently
-                print(f"[live_loop] step_once() raised: {e!r} -- halting all streams as a precaution")
+                print(f"[live_loop] step_once() raised: {e!r} -- tripping manual halt on all streams")
                 self.kill_switch.trip_manual(torch.ones(self.n_envs, dtype=torch.bool, device=self.device))
             time.sleep(self.bar_interval_seconds)

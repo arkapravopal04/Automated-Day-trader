@@ -200,6 +200,20 @@ class VecTradingEnv:
             if any(kw in name.lower() for kw in return_feature_keywords)
         ]
 
+        # L4 visibility: print exactly which features mirroring will flip, so
+        # adding a new direction-sensitive feature (e.g. RSI/MACD) without
+        # extending return_feature_keywords shows up immediately instead of
+        # silently training on inconsistent mirrored observations.
+        if self._return_feature_idx:
+            flipped = [self.feature_names[i] for i in self._return_feature_idx]
+            print(f"[env] mirroring will sign-flip direction-sensitive features: {flipped}")
+        elif self.enable_mirroring:
+            print(
+                f"[env] WARNING: mirroring is enabled but NO features matched "
+                f"return_feature_keywords={return_feature_keywords} -- mirrored streams "
+                "will get flipped prices with unflipped features (inconsistent obs)."
+            )
+
         # --- Portfolio: one row per stream, each managing exactly 1 instrument
         self.portfolio = PortfolioState(
             n_envs=self.n_envs, n_tickers=1, initial_cash=initial_cash, device=str(self.device)
@@ -371,7 +385,16 @@ class VecTradingEnv:
         total_fees = commission + platform_fee
 
         fill = Fill(ticker_idx=0, qty=sim_fill.filled_qty, price=sim_fill.fill_price, commission=total_fees)
+        positions_before = self.portfolio.positions[:, 0].clone()
         realized_delta = self.portfolio.step_apply(fill)
+
+        # L2 fix: whether ANY part of an existing position was CLOSED this
+        # step (position magnitude shrank, including full closes and the
+        # closing leg of a flip) -- distinct from realized_delta == 0, which
+        # is also what a break-even close produces. KellySizer uses this to
+        # count break-even round trips in its win-rate estimate instead of
+        # silently dropping them (see kelly_sizing.py's record_realized_pnl).
+        closed_trade = positions_before.abs() > self.portfolio.positions[:, 0].abs()
 
         self._record_trade_direction(sim_fill.filled_qty)
 
@@ -404,6 +427,7 @@ class VecTradingEnv:
             "commission": commission,
             "platform_fee": platform_fee,
             "overtrading_factor": overtrading_factor,
+            "closed_trade": closed_trade,
             **reward_info,
         }
 

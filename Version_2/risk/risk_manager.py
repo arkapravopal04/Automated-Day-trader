@@ -109,7 +109,7 @@ class RiskManager:
 
         size, breached = self._cap_order_notional(size, breached, equity, mid_price)
         size, breached = self._cap_ticker_position(
-            size, breached, increasing, current_notional_ticker, equity, mid_price
+            size, breached, direction, current_notional_ticker, equity, mid_price
         )
 
         if all_prices is not None and portfolio.n_tickers > 1:
@@ -133,7 +133,13 @@ class RiskManager:
     def _cap_order_notional(
         self, size: Tensor, breached: Tensor, equity: Tensor, mid_price: Tensor
     ) -> Tuple[Tensor, Tensor]:
-        """Per-order notional cap, independent of the resulting position (applies regardless of direction)."""
+        """Per-order notional cap, independent of the resulting position (applies regardless of direction).
+
+        NOTE: this one deliberately applies to REDUCING orders too -- a
+        single-order size bound is a fat-finger guard, not an exposure
+        governor. A close larger than the cap is split across cycles (still
+        de-risks, just in steps); it is never BLOCKED, only paced.
+        """
         max_order_notional = self.limits.max_order_notional_frac * equity
         max_order_qty = max_order_notional / mid_price.clamp(min=1e-6)
         breached = breached | (size > max_order_qty)
@@ -144,17 +150,33 @@ class RiskManager:
         self,
         size: Tensor,
         breached: Tensor,
-        increasing: Tensor,
+        direction: Tensor,
         current_notional_ticker: Tensor,
         equity: Tensor,
         mid_price: Tensor,
     ) -> Tuple[Tensor, Tensor]:
-        """Per-ticker position cap: bounds |position notional| for this ticker, only on exposure-increasing orders."""
+        """
+        Per-ticker position cap: bounds the RESULTING |position notional|
+        after the fill, for adds, opens, AND flips alike (FLIP FIX -- see
+        kelly_sizing.py's _cap_growing_size for the same fix and rationale).
+
+        Pure reduces pass through: their resulting position is smaller than
+        the current one, so the cap (max + |pos|) never binds below a full
+        close. Opposite-direction fills are capped at |pos| + max shares --
+        a full close plus at most `max_position_frac` of equity in NEW
+        reversed exposure.
+        """
         max_position_notional = self.limits.max_position_frac * equity
-        headroom = (max_position_notional - current_notional_ticker.abs()).clamp(min=0.0)
-        max_qty_position_cap = headroom / mid_price.clamp(min=1e-6)
-        would_exceed = increasing & (size > max_qty_position_cap)
-        size = torch.where(increasing, torch.minimum(size, max_qty_position_cap), size)
+        mid_price = mid_price.clamp(min=1e-6)
+        pos_shares = current_notional_ticker / mid_price
+
+        opposite = (torch.sign(direction) != torch.sign(pos_shares)) & (pos_shares != 0) & (direction != 0)
+        max_shares = max_position_notional / mid_price
+        max_qty = max_shares + torch.where(opposite, pos_shares.abs(), -pos_shares.abs())
+        max_qty = max_qty.clamp(min=0.0)
+
+        would_exceed = size > max_qty
+        size = torch.minimum(size, max_qty)
         breached = breached | would_exceed
         return size, breached
 

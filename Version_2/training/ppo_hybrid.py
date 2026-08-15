@@ -311,7 +311,10 @@ def collect_rollout(
                 direction=final_direction, size=final_size, limit_offset=final_limit_offset
             )
 
-            kelly_sizer.record_realized_pnl(step_result.info["realized_delta"])
+            kelly_sizer.record_realized_pnl(
+                step_result.info["realized_delta"],
+                closed_mask=step_result.info.get("closed_trade"),
+            )
             kill_switch.check_daily_loss(step_result.info["equity"])
 
             step_return = step_result.info["step_pnl"] / equity_before.clamp(min=1e-6)
