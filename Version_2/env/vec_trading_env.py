@@ -483,7 +483,13 @@ class VecTradingEnv:
             current_vol = raw_rv
         else:
             current_vol = torch.full_like(step_pnl, 1.0)
-        return self.r_step_scale * (step_pnl / (equity_before.clamp(min=1e-6) * current_vol))
+        # REWARD-EXPLOSION DEFENSE (same class as ppo_hybrid.py's step_return
+        # clamp): a near-zero-equity stream turns step_pnl / (1e-6 * vol) into
+        # an astronomically large ratio. Clamping the ratio to [-1, 1] is free
+        # in practice (real vol-normalized bar moves are << 1) and bounds the
+        # env reward path used when RewardConfig.raw_weight > 0.
+        ratio = (step_pnl / (equity_before.clamp(min=1e-6) * current_vol)).clamp(-1.0, 1.0)
+        return self.r_step_scale * ratio
 
     def _hold_loser_penalty(self, mid_price_after: Tensor) -> Tensor:
         """Small drag applied when holding a position that's currently underwater, scaled by |position|."""

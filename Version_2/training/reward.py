@@ -211,8 +211,18 @@ class DifferentialSharpeReward:
         pos_level = level_signed.clamp(min=0)
         neg_level = (-level_signed).clamp(min=0)
 
-        new_pos_crossings = (pos_level - self._max_level_pos).clamp(min=0)
-        new_neg_crossings = (neg_level - self._max_level_neg).clamp(min=0)
+        # REWARD-EXPLOSION DEFENSE: cap how many milestones a single step
+        # can cross. A pathological step_return (e.g. from a near-zero-equity
+        # stream before the caller-side clamp in ppo_hybrid.py) can imply
+        # billions of crossings; bonus = frac * |D_t| * crossings would then
+        # dwarf everything else in the rollout. Capping at a small constant
+        # bounds the bonus to frac * |D_t| * cap (~4 by default) -- a huge
+        # single-bar move still earns its bonus, it just can't blow up the
+        # reward scale. Levels beyond the cap are still marked as reached
+        # (max_level_* below), so they are never double-paid later.
+        _MAX_CROSSINGS_PER_STEP = 4
+        new_pos_crossings = (pos_level - self._max_level_pos).clamp(min=0, max=_MAX_CROSSINGS_PER_STEP)
+        new_neg_crossings = (neg_level - self._max_level_neg).clamp(min=0, max=_MAX_CROSSINGS_PER_STEP)
 
         self._max_level_pos = torch.maximum(self._max_level_pos, pos_level)
         self._max_level_neg = torch.maximum(self._max_level_neg, neg_level)

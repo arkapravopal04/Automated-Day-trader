@@ -315,6 +315,17 @@ def collect_rollout(
             kill_switch.check_daily_loss(step_result.info["equity"])
 
             step_return = step_result.info["step_pnl"] / equity_before.clamp(min=1e-6)
+            # REWARD-EXPLOSION FIX: clamp per-step return to [-100%, +100%].
+            # Without this, a stream whose equity has decayed toward ~0
+            # produces step_pnl / 1e-6 ~ 1e8+ "returns". The DSR's own D_t is
+            # clamped, but the checkpoint bonus in training/reward.py scales
+            # with the number of milestone crossings, which is UNBOUNDED --
+            # a single bankrupt stream can inject multi-thousand rewards into
+            # the rollout mean, corrupting the EMA / best-checkpoint tracking
+            # (observed: EMA reward jumped from -0.0003 to ~830 in one
+            # rollout). Real 5-min equity moves never approach 100% in a bar,
+            # so this clamp is free in practice.
+            step_return = step_return.clamp(-1.0, 1.0)
             dsr_reward = reward_shaper.step(step_return)
             shaped_reward = cfg.reward.sharpe_weight * dsr_reward + cfg.reward.raw_weight * step_result.reward
 

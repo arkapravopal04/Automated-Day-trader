@@ -86,6 +86,7 @@ from train import (  # noqa: E402 -- reuse, don't duplicate
     make_tick_callback,
     resolve_resume_path,
     _clean_checkpoint_dir,
+    _REWARD_SANITY_BOUND,
 )
 
 
@@ -208,6 +209,19 @@ def _worker(
         start_rollout = checkpoint["rollout_idx"] + 1
         best_metric = checkpoint.get("best_metric", float("-inf"))
         ema_reward = checkpoint.get("ema_reward", None)
+        # AUTO-HEAL for the pre-fix reward explosion signature (see
+        # train.py's matching comment) -- resets poisoned best/EMA baselines
+        # so checkpoint_best.pt tracking works after resuming an old run.
+        if best_metric > _REWARD_SANITY_BOUND:
+            if rank == 0:
+                print(f"[train_ddp] WARNING: loaded best_metric {best_metric:.4f} is the "
+                      "pre-fix reward-explosion signature -- resetting best-metric tracking")
+            best_metric = float("-inf")
+        if ema_reward is not None and ema_reward > _REWARD_SANITY_BOUND:
+            if rank == 0:
+                print(f"[train_ddp] WARNING: loaded ema_reward {ema_reward:.4f} is the "
+                      "pre-fix reward-explosion signature -- restarting the EMA from scratch")
+            ema_reward = None
         state.global_tick = checkpoint.get("global_tick", 0)
         state.episode_idx = checkpoint.get("episode_idx", 0)
         saved_per_ticker = checkpoint.get("total_trades_per_ticker", None)

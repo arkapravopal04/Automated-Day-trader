@@ -63,6 +63,12 @@ from risk.risk_manager import RiskLimits, RiskManager  # noqa: E402
 
 from monitoring.dashboard import MetricsWriter  # noqa: E402
 
+# Rewards are bounded by the DSR clip (|D| <= dsr_clip=10) plus the capped
+# checkpoint bonus (<= ~4), so any EMA/best-metric value far above this is
+# the pre-fix reward-explosion signature (observed ~830-1096). Used by the
+# resume auto-heal in train.py and train_ddp.py.
+_REWARD_SANITY_BOUND = 50.0
+
 
 def build_risk_pipeline(cfg: TrainingConfig, n_envs: int, device: torch.device):
     """
@@ -372,6 +378,19 @@ def main(argv: Optional[List[str]] = None) -> None:
         start_rollout = checkpoint["rollout_idx"] + 1
         best_metric = checkpoint.get("best_metric", float("-inf"))
         ema_reward = checkpoint.get("ema_reward", None)
+        # AUTO-HEAL for the pre-fix reward explosion (observed EMA ~830-1096
+        # vs. legit values bounded by the DSR clip, |reward| <= ~14). If a
+        # checkpoint carries that signature, reset both the EMA and the
+        # best-metric baseline so tracking works again; a poisoned baseline
+        # would otherwise make checkpoint_best.pt unreachable forever.
+        if best_metric > _REWARD_SANITY_BOUND:
+            print(f"[train] WARNING: loaded best_metric {best_metric:.4f} is the pre-fix "
+                  "reward-explosion signature -- resetting best-metric tracking")
+            best_metric = float("-inf")
+        if ema_reward is not None and ema_reward > _REWARD_SANITY_BOUND:
+            print(f"[train] WARNING: loaded ema_reward {ema_reward:.4f} is the pre-fix "
+                  "reward-explosion signature -- restarting the EMA from scratch")
+            ema_reward = None
         state.global_tick = checkpoint.get("global_tick", 0)
         state.episode_idx = checkpoint.get("episode_idx", 0)
         saved_total = checkpoint.get("total_trades_per_ticker", None)
