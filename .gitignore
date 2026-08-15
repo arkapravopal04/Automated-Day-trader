@@ -10,3 +10,8 @@ __pycache__/
 /alpaca_cache
 /legacy
 /info.txt
+
+# --- Security audit L1: untracked legacy / tuning-artifact trees ---
+/Version_1/
+/tuning/
+/sweep_output/
