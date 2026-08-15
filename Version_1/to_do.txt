@@ -1,0 +1,12 @@
+Generate some kind of actual tangable data from the syatem
+
+
+sharpe ratio
+bhs
+
+
+improve the risk syatem
+imporve hte telemetry analysis
+
+add black swan events
+kelly criterion ratio

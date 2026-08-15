@@ -1,0 +1,369 @@
+======================================================================
+[EPISODE 1] FRESH SESSION LOG INITIATED
+======================================================================
+
+[RISK]  OPEN LONG  | Entry: $391.15 | Stop: $385.28 (1.50%) | Vol: 0.00100 [LOW] | ATR: 0.00100 | Kelly: 15.00% | Drawdown: 0.00%
+[SPY] OPEN  LONG  | Entry: $391.15 | Size: 15.00% of balance | Kelly: 15.00% | Vol: 0.0010 | NW: $10,000
+[RISK]  Trade recorded | PnL: -0.204% | WR(last 1): 0% | Avg W: +0.000% | Avg L: -0.204% | Kelly: 15.00%
+[RISK]  CLOSE LONG  | Entry: $391.15 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.01%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.204% | Hold: 1 steps | NW: $9,997
+[RISK]  OPEN LONG  | Entry: $389.68 | Stop: $383.84 (1.50%) | Vol: 0.00064 [LOW] | ATR: 0.00056 | Kelly: 15.00% | Drawdown: 0.03%
+[SPY] OPEN  LONG  | Entry: $389.68 | Size: 15.00% of balance | Kelly: 15.00% | Vol: 0.0006 | NW: $9,997
+[RISK]  Trade recorded | PnL: -0.181% | WR(last 2): 0% | Avg W: +0.000% | Avg L: -0.192% | Kelly: 15.00%
+[RISK]  CLOSE LONG  | Entry: $389.68 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.05%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.181% | Hold: 3 steps | NW: $9,994
+[RISK]  OPEN LONG  | Entry: $387.86 | Stop: $382.04 (1.50%) | Vol: 0.00062 [LOW] | ATR: 0.00047 | Kelly: 15.00% | Drawdown: 0.06%
+[SPY] OPEN  LONG  | Entry: $387.86 | Size: 15.00% of balance | Kelly: 15.00% | Vol: 0.0006 | NW: $9,994
+[RISK]  Trade recorded | PnL: -0.055% | WR(last 3): 0% | Avg W: +0.000% | Avg L: -0.147% | Kelly: 15.00%
+[RISK]  CLOSE LONG  | Entry: $387.86 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.06%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.055% | Hold: 1 steps | NW: $9,993
+[RISK]  OPEN LONG  | Entry: $387.39 | Stop: $381.58 (1.50%) | Vol: 0.00091 [LOW] | ATR: 0.00097 | Kelly: 15.00% | Drawdown: 0.07%
+[SPY] OPEN  LONG  | Entry: $387.39 | Size: 15.00% of balance | Kelly: 15.00% | Vol: 0.0009 | NW: $9,993
+[RISK]  Trade recorded | PnL: -0.237% | WR(last 4): 0% | Avg W: +0.000% | Avg L: -0.169% | Kelly: 15.00%
+[RISK]  CLOSE LONG  | Entry: $387.39 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.09%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.237% | Hold: 2 steps | NW: $9,990
+[RISK]  OPEN LONG  | Entry: $384.18 | Stop: $378.42 (1.50%) | Vol: 0.00103 [LOW] | ATR: 0.00114 | Kelly: 15.00% | Drawdown: 0.10%
+[SPY] OPEN  LONG  | Entry: $384.18 | Size: 15.00% of balance | Kelly: 15.00% | Vol: 0.0010 | NW: $9,990
+[RISK]  Trade recorded | PnL: -0.076% | WR(last 5): 0% | Avg W: +0.000% | Avg L: -0.151% | Kelly: 15.00%
+[RISK]  CLOSE LONG  | Entry: $384.18 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.11%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.076% | Hold: 1 steps | NW: $9,989
+[RISK]  OPEN LONG  | Entry: $381.70 | Stop: $375.97 (1.50%) | Vol: 0.00106 [LOW] | ATR: 0.00086 | Kelly: 15.00% | Drawdown: 0.11%
+[SPY] OPEN  LONG  | Entry: $381.70 | Size: 15.00% of balance | Kelly: 15.00% | Vol: 0.0011 | NW: $9,989
+[RISK]  Trade recorded | PnL: +0.173% | WR(last 6): 17% | Avg W: +0.173% | Avg L: -0.151% | Kelly: 15.00%
+[RISK]  CLOSE LONG  | Entry: $381.70 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.08%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: +0.173% | Hold: 3 steps | NW: $9,991
+[RISK]  OPEN LONG  | Entry: $383.01 | Stop: $377.26 (1.50%) | Vol: 0.00101 [LOW] | ATR: 0.00087 | Kelly: 2.00% | Drawdown: 0.09%
+[SPY] OPEN  LONG  | Entry: $383.01 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0010 | NW: $9,991
+[RISK]  Trade recorded | PnL: -0.125% | WR(last 7): 14% | Avg W: +0.173% | Avg L: -0.146% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $383.01 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.09%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.125% | Hold: 2 steps | NW: $9,991
+[RISK]  OPEN LONG  | Entry: $381.85 | Stop: $376.12 (1.50%) | Vol: 0.00088 [LOW] | ATR: 0.00051 | Kelly: 2.00% | Drawdown: 0.09%
+[SPY] OPEN  LONG  | Entry: $381.85 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0009 | NW: $9,991
+[RISK]  Trade recorded | PnL: -0.041% | WR(last 8): 12% | Avg W: +0.173% | Avg L: -0.131% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $381.85 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.09%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.041% | Hold: 1 steps | NW: $9,991
+[RISK]  OPEN LONG  | Entry: $381.58 | Stop: $375.86 (1.50%) | Vol: 0.00060 [LOW] | ATR: 0.00036 | Kelly: 2.00% | Drawdown: 0.09%
+[SPY] OPEN  LONG  | Entry: $381.58 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0006 | NW: $9,991
+[RISK]  Trade recorded | PnL: +0.063% | WR(last 9): 22% | Avg W: +0.118% | Avg L: -0.131% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $381.58 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.09%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: +0.063% | Hold: 1 steps | NW: $9,991
+[RISK]  OPEN LONG  | Entry: $384.30 | Stop: $378.54 (1.50%) | Vol: 0.00066 [LOW] | ATR: 0.00062 | Kelly: 2.00% | Drawdown: 0.09%
+[SPY] OPEN  LONG  | Entry: $384.30 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0007 | NW: $9,991
+[RISK]  Trade recorded | PnL: -0.139% | WR(last 10): 20% | Avg W: +0.118% | Avg L: -0.132% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $384.30 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.09%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.139% | Hold: 1 steps | NW: $9,991
+[RISK]  OPEN LONG  | Entry: $383.49 | Stop: $377.74 (1.50%) | Vol: 0.00074 [LOW] | ATR: 0.00075 | Kelly: 2.00% | Drawdown: 0.09%
+[SPY] OPEN  LONG  | Entry: $383.49 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0007 | NW: $9,991
+[RISK]  Trade recorded | PnL: +0.301% | WR(last 11): 27% | Avg W: +0.179% | Avg L: -0.132% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $383.49 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.09%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: +0.301% | Hold: 6 steps | NW: $9,991
+[RISK]  OPEN LONG  | Entry: $383.91 | Stop: $378.16 (1.50%) | Vol: 0.00146 [LOW] | ATR: 0.00146 | Kelly: 2.00% | Drawdown: 0.09%
+[SPY] OPEN  LONG  | Entry: $383.91 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0015 | NW: $9,991
+[RISK]  Trade recorded | PnL: +0.176% | WR(last 12): 33% | Avg W: +0.178% | Avg L: -0.132% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $383.91 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.08%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: +0.176% | Hold: 2 steps | NW: $9,992
+[RISK]  OPEN LONG  | Entry: $383.10 | Stop: $377.35 (1.50%) | Vol: 0.00146 [LOW] | ATR: 0.00121 | Kelly: 2.00% | Drawdown: 0.08%
+[SPY] OPEN  LONG  | Entry: $383.10 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0015 | NW: $9,992
+[RISK]  Trade recorded | PnL: +0.015% | WR(last 13): 38% | Avg W: +0.146% | Avg L: -0.132% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $383.10 | Reason: AGENT_REVERSAL  | Drawdown at close: 0.08%
+[SPY] CLOSE LONG | Reason: AGENT_REVERSAL  | PnL: +0.015% | Hold: 1 steps | NW: $9,992
+[RISK]  OPEN LONG  | Entry: $383.35 | Stop: $377.60 (1.50%) | Vol: 0.00148 [LOW] | ATR: 0.00073 | Kelly: 2.00% | Drawdown: 0.08%
+[SPY] OPEN  LONG  | Entry: $383.35 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0015 | NW: $9,992
+[RISK]  Trade recorded | PnL: -0.018% | WR(last 14): 36% | Avg W: +0.146% | Avg L: -0.119% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $383.35 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.08%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.018% | Hold: 1 steps | NW: $9,992
+[RISK]  OPEN LONG  | Entry: $383.58 | Stop: $377.83 (1.50%) | Vol: 0.00078 [LOW] | ATR: 0.00047 | Kelly: 2.00% | Drawdown: 0.08%
+[SPY] OPEN  LONG  | Entry: $383.58 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0008 | NW: $9,992
+[RISK]  Trade recorded | PnL: +0.013% | WR(last 15): 40% | Avg W: +0.123% | Avg L: -0.119% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $383.58 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.08%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: +0.013% | Hold: 4 steps | NW: $9,992
+[RISK]  OPEN LONG  | Entry: $382.59 | Stop: $376.85 (1.50%) | Vol: 0.00061 [LOW] | ATR: 0.00040 | Kelly: 2.00% | Drawdown: 0.08%
+[SPY] OPEN  LONG  | Entry: $382.59 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0006 | NW: $9,992
+[RISK]  Trade recorded | PnL: -0.006% | WR(last 16): 38% | Avg W: +0.123% | Avg L: -0.108% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $382.59 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.08%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.006% | Hold: 3 steps | NW: $9,992
+[RISK]  OPEN LONG  | Entry: $382.90 | Stop: $377.16 (1.50%) | Vol: 0.00052 [LOW] | ATR: 0.00033 | Kelly: 2.00% | Drawdown: 0.08%
+[SPY] OPEN  LONG  | Entry: $382.90 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0005 | NW: $9,992
+[RISK]  Trade recorded | PnL: -0.085% | WR(last 17): 35% | Avg W: +0.123% | Avg L: -0.106% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $382.90 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.08%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.085% | Hold: 1 steps | NW: $9,992
+[RISK]  OPEN LONG  | Entry: $383.60 | Stop: $377.84 (1.50%) | Vol: 0.00053 [LOW] | ATR: 0.00035 | Kelly: 2.00% | Drawdown: 0.08%
+[SPY] OPEN  LONG  | Entry: $383.60 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0005 | NW: $9,992
+[RISK]  Trade recorded | PnL: +0.044% | WR(last 18): 39% | Avg W: +0.112% | Avg L: -0.106% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $383.60 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.08%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: +0.044% | Hold: 1 steps | NW: $9,992
+[RISK]  BLACK SWAN active! z=17.67 > 5.00 | Size capped to 5%
+[RISK]  OPEN LONG  | Entry: $389.00 | Stop: $383.17 (1.50%) | Vol: 0.00215 [MED] | ATR: 0.00153 | Kelly: 2.00% | Drawdown: 0.08%
+[SPY] OPEN  LONG  | Entry: $389.00 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0021 | NW: $9,992
+[RISK]  Trade recorded | PnL: -0.143% | WR(last 19): 37% | Avg W: +0.112% | Avg L: -0.109% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $389.00 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.08%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.143% | Hold: 1 steps | NW: $9,991
+[RISK]  OPEN LONG  | Entry: $388.96 | Stop: $383.12 (1.50%) | Vol: 0.00225 [MED] | ATR: 0.00123 | Kelly: 2.00% | Drawdown: 0.09%
+[SPY] OPEN  LONG  | Entry: $388.96 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0022 | NW: $9,991
+[RISK]  Trade recorded | PnL: +0.031% | WR(last 20): 40% | Avg W: +0.102% | Avg L: -0.109% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $388.96 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.09%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: +0.031% | Hold: 1 steps | NW: $9,991
+[RISK]  OPEN SHORT | Entry: $387.15 | Stop: $392.96 (1.50%) | Vol: 0.00233 [MED] | ATR: 0.00099 | Kelly: 2.00% | Drawdown: 0.09%
+[SPY] OPEN  SHORT | Entry: $387.15 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0023 | NW: $9,991
+[RISK]  Trade recorded | PnL: -0.002% | WR(last 21): 38% | Avg W: +0.102% | Avg L: -0.101% | Kelly: 2.00%
+[RISK]  CLOSE SHORT | Entry: $387.15 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.09%
+[SPY] CLOSE SHORT | Reason: NEUTRAL_DRIFT   | PnL: -0.002% | Hold: 1 steps | NW: $9,991
+[RISK]  OPEN LONG  | Entry: $386.57 | Stop: $380.77 (1.50%) | Vol: 0.00103 [LOW] | ATR: 0.00058 | Kelly: 2.00% | Drawdown: 0.09%
+[SPY] OPEN  LONG  | Entry: $386.57 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0010 | NW: $9,991
+[RISK]  Trade recorded | PnL: -0.011% | WR(last 22): 36% | Avg W: +0.102% | Avg L: -0.094% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $386.57 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.09%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.011% | Hold: 1 steps | NW: $9,991
+[RISK]  OPEN LONG  | Entry: $385.59 | Stop: $379.81 (1.50%) | Vol: 0.00070 [LOW] | ATR: 0.00036 | Kelly: 2.00% | Drawdown: 0.09%
+[SPY] OPEN  LONG  | Entry: $385.59 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0007 | NW: $9,991
+[RISK]  Trade recorded | PnL: -0.229% | WR(last 23): 35% | Avg W: +0.102% | Avg L: -0.103% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $385.59 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.09%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.229% | Hold: 3 steps | NW: $9,991
+[RISK]  OPEN LONG  | Entry: $383.85 | Stop: $378.09 (1.50%) | Vol: 0.00066 [LOW] | ATR: 0.00066 | Kelly: 2.00% | Drawdown: 0.09%
+[SPY] OPEN  LONG  | Entry: $383.85 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0007 | NW: $9,991
+[RISK]  Trade recorded | PnL: -0.185% | WR(last 24): 33% | Avg W: +0.102% | Avg L: -0.109% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $383.85 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.09%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.185% | Hold: 1 steps | NW: $9,991
+[RISK]  OPEN LONG  | Entry: $383.63 | Stop: $377.87 (1.50%) | Vol: 0.00074 [LOW] | ATR: 0.00079 | Kelly: 2.00% | Drawdown: 0.09%
+[SPY] OPEN  LONG  | Entry: $383.63 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0007 | NW: $9,991
+[RISK]  Trade recorded | PnL: -0.171% | WR(last 25): 32% | Avg W: +0.102% | Avg L: -0.112% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $383.63 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.09%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.171% | Hold: 1 steps | NW: $9,990
+[RISK]  OPEN LONG  | Entry: $383.96 | Stop: $378.20 (1.50%) | Vol: 0.00083 [LOW] | ATR: 0.00063 | Kelly: 2.00% | Drawdown: 0.10%
+[SPY] OPEN  LONG  | Entry: $383.96 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0008 | NW: $9,990
+[RISK]  Trade recorded | PnL: -0.253% | WR(last 26): 31% | Avg W: +0.102% | Avg L: -0.120% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $383.96 | Reason: AGENT_REVERSAL  | Drawdown at close: 0.10%
+[SPY] CLOSE LONG | Reason: AGENT_REVERSAL  | PnL: -0.253% | Hold: 2 steps | NW: $9,990
+[RISK]  BLACK SWAN active! z=8.21 > 5.00 | Size capped to 5%
+[RISK]  OPEN LONG  | Entry: $381.65 | Stop: $375.93 (1.50%) | Vol: 0.00168 [MED] | ATR: 0.00137 | Kelly: 2.00% | Drawdown: 0.10%
+[SPY] OPEN  LONG  | Entry: $381.65 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0017 | NW: $9,990
+[RISK]  Trade recorded | PnL: -0.092% | WR(last 27): 30% | Avg W: +0.102% | Avg L: -0.119% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $381.65 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.10%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.092% | Hold: 2 steps | NW: $9,990
+[RISK]  OPEN SHORT | Entry: $382.81 | Stop: $388.55 (1.50%) | Vol: 0.00196 [MED] | ATR: 0.00159 | Kelly: 2.00% | Drawdown: 0.10%
+[SPY] OPEN  SHORT | Entry: $382.81 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0020 | NW: $9,990
+[RISK]  Trade recorded | PnL: +0.010% | WR(last 28): 32% | Avg W: +0.092% | Avg L: -0.119% | Kelly: 2.00%
+[RISK]  CLOSE SHORT | Entry: $382.81 | Reason: AGENT_REVERSAL  | Drawdown at close: 0.11%
+[SPY] CLOSE SHORT | Reason: AGENT_REVERSAL  | PnL: +0.010% | Hold: 2 steps | NW: $9,990
+[RISK]  OPEN LONG  | Entry: $381.96 | Stop: $376.23 (1.50%) | Vol: 0.00206 [MED] | ATR: 0.00144 | Kelly: 2.00% | Drawdown: 0.10%
+[SPY] OPEN  LONG  | Entry: $381.96 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0021 | NW: $9,990
+[RISK]  Trade recorded | PnL: -0.065% | WR(last 29): 31% | Avg W: +0.092% | Avg L: -0.116% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $381.96 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.10%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.065% | Hold: 1 steps | NW: $9,989
+[RISK]  OPEN LONG  | Entry: $381.03 | Stop: $375.31 (1.50%) | Vol: 0.00142 [LOW] | ATR: 0.00072 | Kelly: 2.00% | Drawdown: 0.11%
+[SPY] OPEN  LONG  | Entry: $381.03 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0014 | NW: $9,989
+[RISK]  Trade recorded | PnL: +0.062% | WR(last 30): 33% | Avg W: +0.089% | Avg L: -0.116% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $381.03 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.11%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: +0.062% | Hold: 1 steps | NW: $9,990
+[RISK]  OPEN LONG  | Entry: $381.25 | Stop: $375.53 (1.50%) | Vol: 0.00099 [LOW] | ATR: 0.00065 | Kelly: 2.00% | Drawdown: 0.10%
+[SPY] OPEN  LONG  | Entry: $381.25 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0010 | NW: $9,990
+[RISK]  Trade recorded | PnL: -0.220% | WR(last 31): 32% | Avg W: +0.089% | Avg L: -0.121% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $381.25 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.11%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.220% | Hold: 2 steps | NW: $9,989
+[RISK]  OPEN LONG  | Entry: $380.29 | Stop: $374.58 (1.50%) | Vol: 0.00071 [LOW] | ATR: 0.00046 | Kelly: 2.00% | Drawdown: 0.11%
+[SPY] OPEN  LONG  | Entry: $380.29 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0007 | NW: $9,989
+[RISK]  Trade recorded | PnL: +0.017% | WR(last 32): 34% | Avg W: +0.082% | Avg L: -0.121% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $380.29 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.11%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: +0.017% | Hold: 1 steps | NW: $9,989
+[RISK]  OPEN LONG  | Entry: $380.22 | Stop: $374.51 (1.50%) | Vol: 0.00070 [LOW] | ATR: 0.00040 | Kelly: 2.00% | Drawdown: 0.11%
+[SPY] OPEN  LONG  | Entry: $380.22 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0007 | NW: $9,989
+[RISK]  Trade recorded | PnL: -0.138% | WR(last 33): 33% | Avg W: +0.082% | Avg L: -0.122% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $380.22 | Reason: AGENT_REVERSAL  | Drawdown at close: 0.11%
+[SPY] CLOSE LONG | Reason: AGENT_REVERSAL  | PnL: -0.138% | Hold: 4 steps | NW: $9,989
+[RISK]  OPEN LONG  | Entry: $379.80 | Stop: $374.11 (1.50%) | Vol: 0.00070 [LOW] | ATR: 0.00061 | Kelly: 2.00% | Drawdown: 0.11%
+[SPY] OPEN  LONG  | Entry: $379.80 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0007 | NW: $9,989
+[RISK]  Trade recorded | PnL: -0.172% | WR(last 34): 32% | Avg W: +0.082% | Avg L: -0.124% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $379.80 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.11%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.172% | Hold: 2 steps | NW: $9,989
+[RISK]  OPEN LONG  | Entry: $378.26 | Stop: $372.58 (1.50%) | Vol: 0.00087 [LOW] | ATR: 0.00097 | Kelly: 2.00% | Drawdown: 0.11%
+[SPY] OPEN  LONG  | Entry: $378.26 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0009 | NW: $9,989
+[RISK]  Trade recorded | PnL: -0.097% | WR(last 35): 31% | Avg W: +0.082% | Avg L: -0.123% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $378.26 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.11%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.097% | Hold: 1 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $379.70 | Stop: $374.00 (1.50%) | Vol: 0.00102 [LOW] | ATR: 0.00089 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $379.70 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0010 | NW: $9,988
+[RISK]  Trade recorded | PnL: -0.078% | WR(last 36): 31% | Avg W: +0.082% | Avg L: -0.121% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $379.70 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.078% | Hold: 1 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $377.90 | Stop: $372.23 (1.50%) | Vol: 0.00092 [LOW] | ATR: 0.00068 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $377.90 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0009 | NW: $9,988
+[RISK]  Trade recorded | PnL: +0.020% | WR(last 37): 32% | Avg W: +0.077% | Avg L: -0.121% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $377.90 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: +0.020% | Hold: 1 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $377.44 | Stop: $371.78 (1.50%) | Vol: 0.00088 [LOW] | ATR: 0.00066 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $377.44 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0009 | NW: $9,988
+[RISK]  Trade recorded | PnL: -0.061% | WR(last 38): 32% | Avg W: +0.077% | Avg L: -0.119% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $377.44 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.061% | Hold: 3 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $377.31 | Stop: $371.65 (1.50%) | Vol: 0.00063 [LOW] | ATR: 0.00052 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $377.31 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0006 | NW: $9,988
+[RISK]  Trade recorded | PnL: +0.006% | WR(last 39): 33% | Avg W: +0.072% | Avg L: -0.119% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $377.31 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: +0.006% | Hold: 2 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $376.73 | Stop: $371.08 (1.50%) | Vol: 0.00059 [LOW] | ATR: 0.00041 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $376.73 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0006 | NW: $9,988
+[RISK]  Trade recorded | PnL: -0.041% | WR(last 40): 32% | Avg W: +0.072% | Avg L: -0.116% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $376.73 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.041% | Hold: 3 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $376.36 | Stop: $370.71 (1.50%) | Vol: 0.00052 [LOW] | ATR: 0.00044 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $376.36 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0005 | NW: $9,988
+[RISK]  Trade recorded | PnL: -0.057% | WR(last 41): 32% | Avg W: +0.072% | Avg L: -0.114% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $376.36 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.057% | Hold: 1 steps | NW: $9,988
+[RISK]  BLACK SWAN active! z=11.40 > 5.00 | Size capped to 5%
+[RISK]  OPEN LONG  | Entry: $379.88 | Stop: $374.19 (1.50%) | Vol: 0.00153 [MED] | ATR: 0.00123 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $379.88 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0015 | NW: $9,988
+[RISK]  Trade recorded | PnL: -0.005% | WR(last 42): 31% | Avg W: +0.072% | Avg L: -0.110% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $379.88 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.005% | Hold: 1 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $379.84 | Stop: $374.14 (1.50%) | Vol: 0.00167 [MED] | ATR: 0.00162 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $379.84 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0017 | NW: $9,988
+[RISK]  Trade recorded | PnL: -0.054% | WR(last 43): 30% | Avg W: +0.072% | Avg L: -0.108% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $379.84 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.054% | Hold: 1 steps | NW: $9,988
+[RISK]  OPEN SHORT | Entry: $380.58 | Stop: $386.28 (1.50%) | Vol: 0.00168 [MED] | ATR: 0.00088 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  SHORT | Entry: $380.58 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0017 | NW: $9,988
+[RISK]  Trade recorded | PnL: +0.058% | WR(last 44): 32% | Avg W: +0.071% | Avg L: -0.108% | Kelly: 2.00%
+[RISK]  CLOSE SHORT | Entry: $380.58 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE SHORT | Reason: NEUTRAL_DRIFT   | PnL: +0.058% | Hold: 1 steps | NW: $9,988
+[RISK]  OPEN SHORT | Entry: $380.40 | Stop: $386.11 (1.50%) | Vol: 0.00112 [LOW] | ATR: 0.00076 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  SHORT | Entry: $380.40 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0011 | NW: $9,988
+[RISK]  Trade recorded | PnL: -0.026% | WR(last 45): 31% | Avg W: +0.071% | Avg L: -0.105% | Kelly: 2.00%
+[RISK]  CLOSE SHORT | Entry: $380.40 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE SHORT | Reason: NEUTRAL_DRIFT   | PnL: -0.026% | Hold: 1 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $381.00 | Stop: $375.28 (1.50%) | Vol: 0.00086 [LOW] | ATR: 0.00053 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $381.00 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0009 | NW: $9,988
+[RISK]  Trade recorded | PnL: +0.057% | WR(last 46): 33% | Avg W: +0.070% | Avg L: -0.105% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $381.00 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: +0.057% | Hold: 1 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $381.44 | Stop: $375.72 (1.50%) | Vol: 0.00080 [LOW] | ATR: 0.00044 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $381.44 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0008 | NW: $9,988
+[RISK]  Trade recorded | PnL: -0.038% | WR(last 47): 32% | Avg W: +0.070% | Avg L: -0.103% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $381.44 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.038% | Hold: 2 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $381.86 | Stop: $376.13 (1.50%) | Vol: 0.00060 [LOW] | ATR: 0.00046 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $381.86 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0006 | NW: $9,988
+[RISK]  Trade recorded | PnL: -0.015% | WR(last 48): 31% | Avg W: +0.070% | Avg L: -0.101% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $381.86 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.015% | Hold: 1 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $382.86 | Stop: $377.11 (1.50%) | Vol: 0.00064 [LOW] | ATR: 0.00050 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $382.86 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0006 | NW: $9,988
+[RISK]  Trade recorded | PnL: -0.046% | WR(last 49): 31% | Avg W: +0.070% | Avg L: -0.099% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $382.86 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.046% | Hold: 1 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $381.64 | Stop: $375.92 (1.50%) | Vol: 0.00091 [LOW] | ATR: 0.00095 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $381.64 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0009 | NW: $9,988
+[RISK]  Trade recorded | PnL: +0.221% | WR(last 50): 32% | Avg W: +0.079% | Avg L: -0.099% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $381.64 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: +0.221% | Hold: 3 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $380.48 | Stop: $374.77 (1.50%) | Vol: 0.00109 [LOW] | ATR: 0.00106 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $380.48 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0011 | NW: $9,988
+[RISK]  Trade recorded | PnL: +0.054% | WR(last 50): 34% | Avg W: +0.078% | Avg L: -0.096% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $380.48 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: +0.054% | Hold: 1 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $380.44 | Stop: $374.73 (1.50%) | Vol: 0.00105 [LOW] | ATR: 0.00046 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $380.44 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0010 | NW: $9,988
+[RISK]  Trade recorded | PnL: -0.005% | WR(last 50): 34% | Avg W: +0.078% | Avg L: -0.091% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $380.44 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.005% | Hold: 5 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $379.96 | Stop: $374.26 (1.50%) | Vol: 0.00078 [LOW] | ATR: 0.00047 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $379.96 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0008 | NW: $9,988
+[RISK]  Trade recorded | PnL: -0.066% | WR(last 50): 34% | Avg W: +0.078% | Avg L: -0.091% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $379.96 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.066% | Hold: 3 steps | NW: $9,988
+[RISK]  OPEN SHORT | Entry: $379.92 | Stop: $385.62 (1.50%) | Vol: 0.00051 [LOW] | ATR: 0.00036 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  SHORT | Entry: $379.92 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0005 | NW: $9,988
+[RISK]  Trade recorded | PnL: -0.038% | WR(last 50): 34% | Avg W: +0.078% | Avg L: -0.085% | Kelly: 2.00%
+[RISK]  CLOSE SHORT | Entry: $379.92 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE SHORT | Reason: NEUTRAL_DRIFT   | PnL: -0.038% | Hold: 1 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $379.22 | Stop: $373.53 (1.50%) | Vol: 0.00051 [LOW] | ATR: 0.00032 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $379.22 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0005 | NW: $9,988
+[RISK]  Trade recorded | PnL: -0.035% | WR(last 50): 34% | Avg W: +0.078% | Avg L: -0.084% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $379.22 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.035% | Hold: 3 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $379.24 | Stop: $373.56 (1.50%) | Vol: 0.00051 [LOW] | ATR: 0.00042 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $379.24 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0005 | NW: $9,988
+[RISK]  Trade recorded | PnL: -0.125% | WR(last 50): 32% | Avg W: +0.072% | Avg L: -0.085% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $379.24 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.125% | Hold: 1 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $378.10 | Stop: $372.43 (1.50%) | Vol: 0.00083 [LOW] | ATR: 0.00093 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $378.10 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0008 | NW: $9,988
+[RISK]  Trade recorded | PnL: -0.200% | WR(last 50): 32% | Avg W: +0.072% | Avg L: -0.087% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $378.10 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.13%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.200% | Hold: 2 steps | NW: $9,987
+[RISK]  OPEN LONG  | Entry: $378.32 | Stop: $372.64 (1.50%) | Vol: 0.00104 [LOW] | ATR: 0.00092 | Kelly: 2.00% | Drawdown: 0.13%
+[SPY] OPEN  LONG  | Entry: $378.32 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0010 | NW: $9,987
+[RISK]  Trade recorded | PnL: -0.033% | WR(last 50): 32% | Avg W: +0.072% | Avg L: -0.087% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $378.32 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.13%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.033% | Hold: 11 steps | NW: $9,987
+[RISK]  OPEN LONG  | Entry: $379.50 | Stop: $373.81 (1.50%) | Vol: 0.00083 [LOW] | ATR: 0.00043 | Kelly: 2.00% | Drawdown: 0.13%
+[SPY] OPEN  LONG  | Entry: $379.50 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0008 | NW: $9,987
+[RISK]  Trade recorded | PnL: -0.013% | WR(last 50): 30% | Avg W: +0.072% | Avg L: -0.085% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $379.50 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.13%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.013% | Hold: 7 steps | NW: $9,987
+[RISK]  OPEN LONG  | Entry: $378.74 | Stop: $373.06 (1.50%) | Vol: 0.00052 [LOW] | ATR: 0.00043 | Kelly: 2.00% | Drawdown: 0.13%
+[SPY] OPEN  LONG  | Entry: $378.74 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0005 | NW: $9,987
+[RISK]  Trade recorded | PnL: +0.003% | WR(last 50): 32% | Avg W: +0.068% | Avg L: -0.083% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $378.74 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.13%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: +0.003% | Hold: 1 steps | NW: $9,987
+[RISK]  BLACK SWAN active! z=6.19 > 5.00 | Size capped to 5%
+[RISK]  OPEN LONG  | Entry: $378.82 | Stop: $373.14 (1.50%) | Vol: 0.00088 [LOW] | ATR: 0.00076 | Kelly: 2.00% | Drawdown: 0.13%
+[SPY] OPEN  LONG  | Entry: $378.82 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0009 | NW: $9,987
+[RISK]  Trade recorded | PnL: -0.030% | WR(last 50): 30% | Avg W: +0.052% | Avg L: -0.082% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $378.82 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.13%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.030% | Hold: 1 steps | NW: $9,987
+[RISK]  BLACK SWAN active! z=8.61 > 5.00 | Size capped to 5%
+[RISK]  OPEN SHORT | Entry: $372.47 | Stop: $378.06 (1.50%) | Vol: 0.00223 [MED] | ATR: 0.00217 | Kelly: 2.00% | Drawdown: 0.13%
+[SPY] OPEN  SHORT | Entry: $372.47 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0022 | NW: $9,987
+[RISK]  Trade recorded | PnL: -0.276% | WR(last 50): 28% | Avg W: +0.044% | Avg L: -0.087% | Kelly: 2.00%
+[RISK]  CLOSE SHORT | Entry: $372.47 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.13%
+[SPY] CLOSE SHORT | Reason: NEUTRAL_DRIFT   | PnL: -0.276% | Hold: 1 steps | NW: $9,987
+[RISK]  OPEN SHORT | Entry: $373.82 | Stop: $379.42 (1.50%) | Vol: 0.00251 [MED] | ATR: 0.00190 | Kelly: 2.00% | Drawdown: 0.13%
+[SPY] OPEN  SHORT | Entry: $373.82 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0025 | NW: $9,987
+[RISK]  Trade recorded | PnL: +1.071% | WR(last 50): 28% | Avg W: +0.119% | Avg L: -0.087% | Kelly: 2.00%
+[RISK]  CLOSE SHORT | Entry: $373.82 | Reason: AGENT_REVERSAL  | Drawdown at close: 0.13%
+[SPY] CLOSE SHORT | Reason: AGENT_REVERSAL  | PnL: +1.071% | Hold: 1 steps | NW: $9,989
+[RISK]  OPEN LONG  | Entry: $371.15 | Stop: $365.58 (1.50%) | Vol: 0.00316 [MED] | ATR: 0.00210 | Kelly: 2.00% | Drawdown: 0.11%
+[SPY] OPEN  LONG  | Entry: $371.15 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0032 | NW: $9,989
+[RISK]  Trade recorded | PnL: -0.364% | WR(last 50): 28% | Avg W: +0.119% | Avg L: -0.097% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $371.15 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.11%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.364% | Hold: 2 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $368.72 | Stop: $363.18 (1.50%) | Vol: 0.00245 [MED] | ATR: 0.00092 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $368.72 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0025 | NW: $9,988
+[RISK]  Trade recorded | PnL: -0.202% | WR(last 50): 26% | Avg W: +0.127% | Avg L: -0.099% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $368.72 | Reason: AGENT_REVERSAL  | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: AGENT_REVERSAL  | PnL: -0.202% | Hold: 1 steps | NW: $9,988
+[RISK]  OPEN LONG  | Entry: $368.85 | Stop: $363.32 (1.50%) | Vol: 0.00107 [LOW] | ATR: 0.00061 | Kelly: 2.00% | Drawdown: 0.12%
+[SPY] OPEN  LONG  | Entry: $368.85 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0011 | NW: $9,988
+[RISK]  Trade recorded | PnL: -0.131% | WR(last 50): 26% | Avg W: +0.127% | Avg L: -0.103% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $368.85 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.13%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.131% | Hold: 3 steps | NW: $9,987
+[RISK]  OPEN LONG  | Entry: $368.06 | Stop: $362.54 (1.50%) | Vol: 0.00089 [LOW] | ATR: 0.00058 | Kelly: 2.00% | Drawdown: 0.13%
+[SPY] OPEN  LONG  | Entry: $368.06 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0009 | NW: $9,987
+[RISK]  Trade recorded | PnL: -0.012% | WR(last 50): 26% | Avg W: +0.127% | Avg L: -0.101% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $368.06 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.13%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.012% | Hold: 3 steps | NW: $9,987
+[RISK]  OPEN LONG  | Entry: $367.27 | Stop: $361.76 (1.50%) | Vol: 0.00075 [LOW] | ATR: 0.00063 | Kelly: 2.00% | Drawdown: 0.13%
+[SPY] OPEN  LONG  | Entry: $367.27 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0008 | NW: $9,987
+[RISK]  Trade recorded | PnL: -0.139% | WR(last 50): 24% | Avg W: +0.134% | Avg L: -0.102% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $367.27 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.13%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: -0.139% | Hold: 1 steps | NW: $9,987
+[RISK]  OPEN LONG  | Entry: $369.72 | Stop: $364.18 (1.50%) | Vol: 0.00099 [LOW] | ATR: 0.00082 | Kelly: 2.00% | Drawdown: 0.13%
+[SPY] OPEN  LONG  | Entry: $369.72 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0010 | NW: $9,987
+[RISK]  Trade recorded | PnL: +0.038% | WR(last 50): 26% | Avg W: +0.127% | Avg L: -0.101% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $369.72 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.13%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: +0.038% | Hold: 3 steps | NW: $9,987
+[RISK]  OPEN LONG  | Entry: $369.58 | Stop: $364.03 (1.50%) | Vol: 0.00097 [LOW] | ATR: 0.00082 | Kelly: 2.00% | Drawdown: 0.13%
+[SPY] OPEN  LONG  | Entry: $369.58 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0010 | NW: $9,987
+[RISK]  BLACK SWAN active! z=10.31 > 5.00 | Size capped to 5%
+[RISK]  Trade recorded | PnL: +0.634% | WR(last 50): 26% | Avg W: +0.173% | Avg L: -0.101% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $369.58 | Reason: NEUTRAL_DRIFT   | Drawdown at close: 0.11%
+[SPY] CLOSE LONG | Reason: NEUTRAL_DRIFT   | PnL: +0.634% | Hold: 4 steps | NW: $9,989
+[RISK]  OPEN LONG  | Entry: $370.09 | Stop: $364.53 (1.50%) | Vol: 0.00233 [MED] | ATR: 0.00183 | Kelly: 2.00% | Drawdown: 0.11%
+[SPY] OPEN  LONG  | Entry: $370.09 | Size: 2.00% of balance | Kelly: 2.00% | Vol: 0.0023 | NW: $9,989
+[RISK]  Trade recorded | PnL: -0.180% | WR(last 50): 26% | Avg W: +0.173% | Avg L: -0.106% | Kelly: 2.00%
+[RISK]  CLOSE LONG  | Entry: $370.09 | Reason: AGENT_REVERSAL  | Drawdown at close: 0.12%
+[SPY] CLOSE LONG | Reason: AGENT_REVERSAL  | PnL: -0.180% | Hold: 1 steps | NW: $9,988
+[SPY] EPISODE END | NW: $9,988 | Growth: -0.12% | B&H: -5.80% | Alpha: +5.68% | Terminal bonus: +1.14 | Trades: 71
+
+[PPO] Update ep=1 | Steps=750 (TBPTT chunks=32) | RetMean=+0.429 RetStd=0.115 | AdvMean=-0.2819 AdvStd=0.8192 | Std=0.450 EntropyCoef=0.0200
+  [Epoch 1/4] Valid=750 | ClipFrac=35.33% | Ratio min=0.063 mean=1.158 max=7.389 | ValErr=0.4027 | HeadNorm=107.2303
