@@ -181,7 +181,9 @@ def _worker(
         # before the DDP wrap (below) and letting DDP broadcast from rank 0
         # at construction time guarantees that regardless of any local
         # nondeterminism in torch.load across ranks.
-        checkpoint = torch.load(resume, map_location=device)
+        # weights_only=True -- see main.py's matching comment (checkpoints
+        # are pickle files; arbitrary-object unpickling is RCE).
+        checkpoint = torch.load(resume, map_location=device, weights_only=True)
         actor_critic.load_state_dict(checkpoint["actor_critic"])
         start_rollout = checkpoint["rollout_idx"] + 1
         best_metric = checkpoint.get("best_metric", float("-inf"))
@@ -220,8 +222,12 @@ def _worker(
     # Only rank 0 owns the metrics writer. The writer itself routes
     # record_type="tick" records to its bounded tick log and keeps rollout
     # records in cfg.run.metrics_path, so this DDP entrypoint does not need
-    # separate tick-path or rotation arguments.
-    metrics_writer = MetricsWriter(cfg.run.metrics_path) if rank == 0 else None
+    # separate tick-path or rotation arguments. tick_max_bytes wires up
+    # cfg.run.max_tick_log_bytes -- see train.py's matching comment.
+    metrics_writer = (
+        MetricsWriter(cfg.run.metrics_path, tick_max_bytes=cfg.run.max_tick_log_bytes)
+        if rank == 0 else None
+    )
     tick_callback = (
         make_tick_callback(env, metrics_writer, state, log_every_n_ticks=cfg.run.tick_log_every_n_ticks)
         if rank == 0 else None

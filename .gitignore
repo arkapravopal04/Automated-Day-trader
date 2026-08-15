@@ -1,6 +1,12 @@
-/.env
-/__pycache__
+# --- Secrets (matches nested .env files too, e.g. Version_2/.env) ---
+**/.env
+*.env
+
+# --- Python bytecode caches ---
+__pycache__/
+*.py[cod]
+
+# --- Legacy caches / artifacts ---
 /alpaca_cache
-/models
-/legacy 
+/legacy
 /info.txt

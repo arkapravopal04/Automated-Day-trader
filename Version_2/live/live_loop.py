@@ -32,10 +32,13 @@ feature_builder's output against preprocess.py's OFFLINE output on a known
 historical window before ever pointing this at a funded account.
 """
 
+import math
 import os
 import time
+import uuid
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from datetime import date
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -43,7 +46,7 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-from live.broker_client import BrokerAPIError, BrokerClient, OrderRequest, OrderSide, OrderType
+from live.broker_client import BrokerAPIError, BrokerClient, BrokerOrderRejected, OrderRequest, OrderSide, OrderType
 from live.reconciliation import Reconciler
 
 from model.hybrid_policy import HybridPolicyHead
@@ -185,7 +188,21 @@ class LiveLoop:
 
         self.hidden = actor_critic.init_hidden(self.n_envs, self.device)
         self._step = 0
-        self._day_started = False
+
+        # Date of the most recent bar seen (UTC date of the last polled
+        # timestamp). When it changes, a new trading day has started and
+        # the kill switch's daily-loss baseline must be reset -- see
+        # _rollover_day_if_needed(). Replaces the old one-shot
+        # `_day_started` flag, which never re-armed on subsequent days.
+        self._last_bar_date: Optional[date] = None
+
+        # ticker -> open order_id for orders that did NOT fully fill on
+        # submission (limit orders usually fill 0 immediately). Canceled
+        # at the top of every cycle BEFORE fresh orders are placed, so
+        # stale resting orders can never accumulate (see
+        # _cancel_pending_orders()).
+        self._pending_orders: Dict[str, str] = {}
+
         self._total_trades = 0
 
     def step_once(self) -> None:
@@ -199,9 +216,23 @@ class LiveLoop:
         # nothing else looks wrong yet.
         report = self.reconciler.sync()
 
-        if not self._day_started:
-            self.kill_switch.start_new_day(self.portfolio.equity(mid_price.unsqueeze(1)))
-            self._day_started = True
+        # --- 2b. new trading day? reset the daily-loss baseline (checked
+        # every cycle, not just at process start -- see
+        # _rollover_day_if_needed()). Then evaluate the daily-loss limit
+        # against CURRENT marked equity, BEFORE any new exposure this
+        # cycle: kill_switch.apply() below zeroes orders the moment the
+        # halt trips, so a breach discovered here blocks this cycle's
+        # orders outright.
+        self._rollover_day_if_needed(raw_windows, mid_price)
+        equity_now = self.portfolio.equity(mid_price.unsqueeze(1))
+        self.kill_switch.check_daily_loss(equity_now)
+
+        # --- 2c. cancel any resting orders from previous cycles before
+        # deciding new ones -- stale limits must not pile up and
+        # double-fill if price moves through them (see module docstring /
+        # _cancel_pending_orders). Runs even while halted: a halted
+        # stream still needs its book cleaned up.
+        self._cancel_pending_orders()
 
         # --- 3. features + inference (deterministic -- see module docstring)
         obs = self.feature_builder(raw_windows).to(self.device)
@@ -245,6 +276,16 @@ class LiveLoop:
             final_direction = torch.zeros_like(final_direction)
             final_size = torch.zeros_like(final_size)
 
+        # --- 5b. account-level gross exposure cap (H4): every stream's
+        # Kelly/RiskManager caps assume it owns cfg.env.initial_cash, but
+        # all streams share ONE real brokerage account. Scale this cycle's
+        # orders down proportionally so projected gross exposure (existing
+        # positions + new orders) stays within
+        # max_gross_exposure_frac of the account's ACTUAL equity.
+        final_direction, final_size = self._apply_account_level_cap(
+            final_direction, final_size, mid_price, report
+        )
+
         # --- 6. submit orders for any nonzero size, update ledger optimistically
         for i, ticker in enumerate(self.tickers):
             qty = float(final_size[i].item())
@@ -278,22 +319,65 @@ class LiveLoop:
     ) -> None:
         side = OrderSide.BUY if direction > 0 else OrderSide.SELL
         tick_size = self.cfg.env.tick_size
-        limit_price = round(mid_price + direction * limit_offset_ticks * tick_size, 2)
-        order = OrderRequest(symbol=ticker, side=side, qty=qty, order_type=OrderType.LIMIT, limit_price=limit_price)
+
+        # H2 fix: align live limit pricing with execution_sim.py's
+        # semantics. In the sim (and in hybrid_policy.py's rescale), a
+        # positive limit_offset is IN THE AGENT'S FAVOR -- buy cheaper /
+        # sell richer -- i.e. a passive limit. The old code computed
+        # mid + direction * offset, which made a positive offset a
+        # marketable limit that PAYS UP to 20 ticks above mid for buys
+        # (and below for sells): the learned behavior was inverted live.
+        # Correct: limit = mid - direction * offset * tick.
+        limit_price = round(mid_price - direction * limit_offset_ticks * tick_size, 2)
+
+        # H5 fix: Alpaca only accepts WHOLE shares on limit orders
+        # (fractional fills are market-order-only), and the Kelly/risk
+        # pipeline routinely produces fractional sizes (headroom / price).
+        # Floor, never round up: rounding up could exceed the risk caps,
+        # and a sub-1-share remainder would be rejected outright.
+        qty_int = math.floor(qty)
+        if qty_int < 1:
+            return
+
+        # H6: explicit client_order_id so a lost-response retry inside
+        # broker_client._with_retries() is deduplicated broker-side
+        # instead of placing a second order.
+        order = OrderRequest(
+            symbol=ticker,
+            side=side,
+            qty=qty_int,
+            order_type=OrderType.LIMIT,
+            limit_price=limit_price,
+            client_order_id=f"ad-{uuid.uuid4().hex}",
+        )
 
         try:
             result = self.broker.submit_order(order)
+        except BrokerOrderRejected as e:
+            # Business-level rejection (bad qty, no buying power, ...):
+            # the order is NOT on the books, the connection is fine, and
+            # retrying can't make it succeed. Log and skip -- deliberately
+            # NOT a broker-error-streak event (that counter is for
+            # connectivity failures).
+            print(f"[live_loop] order for {ticker} rejected by broker: {e}")
+            return
         except BrokerAPIError:
             mask = torch.zeros(self.n_envs, dtype=torch.bool, device=self.device)
             mask[i] = True
             self.kill_switch.record_broker_error(mask)
             return
 
+        # H3: if the limit did not fill completely, park the order_id so
+        # the NEXT cycle cancels it before deciding fresh orders -- stale
+        # resting orders must never accumulate across cycles.
+        filled_qty = result.filled_qty or 0.0
+        if filled_qty < qty_int:
+            self._pending_orders[ticker] = result.order_id
+
         # Optimistic ledger update from whatever the broker reports FILLED
         # right now (a limit order may be partial or not filled at all --
         # reconciliation.py's NEXT sync() is what catches drift between this
         # optimistic update and the broker's actual settled state).
-        filled_qty = result.filled_qty or 0.0
         if filled_qty == 0.0:
             return
         signed_qty = filled_qty if direction > 0 else -filled_qty
@@ -308,6 +392,108 @@ class LiveLoop:
         fill = Fill(ticker_idx=0, qty=qty_vec, price=price_vec, commission=commission_vec)
         self.portfolio.step_apply(fill)
         self._total_trades += 1
+
+    def _rollover_day_if_needed(self, raw_windows: Dict[str, RawBarWindow], mid_price: torch.Tensor) -> None:
+        """
+        Detects a new trading day by comparing the UTC date of the latest
+        polled bar against the previous cycle's. When it changes, resets
+        the kill switch's daily-loss baseline to current equity.
+
+        UTC date is a safe proxy for the trading day here: US equity bars
+        don't exist between 21:00 UTC and 13:30 UTC, so a UTC date change
+        can only happen at a genuine overnight gap, never intraday.
+
+        Also re-arms on the very first cycle (_last_bar_date is None),
+        replacing the old one-shot `_day_started` flag.
+        """
+        latest_ts = None
+        for ticker in self.tickers:
+            timestamps = raw_windows[ticker].timestamps
+            if timestamps:
+                ts = timestamps[-1]
+                if latest_ts is None or ts > latest_ts:
+                    latest_ts = ts
+        if latest_ts is None:
+            return  # no bars at all -- _extract_mid_price() will raise anyway
+
+        current_date = latest_ts.date()
+        if self._last_bar_date == current_date:
+            return
+        self._last_bar_date = current_date
+        equity = self.portfolio.equity(mid_price.unsqueeze(1))
+        self.kill_switch.start_new_day(equity)
+        print(
+            f"[live_loop] new trading day detected ({current_date}) -- "
+            f"daily-loss baseline reset to {equity.tolist()}"
+        )
+
+    def _cancel_pending_orders(self) -> None:
+        """
+        Cancels every resting order parked in _pending_orders (any order
+        from a previous cycle that didn't fully fill on submission).
+
+        Runs at the top of every cycle, before new orders are decided, so
+        stale limits can never accumulate and double-fill if price moves
+        through them. A cancel that fails (order already filled or was
+        canceled externally) just drops the entry -- the next
+        reconciler.sync() reconciles whatever actually happened.
+        """
+        for ticker, order_id in list(self._pending_orders.items()):
+            if self.broker.cancel_order(order_id):
+                print(f"[live_loop] cancelled stale order {order_id} for {ticker}")
+            else:
+                print(
+                    f"[live_loop] order {order_id} for {ticker} no longer cancellable "
+                    "(already filled/cancelled) -- dropping from pending"
+                )
+            del self._pending_orders[ticker]
+
+    def _apply_account_level_cap(
+        self,
+        final_direction: torch.Tensor,
+        final_size: torch.Tensor,
+        mid_price: torch.Tensor,
+        report,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        H4 fix: per-stream Kelly/RiskManager caps assume every stream owns
+        cfg.env.initial_cash, but all streams share ONE real brokerage
+        account -- so 100 streams can each size against a fictitious $10k
+        and collectively blow far past the account's actual equity.
+
+        This fetches the account's REAL equity once per cycle and scales
+        this cycle's orders down proportionally so that projected gross
+        exposure (existing positions + these orders) never exceeds
+        cfg.risk.max_gross_exposure_frac of the account equity. If the
+        account-equity call fails (broker unreachable), the reconcile gate
+        already blocks orders this cycle, so we can safely skip scaling.
+        """
+        if not report.broker_reachable:
+            return final_direction, final_size
+        try:
+            account_equity = self.broker.get_account_equity()
+        except BrokerAPIError as e:
+            print(f"[live_loop] account-equity fetch failed ({e!r}) -- skipping account-level cap this cycle")
+            return final_direction, final_size
+
+        order_notional = (final_size * mid_price).sum()
+        existing_gross = self.portfolio.gross_exposure(mid_price.unsqueeze(1)).sum()
+        cap = self.cfg.risk.max_gross_exposure_frac * account_equity
+        projected = existing_gross + order_notional
+
+        if projected <= cap:
+            return final_direction, final_size
+
+        headroom = (cap - existing_gross).clamp(min=0.0)
+        scale = float((headroom / order_notional.clamp(min=1e-9)).item())
+        if scale < 1.0:
+            final_size = final_size * scale
+            print(
+                f"[live_loop] account-level cap: projected gross exposure "
+                f"${projected.item():,.2f} > ${cap:,.2f} (account equity "
+                f"${account_equity:,.2f}) -- scaled all new orders by {scale:.3f}"
+            )
+        return final_direction, final_size
 
     def _extract_mid_price(self, raw_windows: Dict[str, RawBarWindow]) -> torch.Tensor:
         prices = []

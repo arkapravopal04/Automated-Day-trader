@@ -35,6 +35,8 @@ Env var overrides:
 
 import os
 import sys
+import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
@@ -192,6 +194,48 @@ if client is None:
     )
 
 
+def _atomic_write_parquet(df: pd.DataFrame, out_path: str) -> None:
+    """Write a parquet file atomically (temp file + os.replace) so a crash
+    mid-write can never leave a corrupted cache -- same pattern
+    preprocess.py's _atomic_write_parquet uses. A stray temp file on
+    failure is harmless; a half-written out_path is not."""
+    out_dir = os.path.dirname(out_path)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".parquet", dir=out_dir)
+    os.close(fd)
+    try:
+        df.to_parquet(tmp_path, engine="pyarrow")
+        os.replace(tmp_path, out_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
+def _fetch_bars_with_retry(client, request_params, retries: int = 3, base_delay: float = 1.0):
+    """
+    Retries TRANSIENT failures (network blips, 429 rate limits, 5xx) with
+    exponential backoff so a single hiccup doesn't silently leave a
+    permanent gap in the cache. Non-transient errors (bad symbol, auth)
+    propagate immediately -- retrying those cannot help.
+    """
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return client.get_stock_bars(request_params)
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            transient = (
+                isinstance(exc, (ConnectionError, TimeoutError))
+                or (status is not None and (status == 429 or status >= 500))
+            )
+            if not transient:
+                raise
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(base_delay * (2 ** attempt))
+    raise last_exc
+
+
 def fetch_incremental_data(ticker: str, end_date: datetime) -> None:
     """Fetch and cache 5-minute bars for one ticker up to ``end_date``.
 
@@ -266,7 +310,7 @@ def fetch_incremental_data(ticker: str, end_date: datetime) -> None:
 
     try:
         try:
-            bars = client.get_stock_bars(request_params)
+            bars = _fetch_bars_with_retry(client, request_params)
         except Exception as exc:
             if feed == "sip" and "subscription does not permit" in str(exc):
                 print(
@@ -274,7 +318,7 @@ def fetch_incremental_data(ticker: str, end_date: datetime) -> None:
                     "retrying with IEX feed..."
                 )
                 request_params.feed = "iex"
-                bars = client.get_stock_bars(request_params)
+                bars = _fetch_bars_with_retry(client, request_params)
             else:
                 raise
 
@@ -295,7 +339,8 @@ def fetch_incremental_data(ticker: str, end_date: datetime) -> None:
             combined_df = new_df
 
         combined_df = combined_df.sort_index()
-        combined_df.to_parquet(file_path, engine="pyarrow")
+        # Atomic write -- a crash mid-`to_parquet` must never corrupt the cache.
+        _atomic_write_parquet(combined_df, file_path)
         print(
             f"  └─ Saved updated total of {len(combined_df)} 5-min candles "
             f"to {file_path}"

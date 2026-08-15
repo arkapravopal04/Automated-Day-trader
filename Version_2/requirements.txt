@@ -1,3 +1,17 @@
-alpaca-py
-python-dotenv
-rich
+# Core ML / data stack (versions verified against this project's
+# known-good local environment -- see the audit notes)
+torch~=2.10.0
+numpy~=2.3.3
+pandas~=2.3.2
+pyarrow~=24.0.0
+matplotlib~=3.10.6
+
+# Broker / data API
+alpaca-py~=0.43.4
+
+# Runtime plumbing
+python-dotenv~=1.2.2
+rich~=14.3.3
+
+# Optional (dashboard falls back to plain HTML/IPython output without it):
+# ipywidgets~=8.0

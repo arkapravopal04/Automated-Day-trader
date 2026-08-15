@@ -25,6 +25,7 @@ the actual paper endpoint before trusting this against real capital.
 import enum
 import os
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -54,6 +55,25 @@ class BrokerAPIError(Exception):
     """
 
 
+class BrokerOrderRejected(Exception):
+    """
+    Raised when the broker definitively REJECTS an order (a 4xx response:
+    invalid qty, insufficient buying power, unknown symbol, bad limit
+    price, ...). Distinct from BrokerAPIError on purpose:
+
+      - BrokerAPIError  -> transport/5xx trouble; retryable, and feeds
+                           the kill switch's broker-error streak.
+      - BrokerOrderRejected -> a business-level "no" from the broker;
+                           retrying cannot make it succeed and would just
+                           burn API calls (or, worse, double-submit if the
+                           first attempt actually landed server-side).
+
+    Callers should log the rejection and skip the order for that cycle --
+    NOT feed it to the broker-error-streak counter, since the connection
+    is fine and the rejection carries real information.
+    """
+
+
 @dataclass
 class OrderRequest:
     symbol: str
@@ -62,6 +82,7 @@ class OrderRequest:
     order_type: OrderType = OrderType.MARKET
     limit_price: Optional[float] = None
     time_in_force: str = "day"
+    client_order_id: Optional[str] = None
 
 
 @dataclass
@@ -153,16 +174,39 @@ class AlpacaBrokerClient(BrokerClient):
         side = AlpacaOrderSide.BUY if request.side == OrderSide.BUY else AlpacaOrderSide.SELL
         tif = AlpacaTimeInForce.DAY
 
+        # Same client_order_id on every retry attempt: if attempt N actually
+        # landed server-side but the response was lost, the retry is
+        # deduplicated by the broker instead of placing a second order.
+        client_order_id = request.client_order_id or f"ad-{uuid.uuid4().hex}"
+
         if request.order_type == OrderType.MARKET:
-            order_req = MarketOrderRequest(symbol=request.symbol, qty=request.qty, side=side, time_in_force=tif)
+            order_req = MarketOrderRequest(
+                symbol=request.symbol, qty=request.qty, side=side,
+                time_in_force=tif, client_order_id=client_order_id,
+            )
         else:
             if request.limit_price is None:
                 raise ValueError("limit_price is required for a LIMIT order")
             order_req = LimitOrderRequest(
-                symbol=request.symbol, qty=request.qty, side=side, time_in_force=tif, limit_price=request.limit_price
+                symbol=request.symbol, qty=request.qty, side=side,
+                time_in_force=tif, limit_price=request.limit_price,
+                client_order_id=client_order_id,
             )
 
-        order = _with_retries(lambda: self._client.submit_order(order_req), max_retries=self.max_retries)
+        def _submit():
+            try:
+                return self._client.submit_order(order_req)
+            except APIError as e:
+                status = getattr(e, "status_code", None)
+                if status is not None and 400 <= status < 500:
+                    # Business-level rejection (bad qty, no buying power, ...).
+                    # NOT retryable -- see BrokerOrderRejected's docstring.
+                    raise BrokerOrderRejected(
+                        f"order rejected by broker (status {status}): {e}"
+                    ) from e
+                raise
+
+        order = _with_retries(_submit, max_retries=self.max_retries)
         return _to_order_result(order)
 
     def cancel_order(self, order_id: str) -> bool:

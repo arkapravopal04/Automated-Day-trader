@@ -224,6 +224,29 @@ class VecTradingEnv:
         # in preprocess.py as annualized realized vol) instead of recomputing
         self._rv_feature_idx = self.feature_names.index("rv") if "rv" in self.feature_names else None
 
+        # REWARD-NORMALIZATION FIX: the 'rv' feature stored in
+        # *_features.parquet is a per-ticker Z-SCORE (preprocess.py
+        # normalizes every feature with train-split mean/std), not raw
+        # annualized vol. Dividing the step reward by the raw z-score
+        # (clamped to 1e-4) meant that whenever realized vol sat near its
+        # historical mean -- the common case -- the denominator collapsed
+        # to ~1e-4 and the step reward exploded by ~4 orders of magnitude.
+        # Denormalize back to raw vol using metadata.json's per-ticker
+        # constants. 'rv' is a magnitude feature, never sign-flipped by
+        # mirroring, so this is mirror-safe.
+        self._rv_norm_mean: Optional[Tensor] = None
+        self._rv_norm_std: Optional[Tensor] = None
+        if self._rv_feature_idx is not None:
+            constants = dataset.metadata["norm_constants"]
+            self._rv_norm_mean = torch.tensor(
+                [constants[t]["mean"]["rv"] for t in self.tickers],
+                device=self.device, dtype=torch.float32,
+            )
+            self._rv_norm_std = torch.tensor(
+                [constants[t]["std"]["rv"] for t in self.tickers],
+                device=self.device, dtype=torch.float32,
+            )
+
         self.current_idx = 0
         self.max_idx = len(self.dataset) - 1
         self.benchmark_start_price = None
@@ -451,9 +474,13 @@ class VecTradingEnv:
 
     def _vol_normalized_step_reward(self, step_pnl: Tensor, equity_before: Tensor, next_obs: Tensor) -> Tensor:
         """position_bar_return / current_atr, using the dataset's 'rv' feature as the vol proxy when available."""
-        if self._rv_feature_idx is not None:
-            # next_obs: [n_envs, window, features] -> take last timestep's rv feature per stream
-            current_vol = next_obs[:, -1, self._rv_feature_idx].abs().clamp(min=1e-4)
+        if self._rv_feature_idx is not None and self._rv_norm_std is not None:
+            # next_obs: [n_envs, window, features] -> take last timestep's rv
+            # feature per stream, DENORMALIZED back to raw annualized vol
+            # (see __init__'s REWARD-NORMALIZATION FIX comment).
+            rv_z = next_obs[:, -1, self._rv_feature_idx]
+            raw_rv = (rv_z * self._rv_norm_std + self._rv_norm_mean).abs().clamp(min=1e-4)
+            current_vol = raw_rv
         else:
             current_vol = torch.full_like(step_pnl, 1.0)
         return self.r_step_scale * (step_pnl / (equity_before.clamp(min=1e-6) * current_vol))

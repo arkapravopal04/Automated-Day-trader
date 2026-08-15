@@ -121,7 +121,15 @@ class MultiTickerRolloutDataset(Dataset):
         
         # Handle misaligned market schedules (e.g. trading halts for a specific asset)
         # Forward fill the previous known value. For unfillable NaNs at the start, use 0.
-        master_df = master_df.ffill().fillna(0)
+        #
+        # M3 fix: leading (pre-listing) NaNs are BACKWARD-filled, not
+        # zeroed, to stay consistent with vec_trading_env.py's price loader
+        # (load_aligned_close_prices uses ffill().bfill()). Before this fix
+        # a late-starting ticker (COIN, SQ, PANW, ...) showed the model
+        # zeroed features against a flat bfill'd price line -- a signal the
+        # model was never trained on. Both sides now describe "the ticker's
+        # first real state, repeated" during the pre-listing window.
+        master_df = master_df.ffill().bfill().fillna(0)
         
         T = len(master_df)
         F = len(self.feature_names)
