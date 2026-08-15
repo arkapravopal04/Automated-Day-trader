@@ -205,12 +205,100 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--kaggle", action="store_true", help="Force Kaggle-safe paths/checkpointing.")
     parser.add_argument("--local", action="store_true", help="Force local paths/checkpointing.")
     parser.add_argument("--total-rollouts", type=int, default=None, help="Override cfg.run.total_rollouts.")
-    parser.add_argument("--resume", type=str, default=None, help="Path to a checkpoint to resume from.")
+    parser.add_argument(
+        "--resume", type=str, default=None,
+        help="Checkpoint path to resume from, or 'latest' (highest checkpoint_N.pt) / "
+             "'best' (checkpoint_best.pt). Mutually exclusive with --fresh.",
+    )
+    parser.add_argument(
+        "--fresh", action="store_true",
+        help="Force a cold start from random weights: deletes any existing *.pt in the "
+             "checkpoint dir first. Mutually exclusive with --resume. If NEITHER --resume "
+             "nor --fresh is given and checkpoints exist, training refuses to start rather "
+             "than guess (pass --resume latest to continue, or --fresh to reset).",
+    )
     parser.add_argument(
         "--tick-log-every-n-ticks", type=int, default=None,
         help="Override cfg.run.tick_log_every_n_ticks. 1 = log every env-step (max dashboard resolution).",
     )
     return parser.parse_args(argv)
+
+
+def _list_checkpoints(checkpoint_dir: str) -> List[str]:
+    """*.pt files in checkpoint_dir, sorted by name (rollout-index order for checkpoint_N.pt)."""
+    if not os.path.isdir(checkpoint_dir):
+        return []
+    return sorted(f for f in os.listdir(checkpoint_dir) if f.endswith(".pt"))
+
+
+def _resolve_checkpoint_alias(alias: str, checkpoint_dir: str) -> Optional[str]:
+    """Resolve 'latest' / 'best' to a concrete checkpoint path, or None."""
+    if alias == "best":
+        path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
+        return path if os.path.exists(path) else None
+    # 'latest': highest rollout index among checkpoint_<N>.pt
+    best_file, best_idx = None, -1
+    for fname in _list_checkpoints(checkpoint_dir):
+        if fname.startswith("checkpoint_") and fname.endswith(".pt"):
+            try:
+                idx = int(fname[len("checkpoint_"):-3])
+            except ValueError:
+                continue
+            if idx > best_idx:
+                best_idx, best_file = idx, fname
+    return os.path.join(checkpoint_dir, best_file) if best_file is not None else None
+
+
+def _clean_checkpoint_dir(checkpoint_dir: str) -> None:
+    """Delete every *.pt in checkpoint_dir -- used ONLY by an explicit --fresh."""
+    removed = []
+    for fname in _list_checkpoints(checkpoint_dir):
+        os.remove(os.path.join(checkpoint_dir, fname))
+        removed.append(fname)
+    if removed:
+        print(f"[train] --fresh: deleted existing checkpoint(s): {', '.join(removed)}")
+
+
+def resolve_resume_path(
+    resume_arg: Optional[str],
+    checkpoint_dir: str,
+    fresh: bool,
+) -> Optional[str]:
+    """
+    Decides, ONCE, whether this run continues from a checkpoint or starts
+    fresh -- the user's explicit choice, never a silent default:
+
+      --resume <path>     -> that exact checkpoint (must exist)
+      --resume latest     -> highest checkpoint_<N>.pt in checkpoint_dir
+      --resume best       -> checkpoint_best.pt in checkpoint_dir
+      --fresh             -> cold reset (random weights); deletes existing *.pt
+      neither, no ckpts   -> fresh start (first run -- fine)
+      neither, ckpts exist -> RuntimeError: refuse to guess
+
+    Returns the concrete path to load, or None for a fresh start.
+    """
+    if resume_arg is not None and fresh:
+        raise RuntimeError("--resume and --fresh are mutually exclusive -- pick one.")
+    if resume_arg is None:
+        existing = _list_checkpoints(checkpoint_dir)
+        if not existing:
+            return None
+        if fresh:
+            _clean_checkpoint_dir(checkpoint_dir)
+            return None
+        raise RuntimeError(
+            f"checkpoints found in {checkpoint_dir}: {', '.join(existing)}. "
+            "Refusing to guess what you want: pass --resume <path|latest|best> to "
+            "continue, or --fresh to reset to random weights."
+        )
+    if resume_arg in ("latest", "best"):
+        resolved = _resolve_checkpoint_alias(resume_arg, checkpoint_dir)
+        if resolved is None:
+            raise RuntimeError(f"--resume {resume_arg}: no matching checkpoint in {checkpoint_dir}.")
+        return resolved
+    if not os.path.exists(resume_arg):
+        raise RuntimeError(f"--resume: checkpoint not found: {resume_arg}")
+    return resume_arg
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -230,6 +318,13 @@ def main(argv: Optional[List[str]] = None) -> None:
     torch.manual_seed(cfg.run.seed)
 
     os.makedirs(cfg.run.checkpoint_dir, exist_ok=True)
+
+    # Explicit continue-vs-reset decision (--resume / --fresh / refuse-to-guess).
+    resume_path = resolve_resume_path(args.resume, cfg.run.checkpoint_dir, args.fresh)
+    if resume_path is not None:
+        print(f"[train] resuming from {resume_path}")
+    else:
+        print("[train] fresh start (random weights)")
 
     train_dataset = MultiTickerRolloutDataset(
         window_size=cfg.env.window_size,
@@ -268,10 +363,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     ema_reward = None
     state = _TickState(n_envs=env.n_envs)
 
-    if args.resume is not None:
+    if resume_path is not None:
         # weights_only=True -- see main.py's matching comment (checkpoints
         # are pickle files; arbitrary-object unpickling is RCE).
-        checkpoint = torch.load(args.resume, map_location=device, weights_only=True)
+        checkpoint = torch.load(resume_path, map_location=device, weights_only=True)
         actor_critic.load_state_dict(checkpoint["actor_critic"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         start_rollout = checkpoint["rollout_idx"] + 1
@@ -282,7 +377,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         saved_total = checkpoint.get("total_trades_per_ticker", None)
         if isinstance(saved_total, list) and len(saved_total) == env.n_envs:
             state.total_trades_per_ticker = saved_total
-        print(f"[train] resumed from {args.resume} at rollout {start_rollout} "
+        print(f"[train] resumed from {resume_path} at rollout {start_rollout} "
               f"(global_tick={state.global_tick}, episode={state.episode_idx}, "
               f"best_metric so far: {best_metric if best_metric != float('-inf') else 'none yet'})")
     kelly_sizer, risk_manager, kill_switch = build_risk_pipeline(cfg, env.n_envs, device)
@@ -310,7 +405,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     # off makes every scaler method a no-op, so this is safe to always
     # construct and pass regardless of the flag.
     scaler = torch.cuda.amp.GradScaler(enabled=cfg.run.use_amp)
-    if args.resume is not None and "scaler" in checkpoint:
+    if resume_path is not None and "scaler" in checkpoint:
         scaler.load_state_dict(checkpoint["scaler"])
 
     obs = env.reset()

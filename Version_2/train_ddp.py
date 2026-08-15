@@ -80,7 +80,13 @@ from model.dual_critic import DualCriticHead  # noqa: E402
 
 from monitoring.dashboard import MetricsWriter  # noqa: E402
 
-from train import build_risk_pipeline, _TickState, make_tick_callback  # noqa: E402 -- reuse, don't duplicate
+from train import (  # noqa: E402 -- reuse, don't duplicate
+    build_risk_pipeline,
+    _TickState,
+    make_tick_callback,
+    resolve_resume_path,
+    _clean_checkpoint_dir,
+)
 
 
 def ddp_available() -> bool:
@@ -131,6 +137,7 @@ def _worker(
     world_size: int,
     total_rollouts: Optional[int],
     resume: Optional[str],
+    fresh: bool,
     checkpoint_dir: Optional[str] = None,
     metrics_path: Optional[str] = None,
     checkpoint_every_n_rollouts: Optional[int] = None,
@@ -162,7 +169,20 @@ def _worker(
         cfg.run.checkpoint_dir = "/kaggle/working/checkpoints"
     if rank == 0:
         os.makedirs(cfg.run.checkpoint_dir, exist_ok=True)
+        if fresh:
+            # Explicit cold reset -- only rank 0 touches the filesystem.
+            _clean_checkpoint_dir(cfg.run.checkpoint_dir)
     dist.barrier()  # rank > 0 must not race ahead of rank 0's mkdir
+
+    # Explicit continue-vs-reset decision (--resume / --fresh / refuse-to-guess).
+    # Deterministic on every rank (same dir, same rules) so the two GPUs
+    # always agree on the starting weights.
+    resume_path = resolve_resume_path(resume, cfg.run.checkpoint_dir, fresh)
+    if resume_path is not None:
+        if rank == 0:
+            print(f"[train_ddp] resuming from {resume_path}")
+    elif rank == 0:
+        print("[train_ddp] fresh start (random weights)")
 
     env = _build_env(cfg, device)
     actor_critic = HybridActorCritic(n_features=len(env.feature_names), cfg=cfg).to(device)
@@ -175,7 +195,7 @@ def _worker(
     # what a "tick" record looks like.
     state = _TickState(n_envs=env.n_envs)
     checkpoint = None
-    if resume is not None:
+    if resume_path is not None:
         # Every rank loads the SAME checkpoint onto ITS OWN device. DDP
         # requires byte-identical starting weights on every replica; loading
         # before the DDP wrap (below) and letting DDP broadcast from rank 0
@@ -183,7 +203,7 @@ def _worker(
         # nondeterminism in torch.load across ranks.
         # weights_only=True -- see main.py's matching comment (checkpoints
         # are pickle files; arbitrary-object unpickling is RCE).
-        checkpoint = torch.load(resume, map_location=device, weights_only=True)
+        checkpoint = torch.load(resume_path, map_location=device, weights_only=True)
         actor_critic.load_state_dict(checkpoint["actor_critic"])
         start_rollout = checkpoint["rollout_idx"] + 1
         best_metric = checkpoint.get("best_metric", float("-inf"))
@@ -194,7 +214,7 @@ def _worker(
         if isinstance(saved_per_ticker, list) and len(saved_per_ticker) == env.n_envs:
             state.total_trades_per_ticker = saved_per_ticker
         if rank == 0:
-            print(f"[train_ddp] resumed from {resume} at rollout {start_rollout} "
+            print(f"[train_ddp] resumed from {resume_path} at rollout {start_rollout} "
                   f"(global_tick={state.global_tick}, episode={state.episode_idx}, "
                   f"best_metric so far: {best_metric if best_metric != float('-inf') else 'none yet'})")
 
@@ -464,6 +484,7 @@ def _ddp_ppo_update(
 def launch_ddp_training(
     total_rollouts: Optional[int] = None,
     resume: Optional[str] = None,
+    fresh: bool = False,
     checkpoint_dir: Optional[str] = None,
     metrics_path: Optional[str] = None,
     checkpoint_every_n_rollouts: Optional[int] = None,
@@ -492,6 +513,8 @@ def launch_ddp_training(
             argv += ["--total-rollouts", str(total_rollouts)]
         if resume is not None:
             argv += ["--resume", resume]
+        if fresh:
+            argv += ["--fresh"]
         if tick_log_every_n_ticks is not None:
             argv += ["--tick-log-every-n-ticks", str(tick_log_every_n_ticks)]
         # train.py's own argparse doesn't expose checkpoint_dir/metrics_path
@@ -505,7 +528,7 @@ def launch_ddp_training(
     print(f"[train_ddp] launching {world_size} DDP workers (dual-T4 Kaggle path)")
     mp.spawn(
         _worker,
-        args=(world_size, total_rollouts, resume, checkpoint_dir, metrics_path,
+        args=(world_size, total_rollouts, resume, fresh, checkpoint_dir, metrics_path,
               checkpoint_every_n_rollouts, log_every_n_rollouts, tick_log_every_n_ticks),
         nprocs=world_size,
         join=True,
@@ -515,7 +538,18 @@ def launch_ddp_training(
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Dual-GPU DDP entrypoint (Kaggle 2xT4).")
     parser.add_argument("--total-rollouts", type=int, default=None)
-    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument(
+        "--resume", type=str, default=None,
+        help="Checkpoint path to resume from, or 'latest' (highest checkpoint_N.pt) / "
+             "'best' (checkpoint_best.pt). Mutually exclusive with --fresh.",
+    )
+    parser.add_argument(
+        "--fresh", action="store_true",
+        help="Force a cold start from random weights: deletes any existing *.pt in the "
+             "checkpoint dir first. Mutually exclusive with --resume. If NEITHER --resume "
+             "nor --fresh is given and checkpoints exist, training refuses to start rather "
+             "than guess (pass --resume latest to continue, or --fresh to reset).",
+    )
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--metrics-path", type=str, default=None)
     parser.add_argument("--checkpoint-every-n-rollouts", type=int, default=None)
@@ -532,6 +566,7 @@ if __name__ == "__main__":
     launch_ddp_training(
         total_rollouts=args.total_rollouts,
         resume=args.resume,
+        fresh=args.fresh,
         checkpoint_dir=args.checkpoint_dir,
         metrics_path=args.metrics_path,
         checkpoint_every_n_rollouts=args.checkpoint_every_n_rollouts,

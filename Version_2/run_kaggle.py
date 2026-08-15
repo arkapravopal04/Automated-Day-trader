@@ -126,7 +126,7 @@ def stage_diagnostics() -> None:
     run_python("diagnostics_gpu_and_learning.py", check=False)
 
 
-def stage_train(total_rollouts: int, resume: str, force_single: bool) -> None:
+def stage_train(total_rollouts: int, resume: str, fresh: bool, force_single: bool) -> None:
     import torch
 
     use_ddp = (not force_single) and torch.cuda.is_available() and torch.cuda.device_count() >= 2
@@ -134,6 +134,8 @@ def stage_train(total_rollouts: int, resume: str, force_single: bool) -> None:
     args = ["--total-rollouts", str(total_rollouts)]
     if resume:
         args += ["--resume", resume]
+    if fresh:
+        args += ["--fresh"]
     run_python(script, *args)
 
 
@@ -211,7 +213,17 @@ def parse_args(argv=None):
     p.add_argument("--quick", action="store_true",
                    help="diagnostics + train with --total-rollouts 100 (data must already exist)")
     p.add_argument("--total-rollouts", type=int, default=100)
-    p.add_argument("--resume", type=str, default=None, help="checkpoint path to resume from")
+    p.add_argument(
+        "--resume", type=str, default=None,
+        help="checkpoint path to resume from, or 'latest' / 'best' (see train.py). "
+             "Mutually exclusive with --fresh.",
+    )
+    p.add_argument(
+        "--fresh", action="store_true",
+        help="cold reset: start from random weights and delete existing checkpoints. "
+             "Mutually exclusive with --resume. Without either, training refuses to "
+             "start if checkpoints already exist.",
+    )
     p.add_argument("--no-install", action="store_true", help="skip pip install of requirements.txt")
     p.add_argument("--no-ddp", action="store_true", help="force single-GPU train.py even on 2 GPUs")
     return p.parse_args(argv)
@@ -246,7 +258,7 @@ def main(argv=None):
     if args.diagnostics:
         stage_diagnostics()
     if args.train:
-        stage_train(args.total_rollouts, args.resume, args.no_ddp)
+        stage_train(args.total_rollouts, args.resume, args.fresh, args.no_ddp)
 
     print_summary()
 
