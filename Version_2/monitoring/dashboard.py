@@ -9,25 +9,30 @@ against Kaggle's own stdout buffering and corrupted the display. Live() is
 still only ever constructed with auto_refresh=False here, refreshed by an
 explicit .refresh() tied to the same cadence as everything else.
 
-v2 threaded-notebook bug (fixed in this revision): IPython's
-display(display_id=...) / update_display() pairing is NOT guaranteed to
-target the right output cell when called from a background polling thread
--- in practice on Kaggle this showed up as "the dashboard just keeps
-printing itself again" instead of updating in place, because the comm
-message from a background thread doesn't reliably land against the cell
-that's still executing. The fix: when ipywidgets is available, render into
-a persistent `ipywidgets.Output` widget and .clear_output(wait=True) inside
-it every frame -- Output widgets are explicitly designed to capture output
-from any thread and route it to the right place, which display_id/
-update_display are not. Falls back to IPython.display.clear_output(wait=True)
-+ display() (still same-cell in-place, just without the widget) if
-ipywidgets isn't installed, and to Rich's Live() outside any notebook.
+v2 threaded-notebook bug (fixed): IPython's display(display_id=...) /
+update_display() pairing is NOT guaranteed to target the right output cell
+when called from a background polling thread. The fix: when ipywidgets is
+available, render into a persistent `ipywidgets.Output` widget and
+.clear_output(wait=True) inside it every frame. Falls back to
+IPython.display.clear_output(wait=True) + display() outside a notebook,
+and to Rich's Live() on a real TTY.
+
+v3 (layout redesign): the old layout buried the things you actually care
+about under walls of numbers -- ~100 per-ticker rows, an unreadable market
+tape, reward displayed as dollars, a dead "Sharpe" line, and an entropy
+line that never rendered (training emits entropy_discrete/continuous, not
+entropy). The new layout is six clear sections:
+    1. Run Status   -- health, step/rollout/episode, throughput, data age
+    2. Alerts       -- halted / bankrupt / deep-drawdown streams, or "none"
+    3. Training     -- reward, EMA, entropy (both heads), losses, KL, grad
+    4. Portfolio    -- aggregate net worth + context, spotlight top/bottom
+    5. Market       -- compact grid of all symbols + movers + up/down counts
+    6. Recent Fills -- last few fills, oldest -> newest
 
 Decoupling (unchanged): the training loop NEVER renders anything and NEVER
-imports Rich. It only calls MetricsWriter.log(step, **metrics) every N
-steps, appending one JSON line to a flat file. Whether a dashboard is
-watching that file, crashed, or was never started has zero effect on
-training.
+imports Rich. It only calls MetricsWriter.log(step, **metrics), appending
+one JSON line to a flat file. Whether a dashboard is watching that file,
+crashed, or was never started has zero effect on training.
 
 JSONL over SQLite, on purpose: no file-locking to get wrong on a
 containerized/network-mounted filesystem -- a half-written last line just
@@ -186,7 +191,6 @@ class MetricsWriter:
         self.close()
 
 
-
 def _json_default(obj: Any) -> Any:
     item = getattr(obj, "item", None)
     if callable(item):
@@ -308,7 +312,6 @@ class MetricsReader:
         return [record for _, record in merged]
 
 
-
 # --------------------------------------------------------------------------
 # Display mode
 # --------------------------------------------------------------------------
@@ -350,9 +353,13 @@ def resolve_mode(cfg_display_mode: str = "auto", argv: Optional[List[str]] = Non
 # --------------------------------------------------------------------------
 
 _SPINNER_FRAMES = ["⠷", "⠯", "⠟", "⠿", "⡿", "⢿", "⣻", "⣾"]
-_MAX_TRADE_EVENTS = 12
-_MAX_PORTFOLIO_ROWS = 30
-_GRID_THRESHOLD = 20
+_MAX_TRADE_EVENTS = 8          # fills shown in section 6
+_SPOTLIGHT_ROWS = 10           # top/bottom rows in the portfolio spotlight
+_GRID_THRESHOLD = 20           # tickers beyond this get the compact grid
+_MOVERS_COUNT = 3              # biggest movers shown in the market section
+_DD_ALERT_FRAC = 0.25          # per-stream drawdown that raises an alert
+_HEALTH_LIVE_S = 10
+_HEALTH_STALE_S = 30
 
 
 # --------------------------------------------------------------------------
@@ -382,18 +389,25 @@ def _number(value: Any) -> Optional[float]:
 def _fmt(value: Any, pct: bool = False) -> str:
     if value is None:
         return "—"
-
     number = _number(value)
     if number is None:
         return str(value)
-
     return f"{number:.2%}" if pct else f"{number:.4f}"
+
+
+def _fmt_signed(value: Any, decimals: int = 6) -> str:
+    """Signed plain number -- for reward/EMA-style scalars, NOT money."""
+    if value is None:
+        return "—"
+    number = _number(value)
+    if number is None:
+        return str(value)
+    return f"{number:+,.{decimals}f}"
 
 
 def _fmt_int(value: Any) -> str:
     if value is None:
         return "—"
-
     try:
         return str(int(value))
     except (TypeError, ValueError):
@@ -404,7 +418,6 @@ def _fmt_money(value: Any, signed: bool = False) -> str:
     number = _number(value)
     if number is None:
         return "—"
-
     if signed:
         return f"${number:+,.2f}"
     return f"${number:,.2f}"
@@ -419,11 +432,9 @@ def _colored_money(
     number = _number(value)
     if number is None:
         return "—"
-
     color = explicit_color
     if color is None:
         color = "bright_green" if number >= 0 else "bright_red"
-
     return f"[{color}]{_fmt_money(number, signed=signed)}[/{color}]"
 
 
@@ -431,12 +442,10 @@ def _colored_pct(value: Any, *, lower_is_better: bool = False) -> str:
     number = _number(value)
     if number is None:
         return "—"
-
     if lower_is_better:
         color = "bright_green" if number <= 0.10 else "bright_red"
     else:
         color = "bright_green" if number >= 0 else "bright_red"
-
     return f"[{color}]{number:.2%}[/{color}]"
 
 
@@ -452,12 +461,14 @@ class TrainingDashboard:
     """
     Human-readable live view of the training process.
 
-    Design goals:
-      1. Answer "is training alive?" immediately.
-      2. Separate training statistics from portfolio statistics.
-      3. Make risk and failures obvious.
-      4. Keep live market information compact.
-      5. Avoid duplicate or ambiguous labels.
+    Design goals (v3):
+      1. Answer "is training alive?" in one glance (Run Status panel).
+      2. Make risk impossible to miss (dedicated Alerts panel, not a badge
+         buried in a table).
+      3. Show aggregates and spotlights, not 100 rows of numbers.
+      4. Keep market information compact (grid + movers, no giant tape).
+      5. Never display a scalar as the wrong kind of thing (reward is a
+         dimensionless number, not dollars).
 
     The training process remains completely decoupled from rendering. The
     dashboard only reads JSONL files through MetricsReader.
@@ -679,7 +690,7 @@ class TrainingDashboard:
             self.stop()
 
     # ------------------------------------------------------------------
-    # Main layout
+    # Main layout -- six clear sections, aggregates over walls of numbers
     # ------------------------------------------------------------------
 
     def _build_renderable(
@@ -696,32 +707,19 @@ class TrainingDashboard:
             if record.get("record_type") == "tick"
         ]
 
-        status = self._build_status_panel(
-            tick_record,
-            rollout_record,
-            tick_history,
-            now,
-            is_new_step,
-        )
-
-        performance = self._build_performance_panel(rollout_record)
-        portfolio, rows = self._build_portfolio_panel(tick_record)
-
-        market = self._build_market_panel(rows)
-        trades = self._build_trade_tape(tick_history)
-        environment = self._build_environment_view(rows, tick_record)
+        rows = self._compute_per_ticker_rows(tick_record)
 
         return Group(
-            status,
-            performance,
-            portfolio,
-            market,
-            trades,
-            environment,
+            self._build_status_panel(tick_record, rollout_record, tick_history, now, is_new_step, rows),
+            self._build_alerts_panel(rows),
+            self._build_training_panel(rollout_record),
+            self._build_portfolio_panel(tick_record, rows),
+            self._build_market_panel(rows),
+            self._build_fills_panel(tick_history),
         )
 
     # ------------------------------------------------------------------
-    # Section 1: system/training status
+    # Section 1: run status -- is training alive, and at what pace
     # ------------------------------------------------------------------
 
     def _build_status_panel(
@@ -731,19 +729,17 @@ class TrainingDashboard:
         tick_history: List[Dict[str, Any]],
         now: float,
         is_new_step: bool,
+        rows: List[Dict[str, Any]],
     ) -> Panel:
         latest_wall_time = _number(tick.get("wall_time")) or now
         age = max(0, now - latest_wall_time)
 
-        if age < 10:
-            health = "LIVE"
-            health_style = "bold white on green"
-        elif age < 30:
-            health = "STALE"
-            health_style = "bold black on yellow"
+        if age < _HEALTH_LIVE_S:
+            health, health_style = "LIVE", "bold white on green"
+        elif age < _HEALTH_STALE_S:
+            health, health_style = "STALE", "bold black on yellow"
         else:
-            health = "STOPPED?"
-            health_style = "bold white on red"
+            health, health_style = "STOPPED?", "bold white on red"
 
         spinner = (
             _SPINNER_FRAMES[self._frame_count % len(_SPINNER_FRAMES)]
@@ -757,97 +753,156 @@ class TrainingDashboard:
         tickers = tick.get("tickers")
         ticker_count = len(tickers) if isinstance(tickers, list) else 0
 
-        halted = tick.get("halted")
-        halted_count = (
-            sum(bool(item) for item in halted)
-            if isinstance(halted, list)
-            else 0
+        halted_count = sum(1 for row in rows if row["is_halted"])
+        bankrupt_count = sum(1 for row in rows if row["is_bankrupt"])
+
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column(justify="left")
+        grid.add_column(justify="right")
+        grid.add_column(justify="left")
+        grid.add_column(justify="right")
+
+        grid.add_row(
+            "[bold]Step[/bold]", _fmt_int(tick.get("step")),
+            "[bold]Rollout[/bold]", _fmt_int(rollout.get("rollout", rollout.get("step"))),
+        )
+        grid.add_row(
+            "[bold]Episode[/bold]", _fmt_int(rollout.get("episode")),
+            "[bold]Symbols[/bold]", str(ticker_count),
+        )
+        grid.add_row(
+            "[bold]Rate[/bold]", throughput_text,
+            "[bold]Data age[/bold]", f"{age:.0f}s",
+        )
+        grid.add_row(
+            "[bold]Runtime[/bold]", _fmt_uptime(now - self._start_time),
+            "[bold]Uptime[/bold]", _fmt_uptime(age),
         )
 
-        lines = [
-            f"[bold]TRAINING DASHBOARD[/bold]   "
-            f"[{health_style}] {health} [/{health_style}]  "
-            f"[cyan]{spinner}[/cyan]  "
-            f"[grey62]updated {age:.0f}s ago[/grey62]",
-            "",
-            f"[bold]Environment step[/bold]   {_fmt_int(tick.get('step'))}",
-            f"[bold]Rollout[/bold]           {_fmt_int(rollout.get('rollout', rollout.get('step')))}",
-            f"[bold]Episode[/bold]           {_fmt_int(rollout.get('episode'))}",
-            f"[bold]Market symbols[/bold]    {ticker_count}",
-            f"[bold]Processing rate[/bold]   {throughput_text} ticks/s",
-            f"[bold]Runtime[/bold]            {_fmt_uptime(now - self._start_time)}",
-        ]
-
-        if halted_count:
-            lines.append(
-                f"[bold]Attention[/bold]          "
-                f"[white on purple4] {halted_count} HALTED [/white on purple4]"
-            )
+        alert_line = ""
+        if halted_count or bankrupt_count:
+            bits = []
+            if halted_count:
+                bits.append(f"[bold white on purple4] {halted_count} HALTED [/bold white on purple4]")
+            if bankrupt_count:
+                bits.append(f"[bold white on red] {bankrupt_count} BANKRUPT [/bold white on red]")
+            alert_line = "  " + "  ".join(bits)
         else:
-            lines.append("[bold]Attention[/bold]          none")
+            alert_line = "  [green]no risk alerts[/green]"
+
+        body = Group(
+            Text.from_markup(
+                f"[bold]TRAINING DASHBOARD[/bold]   "
+                f"[{health_style}] {health} [/{health_style}]  "
+                f"[cyan]{spinner}[/cyan]  "
+                f"[grey62]updated {age:.0f}s ago[/grey62]"
+            ),
+            grid,
+            Text.from_markup(alert_line),
+        )
 
         return Panel(
-            "\n".join(lines),
-            title="1. System Status",
+            body,
+            title="1. Run Status",
             border_style="cyan",
             expand=False,
         )
 
     # ------------------------------------------------------------------
-    # Section 2: model/training performance
+    # Section 2: alerts -- risk conditions, named, or a clean bill of health
     # ------------------------------------------------------------------
 
-    def _build_performance_panel(
-        self,
-        rollout: Dict[str, Any],
-    ) -> Panel:
-        reward = rollout.get("reward")
-        reward_ema = rollout.get("reward_ema")
-        sharpe = rollout.get("sharpe")
-
-        lines = [
-            f"[bold]Reward[/bold]            {_colored_money(reward, signed=True)}",
-            f"[bold]Reward EMA[/bold]        {_colored_money(reward_ema, signed=True)}",
-            f"[bold]Sharpe[/bold]            {_fmt(sharpe)}",
+    def _build_alerts_panel(self, rows: List[Dict[str, Any]]) -> Panel:
+        halted = [row["ticker"] for row in rows if row["is_halted"]]
+        bankrupt = [row["ticker"] for row in rows if row["is_bankrupt"]]
+        deep_dd = [
+            row["ticker"] for row in rows
+            if not row["is_bankrupt"] and row["drawdown"] is not None
+            and row["drawdown"] > _DD_ALERT_FRAC
         ]
 
-        # Preserve other common PPO metrics when they exist, without making
-        # the dashboard depend on them.
-        optional_fields = (
-            ("policy_loss", "Policy loss"),
-            ("value_loss", "Value loss"),
-            ("entropy", "Entropy"),
-        )
+        if not halted and not bankrupt and not deep_dd:
+            return Panel(
+                "[green]✓ No alerts — all streams healthy.[/green]",
+                title="2. Alerts",
+                border_style="green",
+                expand=False,
+            )
 
-        for key, label in optional_fields:
-            if key in rollout:
-                lines.append(f"[bold]{label:<20}[/bold] {_fmt(rollout.get(key))}")
-
-        lines.append("")
-        lines.append(
-            "[grey62]Training metrics are taken from the most recent rollout; "
-            "they do not update every environment tick.[/grey62]"
-        )
+        lines: List[str] = []
+        if halted:
+            lines.append(f"[bold white on purple4] HALTED [/bold white on purple4]  {', '.join(map(str, halted))}")
+        if bankrupt:
+            lines.append(f"[bold white on red] BANKRUPT [/bold white on red]  {', '.join(map(str, bankrupt))}")
+        if deep_dd:
+            dd_rows = [
+                f"{row['ticker']} [red]{_number(row['drawdown']):.1%}[/red]"
+                for row in rows
+                if row["ticker"] in deep_dd
+            ]
+            lines.append(f"[bold yellow]DEEP DRAWDOWN >{_DD_ALERT_FRAC:.0%}[/bold yellow]  {'  '.join(dd_rows)}")
 
         return Panel(
             "\n".join(lines),
-            title="2. Model Performance",
+            title="2. Alerts",
+            border_style="red",
+            expand=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Section 3: training -- model numbers, correctly typed
+    # ------------------------------------------------------------------
+
+    def _build_training_panel(self, rollout: Dict[str, Any]) -> Panel:
+        fields = [
+            ("Reward", _fmt_signed(rollout.get("reward")), None),
+            ("Reward EMA", _fmt_signed(rollout.get("reward_ema")), None),
+            ("Entropy (direction)", _fmt(rollout.get("entropy_discrete")), None),
+            ("Entropy (size/offset)", _fmt(rollout.get("entropy_continuous")), None),
+            ("Policy loss", _fmt(rollout.get("policy_loss")), None),
+            ("Value loss", _fmt(rollout.get("value_loss")), None),
+            ("Clip fraction", _fmt(rollout.get("clip_frac")), None),
+            ("Approx KL", _fmt(rollout.get("approx_kl")), None),
+            ("Grad norm", _fmt(rollout.get("grad_norm")), None),
+        ]
+
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column(justify="left")
+        grid.add_column(justify="right")
+        grid.add_column(justify="left")
+        grid.add_column(justify="right")
+
+        row_pairs = [fields[i:i + 2] for i in range(0, len(fields), 2)]
+        for pair in row_pairs:
+            cells: List[str] = []
+            for label, value, _color in pair:
+                cells += [f"[bold]{label}[/bold]", value]
+            grid.add_row(*cells)
+
+        body = Group(
+            grid,
+            Text.from_markup("[grey62]reward is a differential-Sharpe signal (dimensionless), "
+                             "not dollar PnL[/grey62]"),
+        )
+
+        return Panel(
+            body,
+            title="3. Training",
             border_style="blue",
             expand=False,
         )
 
     # ------------------------------------------------------------------
-    # Section 3: portfolio health
+    # Section 4: portfolio -- aggregate + context + top/bottom spotlight
     # ------------------------------------------------------------------
 
     def _build_portfolio_panel(
         self,
         tick: Dict[str, Any],
-    ) -> Tuple[Panel, List[Dict[str, Any]]]:
+        rows: List[Dict[str, Any]],
+    ) -> Panel:
         net_worth = tick.get("net_worth")
-        drawdown = tick.get("drawdown")
-        trades = tick.get("total_trades")
-        rollout_trades = tick.get("trades_this_rollout")
+        n_streams = len(rows)
 
         net_worth_change_style = None
         current_net_worth = _number(net_worth)
@@ -861,99 +916,180 @@ class TrainingDashboard:
         if current_net_worth is not None:
             self._previous_net_worth = current_net_worth
 
-        tickers = tick.get("tickers")
-        positions = tick.get("position")
+        drawdown = tick.get("drawdown")
+        trades_rollout = tick.get("trades_this_rollout")
+        trades_total = tick.get("total_trades")
 
-        rows = self._compute_per_ticker_rows(tick, tickers, positions)
-
-        halted = sum(row["is_halted"] for row in rows)
-        bankrupt = sum(row["is_bankrupt"] for row in rows)
-        active_positions = sum(
+        open_positions = sum(
             _number(row["position"]) not in (None, 0)
             for row in rows
         )
+        halted = sum(1 for row in rows if row["is_halted"])
+        bankrupt = sum(1 for row in rows if row["is_bankrupt"])
 
         net_worth_text = _colored_money(
             net_worth,
             explicit_color=net_worth_change_style,
         )
 
-        lines = [
-            f"[bold]Net worth[/bold]          {net_worth_text}",
-            f"[bold]Average drawdown[/bold]   {_colored_pct(drawdown, lower_is_better=True)}",
-            f"[bold]Trades this rollout[/bold] {_fmt_int(rollout_trades)}",
-            f"[bold]Total trades[/bold]       {_fmt_int(trades)}",
-            "",
-            f"[bold]Open positions[/bold]      {active_positions}",
-            f"[bold]Halted symbols[/bold]      {halted}",
-            f"[bold]Bankrupt symbols[/bold]    {bankrupt}",
-        ]
-
-        if bankrupt:
-            lines.append("[bold red]Risk alert: one or more symbols have zero/negative net worth.[/bold red]")
-        elif halted:
-            lines.append("[bold yellow]Operational alert: one or more symbols are halted.[/bold yellow]")
-        else:
-            lines.append("[green]Portfolio health: no halted or bankrupt symbols.[/green]")
-
-        return (
-            Panel(
-                "\n".join(lines),
-                title="3. Portfolio Health",
-                border_style="green",
-                expand=False,
-            ),
-            rows,
+        avg_per_stream = (
+            current_net_worth / n_streams
+            if current_net_worth is not None and n_streams
+            else None
         )
 
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column(justify="left")
+        grid.add_column(justify="right")
+        grid.add_column(justify="left")
+        grid.add_column(justify="right")
+        grid.add_row(
+            "[bold]Net worth (Σ streams)[/bold]", net_worth_text,
+            "[bold]Avg per stream[/bold]", _fmt_money(avg_per_stream),
+        )
+        grid.add_row(
+            "[bold]Avg drawdown[/bold]", _colored_pct(drawdown, lower_is_better=True),
+            "[bold]Trades this rollout[/bold]", _fmt_int(trades_rollout),
+        )
+        grid.add_row(
+            "[bold]Total trades[/bold]", _fmt_int(trades_total),
+            "[bold]Open positions[/bold]", str(open_positions),
+        )
+        grid.add_row(
+            "[bold]Halted[/bold]", str(halted),
+            "[bold]Bankrupt[/bold]", str(bankrupt),
+        )
+
+        components: List[Any] = [
+            grid,
+            Text.from_markup("[grey62]Aggregate = sum across all streams; each stream is an "
+                             "independent simulated book. Watch direction, not the absolute number.[/grey62]"),
+        ]
+        spotlight = self._build_spotlight_table(rows)
+        if spotlight is not None:
+            components.append(spotlight)
+
+        return Panel(
+            Group(*components),
+            title="4. Portfolio",
+            border_style="green",
+            expand=False,
+        )
+
+    def _build_spotlight_table(self, rows: List[Dict[str, Any]]) -> Optional[Table]:
+        """Top and bottom `_SPOTLIGHT_ROWS/2` streams by unrealized PnL."""
+        ranked = sorted(
+            (row for row in rows if row["unrealized_value"] is not None),
+            key=lambda row: row["unrealized_value"],
+            reverse=True,
+        )
+        if not ranked:
+            return None
+
+        half = _SPOTLIGHT_ROWS // 2
+        if len(ranked) <= _SPOTLIGHT_ROWS:
+            spotlight_rows = ranked
+        else:
+            spotlight_rows = ranked[:half] + ranked[-half:]
+
+        table = Table(title="Spotlight (unrealized PnL)", expand=False)
+        table.add_column("Symbol")
+        table.add_column("Price", justify="right")
+        table.add_column("Pos", justify="right")
+        table.add_column("Unrealized", justify="right")
+        table.add_column("Drawdown", justify="right")
+        table.add_column("Status")
+
+        for row in spotlight_rows:
+            status = (
+                "[white on red]BANKRUPT[/white on red]"
+                if row["is_bankrupt"]
+                else "[white on purple4]HALTED[/white on purple4]"
+                if row["is_halted"]
+                else "[green]OK[/green]"
+            )
+            table.add_row(
+                str(row["ticker"]),
+                f"{row['price']:,.2f}" if row["price"] is not None else "—",
+                _fmt(row["position"]),
+                _colored_money(row["unrealized_value"], signed=True),
+                (
+                    _colored_pct(row["drawdown"], lower_is_better=True)
+                    if row["drawdown"] is not None
+                    else "—"
+                ),
+                status,
+            )
+
+        if len(ranked) > _SPOTLIGHT_ROWS:
+            table.caption = (
+                f"{len(ranked) - _SPOTLIGHT_ROWS} middle streams omitted "
+                "(see the market grid for all of them)"
+            )
+        return table
+
     # ------------------------------------------------------------------
-    # Section 4: market view
+    # Section 5: market -- compact grid, movers, up/down counts
     # ------------------------------------------------------------------
 
-    def _build_market_panel(
-        self,
-        rows: List[Dict[str, Any]],
-    ) -> Panel:
+    def _build_market_panel(self, rows: List[Dict[str, Any]]) -> Panel:
         if not rows:
             return Panel(
                 "[grey62]No ticker price data is available in this record.[/grey62]",
-                title="4. Market",
+                title="5. Market",
                 border_style="grey42",
                 expand=False,
             )
 
-        tape = Text()
+        grid = self._build_compact_grid(rows)
 
-        for row in rows:
-            ticker = str(row["ticker"])
-            price = row["price"]
-            arrow = row["price_arrow"]
+        movers = sorted(
+            (row for row in rows
+             if row["change_pct"] is not None and abs(row["change_pct"]) > 1e-9),
+            key=lambda row: abs(row["change_pct"]),
+            reverse=True,
+        )[:_MOVERS_COUNT]
 
-            if price is None:
-                tape.append(f" {ticker} — ", style="grey50")
-                tape.append("|", style="grey35")
-                continue
+        up = sum(1 for row in rows if row["change_pct"] is not None and row["change_pct"] > 0)
+        down = sum(1 for row in rows if row["change_pct"] is not None and row["change_pct"] < 0)
+        flat = sum(1 for row in rows if row["change_pct"] is not None and row["change_pct"] == 0)
+        unknown = len(rows) - up - down - flat
 
-            price_style = row["price_color"] or "white"
-            arrow_style = row["price_color"] or "grey62"
+        summary = f"[bold green]{up} ▲[/bold green]  [bold red]{down} ▼[/bold red]  [grey62]{flat} •[/grey62]"
+        if unknown:
+            summary += f"  [grey42]{unknown} ?[/grey42]"
 
-            tape.append(f" {ticker} ", style="bold white")
-            tape.append(f"{price:,.2f}", style=price_style)
-            tape.append(f" {arrow} ", style=arrow_style)
-            tape.append("|", style="grey35")
+        movers_text = Text()
+        if movers:
+            movers_text.append("Movers  ")
+            for i, row in enumerate(movers):
+                color = "bright_green" if row["change_pct"] > 0 else "bright_red"
+                arrow = "▲" if row["change_pct"] > 0 else "▼"
+                movers_text.append(f"{arrow} {row['ticker']} ", style=color)
+                movers_text.append(f"{row['change_pct']:+.2%}", style=color)
+                if i < len(movers) - 1:
+                    movers_text.append("   ")
+        else:
+            movers_text.append("no meaningful price moves this tick", style="grey62")
+
+        body = Group(
+            Text.from_markup(summary),
+            grid,
+            movers_text,
+        )
 
         return Panel(
-            tape,
-            title=f"4. Market — {len(rows)} symbols",
+            body,
+            title=f"5. Market — {len(rows)} symbols",
             border_style="magenta",
             expand=False,
         )
 
     # ------------------------------------------------------------------
-    # Section 5: fills/trades
+    # Section 6: fills/trades
     # ------------------------------------------------------------------
 
-    def _build_trade_tape(
+    def _build_fills_panel(
         self,
         tick_history: List[Dict[str, Any]],
     ) -> Panel:
@@ -1020,65 +1156,21 @@ class TrainingDashboard:
 
         return Panel(
             body,
-            title="5. Recent Fills",
+            title="6. Recent Fills",
             border_style="yellow",
             expand=False,
         )
 
     # ------------------------------------------------------------------
-    # Section 6: per-symbol state
+    # Row model
     # ------------------------------------------------------------------
-
-    def _build_environment_view(
-        self,
-        rows: List[Dict[str, Any]],
-        tick_record: Dict[str, Any],
-    ) -> Any:
-        if not rows:
-            return Panel(
-                "[grey62]No per-symbol state is available in this record.[/grey62]",
-                title="6. Symbol Details",
-                border_style="grey42",
-                expand=False,
-            )
-
-        if len(rows) <= _GRID_THRESHOLD:
-            return self._build_detail_table(rows, tick_record)
-
-        # For large portfolios, show a compact overview first, then the most
-        # important rows. This keeps the dashboard readable without hiding
-        # risk conditions.
-        grid = self._build_compact_grid(rows)
-
-        prioritized = sorted(
-            rows,
-            key=lambda row: (
-                not (row["is_bankrupt"] or row["is_halted"]),
-                -abs(_number(row.get("unrealized_value")) or 0.0),
-            ),
-        )
-
-        return Group(
-            Panel(
-                grid,
-                title=f"6. Symbol Overview — {len(rows)} symbols",
-                border_style="grey50",
-                expand=False,
-            ),
-            self._build_detail_table(
-                prioritized,
-                tick_record,
-                max_rows=_MAX_PORTFOLIO_ROWS,
-                title="Priority Symbol Details",
-            ),
-        )
 
     def _compute_per_ticker_rows(
         self,
         tick_record: Dict[str, Any],
-        tickers: Any,
-        position: Any,
     ) -> List[Dict[str, Any]]:
+        tickers = tick_record.get("tickers")
+        position = tick_record.get("position")
         if not isinstance(tickers, list) or not isinstance(position, list):
             return []
 
@@ -1100,18 +1192,6 @@ class TrainingDashboard:
             tick_record.get("drawdown_per_ticker"),
             count,
         )
-        trades_rollout = _as_list(
-            tick_record.get("trades_per_ticker_this_rollout"),
-            count,
-        )
-        trades_total = _as_list(
-            tick_record.get("total_trades_per_ticker"),
-            count,
-        )
-        filled = _as_list(
-            tick_record.get("filled_qty_this_tick"),
-            count,
-        )
         halted = _as_list(
             tick_record.get("halted"),
             count,
@@ -1123,24 +1203,10 @@ class TrainingDashboard:
             price = _number(prices[index])
             previous_price = self._previous_prices.get(str(ticker))
 
-            if price is None:
-                price_color = None
-                price_arrow = ""
-            elif previous_price is None:
-                price_color = None
-                price_arrow = "•"
-            elif price > previous_price:
-                price_color = "bright_green"
-                price_arrow = "▲"
-            elif price < previous_price:
-                price_color = "bright_red"
-                price_arrow = "▼"
-            else:
-                price_color = None
-                price_arrow = "•"
+            change_pct: Optional[float] = None
+            if price is not None and previous_price is not None and previous_price > 0:
+                change_pct = (price - previous_price) / previous_price
 
-            # Store once per frame. This fixes the old double-update problem
-            # where the market tape could lose the direction arrow.
             if price is not None:
                 self._previous_prices[str(ticker)] = price
 
@@ -1149,109 +1215,25 @@ class TrainingDashboard:
             is_halted = bool(halted[index]) if halted[index] is not None else False
             is_bankrupt = nw is not None and nw <= 0
 
-            if is_bankrupt:
-                status = "[bold white on red] BANKRUPT [/bold white on red]"
-                row_style = "on red"
-            elif is_halted:
-                status = "[bold white on purple4] HALTED [/bold white on purple4]"
-                row_style = "on purple4"
-            else:
-                status = "[green]OK[/green]"
-                row_style = None
-
-            rows.append(
-                {
-                    "ticker": ticker,
-                    "price": price,
-                    "price_color": price_color,
-                    "price_arrow": price_arrow,
-                    "position": position[index],
-                    "net_worth": nw,
-                    "unrealized_value": pnl,
-                    "drawdown": _number(drawdown[index]),
-                    "trades_rollout": trades_rollout[index],
-                    "trades_total": trades_total[index],
-                    "filled": filled[index],
-                    "is_halted": is_halted,
-                    "is_bankrupt": is_bankrupt,
-                    "status_text": status,
-                    "row_style": row_style,
-                }
-            )
+            rows.append({
+                "ticker": ticker,
+                "price": price,
+                "change_pct": change_pct,
+                "position": position[index],
+                "net_worth": nw,
+                "unrealized_value": pnl,
+                "drawdown": _number(drawdown[index]),
+                "is_halted": is_halted,
+                "is_bankrupt": is_bankrupt,
+            })
 
         return rows
 
-    def _build_detail_table(
-        self,
-        rows: List[Dict[str, Any]],
-        tick_record: Dict[str, Any],
-        max_rows: Optional[int] = None,
-        title: Optional[str] = None,
-    ) -> Table:
-        total = len(rows)
-        visible = rows if max_rows is None else rows[:max_rows]
-        hidden = max(0, total - len(visible))
-
-        table = Table(
-            title=(
-                title
-                or f"Symbol Details — step {_fmt_int(tick_record.get('step'))}"
-            ),
-            expand=False,
-        )
-
-        table.add_column("Symbol")
-        table.add_column("Price", justify="right")
-        table.add_column("Position", justify="right")
-        table.add_column("Net Worth", justify="right")
-        table.add_column("Unrealized PnL", justify="right")
-        table.add_column("Drawdown", justify="right")
-        table.add_column("Trades", justify="right")
-        table.add_column("Status")
-
-        for row in visible:
-            pnl = row["unrealized_value"]
-            pnl_text = _colored_money(pnl, signed=True)
-
-            drawdown = row["drawdown"]
-            drawdown_text = (
-                _colored_pct(drawdown, lower_is_better=True)
-                if drawdown is not None
-                else "—"
-            )
-
-            table.add_row(
-                str(row["ticker"]),
-                (
-                    f"{row['price']:,.2f} {row['price_arrow']}"
-                    if row["price"] is not None
-                    else "—"
-                ),
-                _fmt(row["position"]),
-                _fmt_money(row["net_worth"]),
-                pnl_text,
-                drawdown_text,
-                _fmt_int(row["trades_total"]),
-                row["status_text"],
-                style=row["row_style"],
-            )
-
-        if hidden:
-            table.caption = (
-                f"{hidden} additional symbols omitted from the detailed view; "
-                "the compact overview above still includes them."
-            )
-
-        return table
-
-    def _build_compact_grid(
-        self,
-        rows: List[Dict[str, Any]],
-    ) -> Table:
-        column_width = 22
+    def _build_compact_grid(self, rows: List[Dict[str, Any]]) -> Table:
+        column_width = 28
         columns = max(
-            4,
-            min(12, (self.console.width or 100) // column_width),
+            2,
+            min(6, (self.console.width or 100) // column_width),
         )
 
         grid = Table.grid(padding=(0, 1))
@@ -1275,13 +1257,26 @@ class TrainingDashboard:
                 else "—"
             )
 
-            arrow = row["price_arrow"]
-            arrow_style = row["price_color"] or "grey62"
+            change = row["change_pct"]
+            if change is None:
+                arrow, color = "", "grey62"
+            elif change > 0:
+                arrow, color = "▲", "bright_green"
+            elif change < 0:
+                arrow, color = "▼", "bright_red"
+            else:
+                arrow, color = "•", "grey62"
+
+            pos = row["position"]
+            try:
+                pos_f = float(pos)
+                pos_text = f"p:{pos_f:+.2f}"
+            except (TypeError, ValueError):
+                pos_text = "p:—"
 
             cells.append(
-                f"{marker} [bold]{str(row['ticker']):<7}[/bold]\n"
-                f"  {price} [{arrow_style}]{arrow}[/{arrow_style}]"
-                f"  pos {_fmt(row['position'])}"
+                f"{marker} [bold]{str(row['ticker']):<6}[/bold] "
+                f"{price}[{color}]{arrow}[/{color}] {pos_text}"
             )
 
             if len(cells) == columns:
