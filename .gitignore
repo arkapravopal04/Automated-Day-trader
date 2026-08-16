@@ -1,6 +1,12 @@
 # --- Secrets (matches nested .env files too, e.g. Version_2/.env) ---
 **/.env
 *.env
+*.env.*
+
+# --- Secrets: private keys, certs, API tokens ---
+*.pem
+*.key
+kaggle.json
 
 # --- Python bytecode caches ---
 __pycache__/
@@ -10,6 +16,12 @@ __pycache__/
 /alpaca_cache
 /legacy
 /info.txt
+
+# --- Checkpoint / model artifacts (pickle & torch, any depth) ---
+*.pkl
+*.pt
+*.pth
+*.ckpt
 
 # --- Security audit L1: untracked legacy / tuning-artifact trees ---
 /tuning/

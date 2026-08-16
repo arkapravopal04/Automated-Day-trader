@@ -1,6 +1,12 @@
 # --- Secrets ---
 .env
 *.env
+*.env.*
+
+# --- Private keys, certs, API tokens ---
+*.pem
+*.key
+kaggle.json
 !.env.example
 
 # --- Runtime data (regenerated locally / on Kaggle, never committed) ---
@@ -44,3 +50,4 @@ Thumbs.db
 *.pt
 *.pth
 *.ckpt
+*.pkl
