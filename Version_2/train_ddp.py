@@ -168,6 +168,11 @@ def _worker(
     on_kaggle = is_kaggle()
     if on_kaggle and cfg.run.checkpoint_dir == "checkpoints":
         cfg.run.checkpoint_dir = "/kaggle/working/checkpoints"
+    # Same redirect as train.py -- see that file's matching comment. The
+    # `== default` guard keeps an explicit metrics_path override intact
+    # (e.g. hyperparam_sweep.py sets its own per-run metrics_path).
+    if on_kaggle and cfg.run.metrics_path == "logs/metrics.jsonl":
+        cfg.run.metrics_path = "/kaggle/working/logs/metrics.jsonl"
     if rank == 0:
         os.makedirs(cfg.run.checkpoint_dir, exist_ok=True)
         if fresh:

@@ -319,6 +319,16 @@ def main(argv: Optional[List[str]] = None) -> None:
     on_kaggle = args.kaggle or (is_kaggle() and not args.local)
     if on_kaggle and cfg.run.checkpoint_dir == "checkpoints":
         cfg.run.checkpoint_dir = "/kaggle/working/checkpoints"
+    # Same redirect for metrics: without it, metrics_path stays relative
+    # ("logs/metrics.jsonl") and resolves against the CWD -- which on Kaggle
+    # is the cloned repo dir, NOT /kaggle/working/logs as run_kaggle.py
+    # documents and its summary checks. Files would still land under
+    # /kaggle/working only as long as the repo happens to be cloned there,
+    # and would crash outright if the repo were a read-only /kaggle/input
+    # attachment. The `== default` guard keeps an explicit --metrics-path
+    # override (or train_ddp.py's metrics_path arg) intact.
+    if on_kaggle and cfg.run.metrics_path == "logs/metrics.jsonl":
+        cfg.run.metrics_path = "/kaggle/working/logs/metrics.jsonl"
 
     device = torch.device(cfg.run.device if torch.cuda.is_available() else "cpu")
     torch.manual_seed(cfg.run.seed)

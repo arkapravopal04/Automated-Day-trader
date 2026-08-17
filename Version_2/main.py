@@ -141,6 +141,15 @@ def cmd_monitor(args: argparse.Namespace) -> None:
 
     cfg = TrainingConfig()
     metrics_path = args.metrics_path or cfg.run.metrics_path
+    # Match train.py/train_ddp.py's Kaggle redirect so `monitor` finds the
+    # metrics file where training actually writes it on Kaggle, not where
+    # the local default ("logs/metrics.jsonl", CWD-relative) points. Only
+    # auto-redirect when the user didn't pass an explicit --metrics-path.
+    if args.metrics_path is None:
+        from paths import is_kaggle
+
+        if is_kaggle() and metrics_path == "logs/metrics.jsonl":
+            metrics_path = "/kaggle/working/logs/metrics.jsonl"
     mode = resolve_mode(cfg.run.display_mode)
 
     dashboard = TrainingDashboard(metrics_path, mode=mode, history_window=args.history_window)
