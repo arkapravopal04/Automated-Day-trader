@@ -53,6 +53,10 @@ _CACHE_FILE_EXTENSIONS = (".parquet", ".json")
 
 def is_kaggle() -> bool:
     """True if running inside a Kaggle Notebook/Script session."""
+    if os.name == "nt":
+        # Windows can't be Kaggle; os.path.exists('/kaggle/working') would
+        # resolve to C:\\kaggle\\working and false-positive on any stray dir.
+        return False
     return (
         os.environ.get("KAGGLE_KERNEL_RUN_TYPE") is not None
         or os.environ.get("KAGGLE_URL_BASE") is not None

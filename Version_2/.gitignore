@@ -28,6 +28,9 @@ dist/
 .mypy_cache/
 .ruff_cache/
 
+sweep_output/
+kaggle_data/
+
 # --- Virtual environments ---
 venv/
 .venv/
