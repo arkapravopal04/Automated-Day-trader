@@ -854,6 +854,20 @@ class TrainingDashboard:
     # ------------------------------------------------------------------
 
     def _build_training_panel(self, rollout: Dict[str, Any]) -> Panel:
+        n_tickers = len(rollout.get("tickers") or [])
+        kelly_zero = rollout.get("kelly_zero_count")
+        kelly_warm = rollout.get("kelly_warm_count")
+        # Red once any stream is locked (fractional_kelly == 0.0 for a warm
+        # stream) -- see risk/kelly_sizing.py's diagnostics() docstring: that
+        # 0.0 is permanent for the rest of the run once it happens, so this
+        # count should only ever climb, never fall, within one run.
+        kelly_zero_text = (
+            "—" if kelly_zero is None
+            else f"[bold red]{kelly_zero}/{n_tickers}[/bold red]" if kelly_zero > 0
+            else f"{kelly_zero}/{n_tickers}"
+        )
+        kelly_warm_text = "—" if kelly_warm is None else f"{kelly_warm}/{n_tickers}"
+
         fields = [
             ("Reward", _fmt_signed(rollout.get("reward")), None),
             ("Reward EMA", _fmt_signed(rollout.get("reward_ema")), None),
@@ -864,6 +878,8 @@ class TrainingDashboard:
             ("Clip fraction", _fmt(rollout.get("clip_frac")), None),
             ("Approx KL", _fmt(rollout.get("approx_kl")), None),
             ("Grad norm", _fmt(rollout.get("grad_norm")), None),
+            ("Kelly locked (zero)", kelly_zero_text, None),
+            ("Kelly warm", kelly_warm_text, None),
         ]
 
         grid = Table.grid(padding=(0, 2))
