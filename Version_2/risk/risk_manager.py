@@ -41,6 +41,9 @@ class RiskLimits:
     max_ticker_concentration_frac: float = 0.35   # max any single ticker's share of *gross exposure* (not equity)
     max_order_notional_frac: float = 0.10         # max single order's notional / equity, regardless of resulting position
     drawdown_halt_frac: float = 0.20              # drawdown from peak equity at which new-exposure orders are blocked (reduce-only)
+    min_order_notional: float = 100.0             # ABSOLUTE $; drop exposure-increasing orders smaller than this. See
+                                                   # RiskManager._drop_dust_orders() for why this exists and why it's
+                                                   # absolute rather than a fraction of equity. 0.0 disables.
 
 
 @dataclass
@@ -118,6 +121,12 @@ class RiskManager:
             )
 
         size, breached = self._apply_drawdown_halt(size, breached, reduce_only, increasing)
+
+        # LAST, deliberately: every cap above can SHRINK an order, so an order
+        # that was a sane size when the policy asked for it may be dust by the
+        # time it gets here. Checking earlier would let a capped-down order
+        # through.
+        size, breached = self._drop_dust_orders(size, breached, increasing, mid_price)
 
         direction = torch.where(size == 0, torch.zeros_like(direction), direction)
 
@@ -216,6 +225,53 @@ class RiskManager:
         size = torch.where(over_concentrated, torch.minimum(size, max_qty_conc_cap), size)
         breached = breached | over_concentrated
 
+        return size, breached
+
+    def _drop_dust_orders(
+        self, size: Tensor, breached: Tensor, increasing: Tensor, mid_price: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Zeroes exposure-INCREASING orders whose notional is below
+        `min_order_notional`. Reducing/closing orders always pass, no matter
+        how small -- same contract as every other cap in this class, and a
+        hard requirement here: a minimum that could block a close would trap
+        a position the system is trying to exit.
+
+        WHY THIS EXISTS (measured, from a real 50-rollout run):
+        73.8% of that run's fills had a notional under $1.00, with a MEDIAN
+        fill of $0.20 -- fractions of a share worth pennies -- while each one
+        paid the flat $1.00 platform ticket fee (see paths.py's
+        PLATFORM_FEE_PER_TRADE). That is a >500% round-trip cost on the
+        median trade, and it accounted for 99.3% of the run's entire
+        $134k loss; gross PnL excluding the ticket fee was only -$980.
+        Filtering those fills at $100 discards ~86% of the ORDERS but keeps
+        ~98.8% of the traded NOTIONAL -- i.e. what gets dropped is
+        economically meaningless.
+
+        The root cause is a policy-expressiveness gap, not a broker cost:
+        model/hybrid_policy.py's discrete direction head fires SHORT/LONG
+        independently of the continuous Beta size head, and the Beta cannot
+        emit exactly 0 (open support on (0,1)). So a policy that has
+        correctly learned "trading is expensive, trade less" expresses that
+        as "LONG, 0.0014 shares" rather than as FLAT -- which still fills and
+        still gets billed a full ticket.
+
+        Absolute dollars, not a fraction of equity, because the cost this
+        defends against (the flat per-trade fee) is itself absolute: the
+        thing that makes an order uneconomic is its size relative to a fixed
+        $/ticket, not relative to the account.
+
+        Applies in training, backtest AND live -- unlike the training-only
+        Kelly floor in kelly_sizing.py. Submitting a 20-cent order to a real
+        broker is not something we want the live loop doing either, so this
+        one deliberately does NOT carve out an exception.
+        """
+        if self.limits.min_order_notional <= 0:
+            return size, breached
+        order_notional = size * mid_price
+        too_small = increasing & (size > 0) & (order_notional < self.limits.min_order_notional)
+        size = torch.where(too_small, torch.zeros_like(size), size)
+        breached = breached | too_small
         return size, breached
 
     def _apply_drawdown_halt(

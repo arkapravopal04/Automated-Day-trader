@@ -264,6 +264,15 @@ class RiskConfig:
     max_order_notional_frac: float = 0.10
     drawdown_halt_frac: float = 0.20
 
+    # Absolute $ floor on exposure-INCREASING orders -- see
+    # risk_manager.py's _drop_dust_orders() for the full measured
+    # rationale. Short version: a 50-rollout run produced a MEDIAN fill of
+    # $0.20 (73.8% of fills under $1.00) while paying a flat $1.00/ticket
+    # fee, which was 99.3% of that run's entire loss. Filtering at $100
+    # drops ~86% of orders but keeps ~98.8% of traded notional. Applies in
+    # training, backtest and live alike. 0.0 disables.
+    min_order_notional: float = 100.0
+
     # kelly_sizing.py -- KellySizer
     kelly_lookback_trades: int = 30
     kelly_min_trades_for_estimate: int = 10

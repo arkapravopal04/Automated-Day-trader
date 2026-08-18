@@ -98,6 +98,7 @@ def build_risk_pipeline(cfg: TrainingConfig, n_envs: int, device: torch.device):
             max_ticker_concentration_frac=cfg.risk.max_ticker_concentration_frac,
             max_order_notional_frac=cfg.risk.max_order_notional_frac,
             drawdown_halt_frac=cfg.risk.drawdown_halt_frac,
+            min_order_notional=cfg.risk.min_order_notional,
         ),
         device=str(device),
     )
