@@ -215,7 +215,74 @@ def _run_action_pipeline(
         ticker_idx=0,
     )
     final_direction, final_size = kill_switch.apply(risk_result.direction, risk_result.size)
+
+    final_direction, final_size = _apply_flat_intent(
+        raw_direction=action_sample.direction,
+        final_direction=final_direction,
+        final_size=final_size,
+        position=env.portfolio.positions[:, 0],
+        halted=kill_switch.is_halted(),
+    )
     return final_direction, final_size, risk_result.limit_offset
+
+
+def _apply_flat_intent(
+    raw_direction: Tensor,
+    final_direction: Tensor,
+    final_size: Tensor,
+    position: Tensor,
+    halted: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    """
+    Turns the policy's own "flat" action into an actual close.
+
+    vec_trading_env.step() treats direction == 0 as "no order this step",
+    which is right for a stream that is already flat but means a stream
+    HOLDING a position can never deliberately exit: the only other route to
+    flat is a continuous size draw landing exactly on the current position
+    magnitude, which is effectively measure-zero. Two consecutive 50-rollout
+    runs produced 6,043 and 2,380 flips against exactly **0 opens and 0
+    closes**, with 98%+ long occupancy -- the policy was structurally unable
+    to say "get me out", so it expressed every view as a reversal.
+
+    Feeding position state into the observation (see
+    VecTradingEnv._augment_obs_with_portfolio_state) was necessary but not
+    sufficient: the second run showed the actor could finally SEE its
+    inventory and still had no action that meant "sell it", and opens/closes
+    stayed pinned at 0. This supplies the missing mechanism.
+
+    WHY HERE, and not in vec_trading_env.step(): by the time an action
+    reaches the env, a zero direction has three indistinguishable causes,
+    and only the first is the policy's intent --
+      1. the discrete head sampled "flat";
+      2. risk_manager.py zeroed it (`direction = where(size == 0, 0,
+         direction)`) after a cap or the min_order_notional dust gate
+         clipped size to 0;
+      3. kill_switch.py zeroed it because the stream is halted.
+    An earlier attempt at this lived in the env and therefore treated all
+    three alike, turning every dust rejection and every halt into a forced
+    liquidation. Here `action_sample.direction` is still the raw policy
+    output, so intent is unambiguous.
+
+    Closes deliberately bypass the Kelly/Risk caps computed above, because
+    every one of those caps exists to bound EXPOSURE and a full close takes
+    exposure to zero: risk_manager.py's dust gate and drawdown halt already
+    exempt reducing orders by design, and kelly_sizing.py's notional cap
+    documents that "a pure reduce passes through untouched". Liquidity is
+    still enforced downstream -- execution_sim.py's max_participation can
+    partially fill a close on a thin bar, and a zero-volume bar fills none
+    of it, which is correct.
+
+    KillSwitch is the one thing NOT bypassed. Its apply() docstring states
+    that it "freezes NEW orders; it does not itself submit a flattening
+    order", leaving flatten-vs-freeze to the caller -- so a halted stream
+    stays frozen rather than being force-flattened here.
+    """
+    wants_flat = raw_direction.to(position.device) == 0
+    close_mask = wants_flat & (position != 0) & ~halted.to(position.device)
+    direction = torch.where(close_mask, -torch.sign(position), final_direction.to(position.dtype))
+    size = torch.where(close_mask, position.abs(), final_size.to(position.dtype))
+    return direction, size
 
 
 def collect_rollout(

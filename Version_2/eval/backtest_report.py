@@ -31,7 +31,7 @@ from risk.risk_manager import RiskManager, RiskLimits
 from risk.kill_switch import KillSwitch
 
 from vec_trading_env import VecTradingEnv
-from training.ppo_hybrid import HybridActorCritic
+from training.ppo_hybrid import HybridActorCritic, _apply_flat_intent
 from training.config import TrainingConfig
 
 from eval.metrics import (
@@ -175,10 +175,32 @@ def run_backtest(
                         ticker_idx=0,
                     )
                     final_direction, final_size = kill_switch.apply(risk_result.direction, risk_result.size)
+                    # Same flat-intent handling training uses -- see
+                    # training/ppo_hybrid.py's _apply_flat_intent(). Omitting it
+                    # here would score the policy under DIFFERENT action
+                    # semantics than it was trained with (every deliberate exit
+                    # silently becoming a hold), which is exactly the kind of
+                    # train/eval mismatch this backtest exists to rule out.
+                    final_direction, final_size = _apply_flat_intent(
+                        raw_direction=action_sample.direction,
+                        final_direction=final_direction,
+                        final_size=final_size,
+                        position=env.portfolio.positions[:, 0],
+                        halted=kill_switch.is_halted(),
+                    )
                     final_limit_offset = risk_result.limit_offset
                 else:
-                    final_direction = action_sample.direction
-                    final_size = size_shares
+                    # Bare-policy mode deliberately bypasses Kelly/Risk/KillSwitch,
+                    # but flat-intent is action SEMANTICS, not a risk control: without
+                    # it direction == 0 is a no-op and the raw policy could never exit
+                    # a position either.
+                    final_direction, final_size = _apply_flat_intent(
+                        raw_direction=action_sample.direction,
+                        final_direction=action_sample.direction,
+                        final_size=size_shares,
+                        position=env.portfolio.positions[:, 0],
+                        halted=torch.zeros_like(action_sample.direction, dtype=torch.bool),
+                    )
                     final_limit_offset = limit_offset_ticks
 
                 step_result = env.step(direction=final_direction, size=final_size, limit_offset=final_limit_offset)
