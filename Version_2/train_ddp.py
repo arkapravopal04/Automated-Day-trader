@@ -82,6 +82,7 @@ from monitoring.dashboard import MetricsWriter  # noqa: E402
 
 from train import (  # noqa: E402 -- reuse, don't duplicate
     build_risk_pipeline,
+    kelly_metrics_fields,
     _TickState,
     make_tick_callback,
     resolve_resume_path,
@@ -290,6 +291,10 @@ def _worker(
             env, ddp_model.module, kelly_sizer, risk_manager, kill_switch, reward_shaper, obs, hidden, cfg,
             tick_callback=tick_callback,
         )
+        # Snapshot BEFORE the episode-boundary kelly_sizer.reset() below can
+        # run -- see train.py's matching comment. Only rank 0 logs, so only
+        # rank 0 needs the snapshot.
+        kelly_diag = kelly_sizer.diagnostics() if rank == 0 else None
         compute_gae(buffer, final_value, cfg.ppo.gamma, cfg.ppo.gae_lambda)
         stats = _ddp_ppo_update(ddp_model, optimizer, buffer, cfg, scaler=scaler)
 
@@ -346,6 +351,7 @@ def _worker(
                 tickers=env.tickers,
                 position=env.portfolio.positions[:, 0].tolist(),
                 world_size=world_size,  # tag records so you can tell DDP runs apart from single-GPU ones in the log
+                **kelly_metrics_fields(kelly_diag),
                 **stats,
             )
 

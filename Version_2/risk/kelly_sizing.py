@@ -42,6 +42,18 @@ class KellySizingResult:
     is_warm: Tensor         # [n_envs] bool, whether enough trade history exists to trust the estimate
 
 
+@dataclass
+class KellyDiagnostics:
+    """Read-only edge-estimate snapshot -- see KellySizer.diagnostics(). Observability only,
+    never consumed by apply()/_cap_growing_size() -- has no effect on sizing."""
+    win_rate: Tensor          # [n_envs], rolling win rate estimate
+    payoff_ratio: Tensor      # [n_envs], rolling payoff ratio estimate
+    raw_kelly: Tensor         # [n_envs], f* clamped to [0, kelly_cap] -- see _edge_estimate()
+    fractional_kelly: Tensor  # [n_envs], raw_kelly * kelly_multiplier (or default_fraction while not warm) --
+                               # the actual cap apply() would use for a stream sitting flat right now
+    is_warm: Tensor           # [n_envs] bool, whether enough trade history exists to trust the estimate
+
+
 class KellySizer:
     def __init__(
         self,
@@ -185,6 +197,34 @@ class KellySizer:
             kelly_fraction=fractional_kelly,
             win_rate=win_rate,
             payoff_ratio=payoff_ratio,
+            is_warm=is_warm,
+        )
+
+    def diagnostics(self) -> KellyDiagnostics:
+        """
+        Read-only snapshot of the current per-stream edge estimate and the
+        fractional-Kelly cap it implies right now -- for rollout-level
+        metrics logging (train.py / train_ddp.py), never called from
+        apply()'s own path and never fed back into sizing.
+
+        Deliberately calls the exact same private helpers apply() itself
+        uses (_edge_estimate() / _fractional_kelly()) rather than
+        re-deriving the formula here, so this can never silently drift from
+        what apply() actually computes -- see this project's diagnostic
+        history (kelly_sizing.py's module docstring / hyperparam_sweep.py's
+        SweptParam note) on why a stream's fractional_kelly landing at
+        exactly 0.0 while is_warm=True is the thing to watch for: once that
+        happens for a flat stream, every opening order is capped to 0
+        shares, no trade closes to update the PnL history, and the estimate
+        (and this same 0.0) freezes for the rest of the run.
+        """
+        win_rate, payoff_ratio, raw_kelly, is_warm = self._edge_estimate()
+        fractional_kelly = self._fractional_kelly(raw_kelly, is_warm)
+        return KellyDiagnostics(
+            win_rate=win_rate,
+            payoff_ratio=payoff_ratio,
+            raw_kelly=raw_kelly,
+            fractional_kelly=fractional_kelly,
             is_warm=is_warm,
         )
 

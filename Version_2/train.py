@@ -40,7 +40,7 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -57,7 +57,7 @@ from training.config import TrainingConfig  # noqa: E402
 from training.ppo_hybrid import HybridActorCritic, collect_rollout, compute_gae, ppo_update  # noqa: E402
 from training.reward import DifferentialSharpeReward  # noqa: E402
 
-from risk.kelly_sizing import KellySizer  # noqa: E402
+from risk.kelly_sizing import KellyDiagnostics, KellySizer  # noqa: E402
 from risk.kill_switch import KillSwitch  # noqa: E402
 from risk.risk_manager import RiskLimits, RiskManager  # noqa: E402
 
@@ -103,6 +103,52 @@ def build_risk_pipeline(cfg: TrainingConfig, n_envs: int, device: torch.device):
         device=str(device),
     )
     return kelly_sizer, risk_manager, kill_switch
+
+
+def kelly_metrics_fields(diag: KellyDiagnostics) -> Dict[str, Any]:
+    """
+    Builds the Kelly-sizing diagnostic fields for one "rollout" metrics
+    record, from a KellySizer.diagnostics() snapshot -- same _per_ticker-list
+    + scalar-aggregate shape as the existing fields on that record (e.g.
+    total_trades_per_ticker / total_trades). One shared function so
+    train.py and train_ddp.py can't drift on what these fields mean (see
+    train_ddp.py's "reuse, don't duplicate" imports from this module).
+
+    win_rate/payoff_ratio/raw_kelly aggregates are averaged over is_warm
+    streams only -- the estimate is meaningless pre-warm (see
+    kelly_sizing.py's _edge_estimate()). fractional_kelly's aggregate and
+    kelly_zero_count cover every stream regardless of warm status, since
+    that's the value actually capping (or not capping) orders right now,
+    including the kelly_default_fraction pre-warm streams get.
+
+    Added to trace exactly which rollout each stream's fractional_kelly
+    first lands on 0.0 -- see this project's diagnostic history: a stream
+    sitting flat with fractional_kelly==0.0 has every opening order capped
+    to 0 shares, which means it can never close a trade to update the PnL
+    history that estimate is built from, so the 0.0 is permanent for the
+    rest of the run once it happens. kelly_zero_count climbing rollout over
+    rollout, in step with total_trades going flat, is the signature to
+    watch for.
+    """
+    is_warm = diag.is_warm
+    n_warm = int(is_warm.sum().item())
+
+    def _warm_mean(x: torch.Tensor) -> Optional[float]:
+        return float(x[is_warm].mean().item()) if n_warm > 0 else None
+
+    return {
+        "kelly_win_rate_per_ticker": diag.win_rate.tolist(),
+        "kelly_payoff_ratio_per_ticker": diag.payoff_ratio.tolist(),
+        "kelly_raw_per_ticker": diag.raw_kelly.tolist(),
+        "kelly_fractional_per_ticker": diag.fractional_kelly.tolist(),
+        "kelly_is_warm_per_ticker": is_warm.tolist(),
+        "kelly_win_rate": _warm_mean(diag.win_rate),
+        "kelly_payoff_ratio": _warm_mean(diag.payoff_ratio),
+        "kelly_raw": _warm_mean(diag.raw_kelly),
+        "kelly_fractional": float(diag.fractional_kelly.mean().item()),
+        "kelly_warm_count": n_warm,
+        "kelly_zero_count": int((diag.fractional_kelly == 0.0).sum().item()),
+    }
 
 
 @dataclass
@@ -449,6 +495,11 @@ def main(argv: Optional[List[str]] = None) -> None:
             env, actor_critic, kelly_sizer, risk_manager, kill_switch, reward_shaper, obs, hidden, cfg,
             tick_callback=tick_callback,
         )
+        # Snapshot BEFORE the episode-boundary kelly_sizer.reset() below can
+        # run, so this reflects what was actually used for this rollout's
+        # own ticks -- not a freshly-reset state that belongs to the next
+        # rollout. See risk/kelly_sizing.py's diagnostics() docstring.
+        kelly_diag = kelly_sizer.diagnostics()
         compute_gae(buffer, final_value, cfg.ppo.gamma, cfg.ppo.gae_lambda)
         stats = ppo_update(actor_critic, optimizer, buffer, cfg, scaler=scaler)
 
@@ -516,6 +567,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 total_trades_per_ticker=list(state.total_trades_per_ticker),
                 tickers=env.tickers,
                 position=env.portfolio.positions[:, 0].tolist(),
+                **kelly_metrics_fields(kelly_diag),
                 **stats,
             )
 
