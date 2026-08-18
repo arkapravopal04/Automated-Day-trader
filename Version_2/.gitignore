@@ -31,6 +31,9 @@ dist/
 sweep_output/
 kaggle_data/
 
+# --- Local-only agent/session notes ---
+AGENTS.md
+
 # --- Virtual environments ---
 venv/
 .venv/
