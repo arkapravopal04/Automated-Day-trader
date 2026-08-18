@@ -480,7 +480,7 @@ def probe_reward_scale(n_rollouts: int = 2, output_dir: str = "sweep_output") ->
     )
     print(f"[probe] n_envs={env.n_envs}, tickers={len(env.tickers)}, rollout_length={cfg.ppo.rollout_length} "
           f"(T*n_envs = {cfg.ppo.rollout_length * env.n_envs} transitions/rollout)")
-    actor_critic = HybridActorCritic(n_features=len(ds.feature_names), cfg=cfg).to(device)
+    actor_critic = HybridActorCritic(n_features=len(env.feature_names), cfg=cfg).to(device)
     optimizer = torch.optim.Adam(actor_critic.parameters(), lr=cfg.ppo.learning_rate, eps=cfg.ppo.adam_eps)
     kelly_sizer, risk_manager, kill_switch = build_risk_pipeline(cfg, env.n_envs, device)
     reward_shaper = DifferentialSharpeReward(

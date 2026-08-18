@@ -424,7 +424,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         device=str(device),
     )
 
-    actor_critic = HybridActorCritic(n_features=len(train_dataset.feature_names), cfg=cfg).to(device)
+    # env.feature_names, not train_dataset.feature_names: VecTradingEnv appends
+    # portfolio-state channels to every observation (see
+    # _augment_obs_with_portfolio_state), so the dataset's own count is
+    # narrower than what the network actually receives.
+    actor_critic = HybridActorCritic(n_features=len(env.feature_names), cfg=cfg).to(device)
     optimizer = torch.optim.Adam(actor_critic.parameters(), lr=cfg.ppo.learning_rate, eps=cfg.ppo.adam_eps)
 
     start_rollout = 0
@@ -510,6 +514,19 @@ def main(argv: Optional[List[str]] = None) -> None:
         compute_gae(buffer, final_value, cfg.ppo.gamma, cfg.ppo.gae_lambda)
         stats = ppo_update(actor_critic, optimizer, buffer, cfg, scaler=scaler)
 
+        # DRAWDOWN-METRIC FIX: snapshot peak_equity BEFORE either reset
+        # branch below can touch it. The periodic branch's
+        # reset_peak_equity() overwrites peak_equity to the CURRENT equity,
+        # and drawdown_per_ticker below was computed from
+        # env.portfolio.peak_equity AFTER that reset already ran -- so it
+        # compared equity against a peak just set equal to itself, logging
+        # exactly 0.0 every rollout by construction (verified on a
+        # 50-rollout run: 50/50 logged drawdown == 0.0 while the tick-level
+        # log -- a separate path not subject to this reset -- showed real
+        # intra-rollout drawdown up to 1.87%). This snapshot is the peak
+        # this rollout's trading actually ran against.
+        pre_reset_peak_equity = env.portfolio.peak_equity.clone()
+
         if buffer.done.any():
             # end of a full pass through the training split -- a real
             # episode boundary in the RL sense, not a rollout boundary.
@@ -550,7 +567,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         current_prices_unsq = env._current_prices().unsqueeze(1)  # noqa: SLF001
         equity_per_ticker = env.portfolio.equity(current_prices_unsq)
         unrealized_per_ticker = env.portfolio.unrealized_pnl(current_prices_unsq)
-        peak = env.portfolio.peak_equity.clamp(min=1e-6)
+        peak = pre_reset_peak_equity.clamp(min=1e-6)
         drawdown_per_ticker = (peak - equity_per_ticker).clamp(min=0.0) / peak
         net_worth = float(equity_per_ticker.sum().item())
 

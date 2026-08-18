@@ -80,7 +80,10 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     )
     env = VecTradingEnv(dataset=test_dataset, initial_cash=cfg.env.initial_cash, device=str(device))
 
-    actor_critic = _load_actor_critic(args.checkpoint, cfg, len(test_dataset.feature_names), device)
+    # env.feature_names, not test_dataset.feature_names -- VecTradingEnv appends
+    # portfolio-state channels to the observation, so sizing off the dataset
+    # builds a network too narrow and the checkpoint load fails on shape.
+    actor_critic = _load_actor_critic(args.checkpoint, cfg, len(env.feature_names), device)
 
     output = run_backtest(
         env,

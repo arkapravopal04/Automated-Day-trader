@@ -41,7 +41,9 @@ class RiskLimits:
     max_ticker_concentration_frac: float = 0.35   # max any single ticker's share of *gross exposure* (not equity)
     max_order_notional_frac: float = 0.10         # max single order's notional / equity, regardless of resulting position
     drawdown_halt_frac: float = 0.20              # drawdown from peak equity at which new-exposure orders are blocked (reduce-only)
-    min_order_notional: float = 100.0             # ABSOLUTE $; drop exposure-increasing orders smaller than this. See
+    min_order_notional: float = 2_000.0           # ABSOLUTE $; drop exposure-increasing orders smaller than this. Kept in
+                                                   # sync with training/config.py's RiskConfig.min_order_notional (which is
+                                                   # what train.py actually passes) -- see that field for the sizing math. See
                                                    # RiskManager._drop_dust_orders() for why this exists and why it's
                                                    # absolute rather than a fraction of equity. 0.0 disables.
 

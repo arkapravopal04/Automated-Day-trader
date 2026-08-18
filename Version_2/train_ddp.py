@@ -298,6 +298,19 @@ def _worker(
         compute_gae(buffer, final_value, cfg.ppo.gamma, cfg.ppo.gae_lambda)
         stats = _ddp_ppo_update(ddp_model, optimizer, buffer, cfg, scaler=scaler)
 
+        # DRAWDOWN-METRIC FIX: snapshot peak_equity BEFORE any reset below
+        # touches it. reset_peak_equity() (periodic branch) overwrites
+        # peak_equity to the CURRENT equity, and the metrics block further
+        # down computed drawdown_per_ticker from env.portfolio.peak_equity
+        # AFTER that reset had already run -- so it was comparing equity
+        # against a peak just set equal to itself, logging exactly 0.0
+        # every single rollout by construction (verified on a 50-rollout
+        # run: 50/50 rollouts logged drawdown == 0.0 while the tick-level
+        # log, computed on a separate path not subject to this reset,
+        # showed real intra-rollout drawdown up to 1.87%). This snapshot is
+        # the peak this rollout's trading actually ran against.
+        pre_reset_peak_equity = env.portfolio.peak_equity.clone()
+
         if buffer.done.any():
             if rank == 0:
                 state.episode_idx += 1
@@ -327,7 +340,7 @@ def _worker(
             current_prices_unsq = env._current_prices().unsqueeze(1)  # noqa: SLF001
             equity_per_ticker = env.portfolio.equity(current_prices_unsq)
             unrealized_per_ticker = env.portfolio.unrealized_pnl(current_prices_unsq)
-            peak = env.portfolio.peak_equity.clamp(min=1e-6)
+            peak = pre_reset_peak_equity.clamp(min=1e-6)
             drawdown_per_ticker = (peak - equity_per_ticker).clamp(min=0.0) / peak
             net_worth = float(equity_per_ticker.sum().item())
 

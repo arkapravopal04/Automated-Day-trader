@@ -95,9 +95,57 @@ def _load_aligned_column(
             df.index = df.index.tz_localize("UTC")
         series_by_ticker[ticker] = df[column]
 
-    frame = pd.DataFrame(series_by_ticker).reindex(aligned_dates)
+    # NaN-POISONING FIX: reindex onto the UNION of each ticker's own history
+    # and `aligned_dates`, fill there, and only then select the split's dates.
+    # Reindexing straight onto `aligned_dates` (which is already sliced to one
+    # train/val/test split) discards every bar before the split starts, so
+    # ffill() has nothing to carry forward for a ticker whose data ENDS before
+    # that split -- the whole column stays NaN even though ffill().bfill()
+    # "looks" total.
+    #
+    # That is not hypothetical: SQ (Block, ticker retired to XYZ) stops at
+    # 2025-01-17, while the test split runs 2026-01-21 -> 2026-08-11, so SQ's
+    # price column was entirely NaN on both the val and test splits. Because
+    # equity is `cash + (positions * prices).sum()` and IEEE gives
+    # 0 * NaN = NaN, that one dead ticker made its stream's equity NaN from
+    # the very first bar -- and therefore the SUMMED portfolio net worth NaN
+    # -- which would have silently turned eval/backtest_report.py's entire
+    # go/no-go verdict into garbage. dataset.py's feature path never tripped
+    # on it because that path ends in an extra .fillna(0) this one lacks.
+    #
+    # After this fix such a ticker forward-fills its last real price as a
+    # constant for the split: a dead but INERT stream (zero volume already
+    # makes it unfillable via load_aligned_volumes) rather than one that
+    # poisons every aggregate. `_warn_on_dead_streams` below makes that
+    # visible instead of silent.
+    frame = pd.DataFrame(series_by_ticker)
+    frame = frame.reindex(frame.index.union(aligned_dates))
     frame = fill(frame)
+    frame = frame.reindex(aligned_dates)
     return frame[tickers].values.astype(np.float32)
+
+
+def _warn_on_dead_streams(tickers: Sequence[str], prices: np.ndarray) -> None:
+    """
+    Prints a warning for any ticker whose price never moves across the split.
+
+    Such a stream is inert -- it contributes no PnL and no gradient signal,
+    but it still occupies one of the n_envs rollout slots and dilutes every
+    cross-sectional average. Two known causes, both real in this universe:
+    a ticker whose history ENDS before the split (SQ, see the fix note in
+    _load_aligned_column) and one whose history BEGINS after the split start,
+    which dataset.py backward-fills to its first-ever print (COIN, listed
+    2021-04-15, against a union grid starting 2020-08-13).
+    """
+    if prices.size == 0:
+        return
+    constant = (prices.max(axis=0) - prices.min(axis=0)) == 0
+    dead = [tickers[i] for i in np.nonzero(constant)[0]]
+    if dead:
+        print(
+            f"[env] WARNING: {len(dead)}/{len(tickers)} streams have a CONSTANT price across this "
+            f"split and are inert (no PnL, no signal, still consuming a rollout slot): {dead}"
+        )
 
 
 def load_aligned_close_prices(tickers: Sequence[str], aligned_dates: pd.DatetimeIndex) -> np.ndarray:
@@ -188,7 +236,15 @@ class VecTradingEnv:
         self.window_size = dataset.window_size
         self.n_envs = dataset.n_envs  # == n_tickers, one stream per ticker
         self.tickers = dataset.tickers
-        self.feature_names = dataset.feature_names
+        # Market features from the dataset PLUS the portfolio-state channels
+        # this env appends to every observation (see
+        # _augment_obs_with_portfolio_state). Model construction sites size
+        # the network off env.feature_names, so they pick up the extra width
+        # automatically -- anything sizing off dataset.feature_names directly
+        # would build a network 2 channels too narrow.
+        self.market_feature_names = list(dataset.feature_names)
+        self.portfolio_feature_names = ["pos_frac", "unrealized_frac"]
+        self.feature_names = self.market_feature_names + self.portfolio_feature_names
         self.device = torch.device(device) if device is not None else dataset.device
 
         self.initial_cash = initial_cash
@@ -211,8 +267,11 @@ class VecTradingEnv:
         # the observation stays consistent with the mirrored price path.
         # Volatility-style features (e.g. 'rv') are magnitude-based and are
         # deliberately left untouched.
+        # market_feature_names, NOT feature_names: mirroring is applied to the
+        # raw dataset observation BEFORE the portfolio channels are appended,
+        # so these indices must address the market block only.
         self._return_feature_idx = [
-            i for i, name in enumerate(self.feature_names)
+            i for i, name in enumerate(self.market_feature_names)
             if any(kw in name.lower() for kw in return_feature_keywords)
         ]
 
@@ -252,7 +311,9 @@ class VecTradingEnv:
         # rolling ATR-style volatility proxy for step-reward normalization,
         # reuses the dataset's own 'rv' feature if present (already computed
         # in preprocess.py as annualized realized vol) instead of recomputing
-        self._rv_feature_idx = self.feature_names.index("rv") if "rv" in self.feature_names else None
+        self._rv_feature_idx = (
+            self.market_feature_names.index("rv") if "rv" in self.market_feature_names else None
+        )
 
         # REWARD-NORMALIZATION FIX: the 'rv' feature stored in
         # *_features.parquet is a per-ticker Z-SCORE (preprocess.py
@@ -294,6 +355,15 @@ class VecTradingEnv:
     def _load_market_data(self) -> None:
         """Loads and aligns raw close prices and bar volume onto the dataset's date index."""
         prices_np = load_aligned_close_prices(self.tickers, self.dataset.aligned_dates)
+        _warn_on_dead_streams(self.tickers, prices_np)
+        if not np.isfinite(prices_np).all():
+            bad = [self.tickers[i] for i in np.nonzero(~np.isfinite(prices_np).all(axis=0))[0]]
+            raise ValueError(
+                f"Non-finite aligned close prices for {bad}. Equity is cash + positions*price and "
+                f"0 * NaN = NaN, so a single such column makes the summed portfolio net worth NaN "
+                f"and every downstream metric meaningless -- see _load_aligned_column()'s "
+                f"NaN-POISONING FIX note. Refusing to build the env."
+            )
         self.prices = torch.tensor(prices_np, device=self.device, dtype=torch.float32)  # [T, n_envs]
 
         # Real liquidity proxy for execution_sim.py's partial-fill sizing
@@ -335,7 +405,58 @@ class VecTradingEnv:
         first_price_row = self.active_prices[self.window_size - 1]  # last bar in first window == "now"
         self.benchmark_start_price = first_price_row.clone()
         obs = self.dataset[self.current_idx].to(self.device)  # [n_envs, window, features]
-        return self._apply_mirror_to_obs(obs)
+        obs = self._apply_mirror_to_obs(obs)
+        return self._augment_obs_with_portfolio_state(obs, first_price_row)
+
+    def _augment_obs_with_portfolio_state(self, obs: Tensor, mark_price: Tensor) -> Tensor:
+        """
+        Appends the stream's OWN portfolio state to the market observation.
+
+        Until this existed the actor saw ONLY the 8 market features
+        preprocess.py produces (log_ret, rv, vol_z, time_sin, time_cos,
+        log_ret_3/6/12) -- no position, no unrealized PnL, no equity. That
+        made the policy a stateless market-signal function that could not
+        perceive its own inventory, with three measured consequences:
+
+          * "go flat" was not expressible. The discrete head's 0 action
+            means "the market looks neutral", not "exit my position",
+            because the actor did not know a position existed. Over
+            4,860 ticks x 100 streams a real run produced 6,043 flips and
+            exactly 0 opens and 0 closes, with 99/100 streams never flat
+            for even one tick.
+          * a persistent 96.1%-long / 2.9%-short occupancy, which is NOT
+            explained by mirroring (mirror_prob=0.5 means ~half the streams
+            see inverted prices, and every one of the 99 active streams was
+            measured taking BOTH signs at some point) -- it is what a
+            direction head collapsing toward a constant looks like.
+          * dual_critic.py's DualCriticHead.select() conditions the VALUE
+            estimate on position sign while the actor could not observe it,
+            so the critic was fitting a function of a variable hidden from
+            the actor -- consistent with value_loss sitting flat at ~1.0-1.5
+            for 50 straight rollouts instead of falling.
+
+        Two channels, both scale-free (so they are unaffected by
+        initial_cash) and both broadcast across the window dim, since they
+        describe "now" rather than a history:
+
+            pos_frac         signed position notional / equity
+            unrealized_frac  unrealized PnL / equity
+
+        Sign convention is deliberately the MIRRORED frame, matching
+        _apply_mirror_to_obs(): the ledger trades `active_prices`, so a
+        mirrored stream's position sign is already expressed in the same
+        frame as its sign-flipped return features. No extra flip here.
+        """
+        equity = self.portfolio.equity(mark_price.unsqueeze(1)).clamp(min=1e-6)
+        position_notional = self.portfolio.positions[:, 0] * mark_price
+        unrealized = self.portfolio.unrealized_pnl(mark_price.unsqueeze(1))
+
+        pos_frac = (position_notional / equity).clamp(-10.0, 10.0)
+        unrealized_frac = (unrealized / equity).clamp(-10.0, 10.0)
+
+        extra = torch.stack((pos_frac, unrealized_frac), dim=-1)          # [n_envs, 2]
+        extra = extra.unsqueeze(1).expand(-1, obs.shape[1], -1)            # [n_envs, window, 2]
+        return torch.cat((obs, extra), dim=-1)
 
     def _apply_mirror_to_obs(self, obs: Tensor) -> Tensor:
         """
@@ -388,6 +509,27 @@ class VecTradingEnv:
 
         overtrading_factor = self._overtrading_factor()
 
+        # NOTE on direction == 0 (do NOT reinterpret it here as "close the
+        # position"): by the time an action reaches this method, a zero
+        # direction has THREE indistinguishable causes, only one of which is
+        # the policy's own intent --
+        #   1. the policy's discrete head genuinely sampled "flat";
+        #   2. risk_manager.py zeroed it (`direction = where(size == 0, 0,
+        #      direction)`) because a cap or the min_order_notional dust gate
+        #      clipped size to 0;
+        #   3. kill_switch.py zeroed it because that stream is halted --
+        #      whose docstring explicitly leaves "flatten vs. merely freeze"
+        #      to the caller.
+        # Treating all three as a full close turns every dust rejection,
+        # every drawdown-halt reduce_only block, and every KillSwitch halt
+        # into a forced liquidation. Any change to flat-semantics has to be
+        # made where raw policy intent is still known (see
+        # training/ppo_hybrid.py's _run_action_pipeline) -- and note that the
+        # actor cannot currently observe its own position at all, so a
+        # sampled "flat" means "the market looks neutral", not "exit my
+        # position". Position state is now fed to the actor via
+        # _augment_obs_with_portfolio_state() below, which is what makes
+        # inventory intent representable in the first place.
         sim_fill: SimulatedFill = self.execution.simulate_fill(
             direction=direction,
             size=size,
@@ -427,6 +569,14 @@ class VecTradingEnv:
         reward, reward_info = self._compute_reward(
             equity_before, equity_after, mid_price, next_mid_price, done_time, next_obs
         )
+
+        # Portfolio channels are appended AFTER _compute_reward, which indexes
+        # next_obs by self._rv_feature_idx -- appending at the end of the
+        # feature dim leaves every existing index valid, but keeping the
+        # reward path on the pure market obs makes that independence explicit.
+        # Reflects post-fill position, so the next action is conditioned on
+        # the inventory it will actually be acting on.
+        next_obs = self._augment_obs_with_portfolio_state(next_obs, next_mid_price)
 
         done = torch.full((self.n_envs,), done_time, device=self.device, dtype=torch.bool)
 
