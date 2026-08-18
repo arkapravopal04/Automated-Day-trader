@@ -167,22 +167,30 @@ class EnvConfig:
 
     tickers: List[str] = field(default_factory=lambda: list(DEFAULT_TICKERS))
     window_size: int = 60
-    # 10_000 -> 100_000. The platform ticket fee is a FLAT $1 per trade, so
-    # its cost as a fraction of notional is set entirely by order size, and
-    # order size is capped by fractional_kelly * equity. Measured on a real
-    # 50-rollout run: median fill $619, ticket fee therefore 16.2 bps/side,
-    # against a measured GROSS edge of 3.29 bps of notional -- i.e. the
-    # strategy earned +$1,463 gross and paid $7,023 in tickets to do it.
-    # Break-even needs ~$3,040/order; at $10k equity even FULL Kelly
-    # (raw 0.147 * $9,270) caps out at $1,363, so no setting of
-    # kelly_multiplier / min_order_notional / max_position_frac can clear the
-    # fee at that account size -- capital per stream is the binding
-    # constraint, not a tuning knob. At $100k the same Kelly fraction gives
-    # ~$4.3k orders (2.3 bps) and half-Kelly below gives ~$8.6k (1.2 bps),
-    # comfortably under the edge. Observations are scale-free (the two
-    # portfolio channels are equity-normalized fractions), so this does not
-    # shift the input distribution the policy sees.
-    initial_cash: float = 100_000.0
+    # DELIBERATELY 10_000: this mirrors the capital the system will actually
+    # be deployed with, and a sim funded 10x richer than the real account
+    # teaches the policy trade economics it will never encounter.
+    #
+    # KNOWN CONSEQUENCE, measured -- do not "fix" this by raising the number.
+    # The platform ticket fee is a FLAT $1/trade, so its cost as a fraction
+    # of notional is set purely by order size. At this account size
+    # max_order_notional_frac (0.10) caps an order at $1,000 and
+    # max_position_frac (0.25) caps the position at $2,500, so:
+    #     one-way cost ~29.8 bps   vs   measured gross edge ~7.06 bps
+    #     => roughly -13.5 bps per trade, i.e. structurally unprofitable
+    # (measured over rollouts 31-49 of a real 50-rollout run: gross +$3,140,
+    # ticket fees $7,023, net -$6,004 on $4.45M of traded notional; the
+    # decomposition closes to within $3).
+    #
+    # Break-even needs ~$3,000+ per order. Capital per stream is the binding
+    # constraint -- no setting of kelly_multiplier / min_order_notional can
+    # clear a flat fee at $10k/stream. The way OUT that preserves a small
+    # real account is CONCENTRATION, not more capital: the same $1M funds
+    # either 100 streams x $10k (max order $1,000, unusable) or 10 streams
+    # x $100k (max order $10,000, viable). That means shrinking the ticker
+    # universe (n_envs is one stream per ticker), which needs metadata
+    # regeneration and a model reshape -- see the notes in Version_2/AGENTS.md.
+    initial_cash: float = 10_000.0
     max_position_frac: float = 1.0
     tick_size: float = 0.01
     friction_level: str = "realistic"   # "low" | "realistic" | "high" -- see FRICTION_PRESETS above.
@@ -286,40 +294,25 @@ class RiskConfig:
     # fee, which was 99.3% of that run's entire loss. Filtering at $100
     # drops ~86% of orders but keeps ~98.8% of traded notional. Applies in
     # training, backtest and live alike. 0.0 disables.
-    # 100.0 -> 2_000.0, tracking the initial_cash 10k -> 100k change above
-    # (see EnvConfig.initial_cash). This gate is an ABSOLUTE dollar floor, so
-    # leaving it at $100 against a 10x larger account would make it a 0.1%-of-
-    # equity threshold that gates nothing. $2,000 keeps it at the same ~2% of
-    # stream equity it effectively enforced before, and doubles as a hard
-    # backstop on fee drag: any order that passes pays at most 5 bps of
-    # ticket, and the typical half-Kelly order (~$8.6k) pays ~1.2 bps.
-    # Still exposure-INCREASING orders only -- closes and reduces are never
-    # blocked by this, so it can't trap a position.
-    min_order_notional: float = 2_000.0
+    # MUST stay below max_order_notional_frac * initial_cash (currently
+    # 0.10 * 10_000 = $1,000) or NO exposure-increasing order can ever pass
+    # this gate and training deadlocks with zero fills -- the hard-caps
+    # version of the Kelly chicken-and-egg described under
+    # kelly_min_fraction. Re-derive this whenever EnvConfig.initial_cash
+    # moves; it is an ABSOLUTE dollar floor, not a fraction.
+    min_order_notional: float = 100.0
 
     # kelly_sizing.py -- KellySizer
     kelly_lookback_trades: int = 30
     kelly_min_trades_for_estimate: int = 10
-    # 0.25 -> 0.5 (quarter- to half-Kelly). Quarter-Kelly was leaving the
-    # typical order at ~$4.3k even after the initial_cash change; half-Kelly
-    # puts it near ~$8.6k, cutting ticket drag from 2.3 bps to ~1.2 bps
-    # against the 3.29 bps measured gross edge. Half-Kelly is the standard
-    # conservative operating point and still sits well inside
-    # max_position_frac (0.25) and max_order_notional_frac (0.10).
-    kelly_multiplier: float = 0.5
+    kelly_multiplier: float = 0.25     # quarter-Kelly
     kelly_cap: float = 1.0
-    # 0.02 -> 0.05, forced by the min_order_notional change above. This is the
-    # PRE-WARM sizing fraction, so it sets the order cap during exactly the
-    # period when no stream has enough closed trades for a real edge estimate.
-    # At 0.02 against initial_cash=100_000 the cap is 0.02 * 100k = $2,000 --
-    # numerically EQUAL to min_order_notional, so every pre-warm order the
-    # policy sized below its own Kelly cap would be dropped as dust, almost
-    # nothing would fill, almost nothing would close, and the edge estimate
-    # could never warm: a rebuild of the exact chicken-and-egg deadlock
-    # kelly_min_fraction below was added to break. 0.05 gives a $5,000
-    # pre-warm cap, a clear $2,000-$5,000 band of orders that can actually
-    # pass the gate.
-    kelly_default_fraction: float = 0.05
+    # PRE-WARM sizing fraction: sets the order cap during exactly the period
+    # when no stream has enough closed trades for a real edge estimate. Keep
+    # `kelly_default_fraction * initial_cash` comfortably ABOVE
+    # min_order_notional (here 0.02 * 10_000 = $200 vs a $100 gate) or every
+    # pre-warm order is dropped as dust and the edge estimate can never warm.
+    kelly_default_fraction: float = 0.02
 
     # TRAINING-ONLY floor on the post-multiplier fractional Kelly (see
     # kelly_sizing.py's __init__ docstring). Consumed ONLY by train.py's
@@ -342,11 +335,9 @@ class RiskConfig:
     # restart. Kept EQUAL to kelly_default_fraction (the size used pre-warm),
     # i.e. "keep exploring at the conservative default size" rather than
     # "stop trading forever the first time the estimate turns negative".
-    # Raised 0.02 -> 0.05 alongside it -- see that field for why the old value
-    # collided with min_order_notional at the new account size. If either is
-    # retuned, move BOTH, and keep the floor strictly above
+    # If either is retuned, move BOTH, and keep the floor strictly above
     # min_order_notional / initial_cash or the deadlock returns.
-    kelly_min_fraction: float = 0.05
+    kelly_min_fraction: float = 0.02
 
     # kill_switch.py -- KillSwitch
     daily_loss_limit_frac: float = 0.03
