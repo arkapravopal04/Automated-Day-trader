@@ -247,6 +247,31 @@ OVERTRADE_SURCHARGE_BPS = float(os.environ.get("TRADING_OVERTRADE_SURCHARGE_BPS"
 # which model exchange/broker commission proper). Set to 0.0 to disable.
 PLATFORM_FEE_PER_TRADE = float(os.environ.get("TRADING_PLATFORM_FEE_PER_TRADE", "1.0"))
 
+# --- Liquidity-proxy scaling: single-venue (IEX) volume -> consolidated ---
+# fetch_alpaca.py's DEFAULT_DATA_FEED is "iex", so every bar's `volume`
+# column is IEX-only prints, NOT consolidated tape volume. IEX is roughly
+# 2-3% of total US equity volume, and measuring this dataset against
+# real-world figures confirms it: AAPL 1.17M/day here vs ~45M actual,
+# BAC 1.18M vs ~35M, ABBV 186k vs ~6M -- a consistent ~30-40x shortfall.
+#
+# That matters because vec_trading_env.py feeds this volume to
+# execution_sim.py as `bar_liquidity_proxy`, where participation =
+# order_size / volume drives a SQRT market-impact term. Understating volume
+# ~35x overstates participation ~35x, and because sqrt(x) >> x for small x
+# the resulting slippage is wildly overstated: a 1.33-share order against a
+# 1,736-share median bar paid 0.277% one-way (0.55% round trip) against a
+# 0.056% median 5-minute price move -- i.e. every trade was structurally
+# unprofitable before the policy made any decision at all.
+#
+# Alpaca routes retail orders across venues, not to IEX alone, so
+# consolidated volume is the correct liquidity proxy for what a real fill
+# would see. Scaling here (rather than lowering impact_coef to compensate)
+# keeps the impact MODEL honest and fixes the input that was actually
+# wrong. Set TRADING_VOLUME_SCALE=1.0 to disable, or switch the feed
+# entirely with ALPACA_DATA_FEED=sip (needs a paid Alpaca subscription) and
+# then set this back to 1.0 -- SIP volume is already consolidated.
+VOLUME_SCALE = float(os.environ.get("TRADING_VOLUME_SCALE", "35.0"))
+
 # On Kaggle, opportunistically seed from an attached input dataset the first
 # time these directories are touched. Cheap no-op everywhere else.
 if is_kaggle():

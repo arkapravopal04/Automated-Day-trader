@@ -64,6 +64,7 @@ from paths import (  # noqa: E402
     OVERTRADE_FREE_TRADES,
     OVERTRADE_SURCHARGE_BPS,
     PLATFORM_FEE_PER_TRADE,
+    VOLUME_SCALE,
 )
 from execution_sim import ExecutionSimulator, SimulatedFill  # noqa: E402
 from portfolio_state import PortfolioState, Fill  # noqa: E402
@@ -123,10 +124,18 @@ def load_aligned_volumes(tickers: Sequence[str], aligned_dates: pd.DatetimeIndex
     volume as the last real bar." Zero volume correctly makes
     max_participation * 0 = 0 fillable shares that bar in execution_sim.py,
     which is the right behavior for a halt, not an artifact to paper over.
+    Scaling below preserves that: 0 * anything is still 0.
+
+    Volume is then scaled by paths.VOLUME_SCALE to convert single-venue
+    (IEX) prints into an approximation of consolidated tape volume -- see
+    that constant's comment in paths.py for the measured justification and
+    for how to disable it (TRADING_VOLUME_SCALE=1.0, or switch to the SIP
+    feed which is already consolidated).
 
     Returns: np.ndarray of shape [T, n_tickers], float32.
     """
-    return _load_aligned_column(tickers, aligned_dates, "volume", lambda df: df.fillna(0.0))
+    volumes = _load_aligned_column(tickers, aligned_dates, "volume", lambda df: df.fillna(0.0))
+    return (volumes * VOLUME_SCALE).astype(np.float32)
 
 
 @dataclass

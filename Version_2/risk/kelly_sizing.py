@@ -63,14 +63,40 @@ class KellySizer:
         kelly_multiplier: float = 0.25,     # quarter-Kelly
         kelly_cap: float = 1.0,             # never let raw f* exceed this before the multiplier
         default_fraction: float = 0.02,     # conservative fallback while warming up / no history
+        min_fraction: float = 0.0,          # floor on the POST-multiplier fraction -- see below
         device: Optional[str] = None,
     ) -> None:
+        """
+        min_fraction: hard floor applied to the post-multiplier fractional
+        Kelly. Defaults to 0.0, which is exactly the historical behavior
+        (a non-positive edge estimate zeroes the cap outright) -- eval/
+        backtest_report.py and live/live_loop.py both construct this class
+        without the argument and are therefore bit-identical to before.
+
+        TRAINING ONLY, and only via train.py's build_risk_pipeline(): a
+        floor > 0 exists to break the exploration deadlock this project hit
+        (see that function's comment and risk/kelly_sizing diagnostics in
+        the metrics log). Kelly estimates edge from REALIZED closed trades.
+        A randomly-initialized PPO policy has negative realized edge after
+        any non-zero transaction cost, so raw_kelly clamps to 0, which caps
+        every exposure-increasing order at 0 shares, which means no trade
+        ever closes, which freezes the very PnL history the estimate is
+        built from -- a permanent lock reached within the FIRST rollout and
+        re-reached on every restart (KellySizer state is not checkpointed).
+        Kelly is a capital-allocation rule for a strategy with a known
+        edge; during exploration the agent has to be allowed to keep taking
+        small positions in order to generate the experience Kelly later
+        measures. The floor never blocks or shrinks anything -- it only
+        stops the cap from reaching exactly zero -- and RiskManager's hard
+        position/exposure/drawdown caps still run downstream, unchanged.
+        """
         self.n_envs = n_envs
         self.lookback_trades = lookback_trades
         self.min_trades_for_estimate = min_trades_for_estimate
         self.kelly_multiplier = kelly_multiplier
         self.kelly_cap = kelly_cap
         self.default_fraction = default_fraction
+        self.min_fraction = min_fraction
         self.device = torch.device(device) if device is not None else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
@@ -229,12 +255,18 @@ class KellySizer:
         )
 
     def _fractional_kelly(self, raw_kelly: Tensor, is_warm: Tensor) -> Tensor:
-        """Applies kelly_multiplier where warm, falls back to default_fraction otherwise."""
-        return torch.where(
+        """
+        Applies kelly_multiplier where warm, falls back to default_fraction
+        otherwise, then floors the result at min_fraction (default 0.0 =
+        no floor = historical behavior; see __init__'s docstring for why a
+        training run sets this above zero).
+        """
+        fraction = torch.where(
             is_warm,
             raw_kelly * self.kelly_multiplier,
             torch.full_like(raw_kelly, self.default_fraction),
         )
+        return fraction.clamp(min=self.min_fraction)
 
     @staticmethod
     def _cap_growing_size(

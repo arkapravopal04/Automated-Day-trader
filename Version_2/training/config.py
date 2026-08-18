@@ -125,7 +125,20 @@ FRICTION_PRESETS: Dict[str, Dict[str, Any]] = {
     ),
     "realistic": dict(
         spread_bps=1.0,
-        impact_coef=0.1,
+        # 0.1 -> 0.015: recalibrated to the standard square-root impact law,
+        # impact ~= Y * sigma_daily * sqrt(Q/V) with Y ~ 0.5-1 and
+        # sigma_daily ~ 1.5%, i.e. a coefficient near 0.015 -- NOT 0.1, which
+        # is ~7x the literature value and was never calibrated against
+        # anything. It matters most at SMALL order sizes, because sqrt(x) >> x
+        # for small x: at the ~1.3-share orders this project actually trades
+        # (participation ~2e-5 of a consolidated bar) the old 0.1 charged
+        # 0.047% one-way -- roughly 5x the half-spread for an order that in
+        # reality moves the market not at all. Combined with the separate
+        # IEX-volume bug (see paths.py's VOLUME_SCALE) this produced a 0.55%
+        # round-trip cost against a 0.056% median 5-minute move. At 0.015 a
+        # micro order pays ~0.005% one-way (negligible, correct) while a
+        # genuine 10%-of-bar order still pays ~0.24%.
+        impact_coef=0.015,
         max_participation=0.1,
         commission_per_share=0.0,
         commission_bps=0.5,
@@ -161,7 +174,11 @@ class EnvConfig:
                                           # Informational once set via for_friction(); the fields below
                                           # are what VecTradingEnv actually reads.
     spread_bps: float = 1.0
-    impact_coef: float = 0.1
+    impact_coef: float = 0.015   # 0.1 -> 0.015, kept in sync with FRICTION_PRESETS["realistic"] --
+                                  # see that entry for the square-root-law calibration rationale.
+                                  # These dataclass defaults (not the preset) are what training
+                                  # actually reads, since train.py builds TrainingConfig() directly
+                                  # rather than going through EnvConfig.for_friction().
     max_participation: float = 0.1
     commission_per_share: float = 0.0
     commission_bps: float = 0.5
@@ -253,6 +270,29 @@ class RiskConfig:
     kelly_multiplier: float = 0.25
     kelly_cap: float = 1.0
     kelly_default_fraction: float = 0.02
+
+    # TRAINING-ONLY floor on the post-multiplier fractional Kelly (see
+    # kelly_sizing.py's __init__ docstring). Consumed ONLY by train.py's
+    # build_risk_pipeline(), which is called only by train.py /
+    # train_ddp.py / hyperparam_sweep.py -- eval/backtest_report.py and
+    # live/live_loop.py build their own KellySizer without this argument
+    # and keep the strict min_fraction=0.0 behavior, so live/backtest risk
+    # semantics are unchanged.
+    #
+    # Why it exists (measured, not theoretical): with min_fraction=0.0 the
+    # first training run to log Kelly diagnostics showed ALL 100 streams at
+    # fractional_kelly == 0.0 by the END of rollout 0 -- mean win_rate
+    # 0.0156, mean payoff_ratio 0.0672, 73/100 streams with literally zero
+    # winning trades. Reconstructing those same round trips at mid price
+    # (no slippage) gave a fair 44% win rate, so the edge estimate was
+    # measuring execution cost, not policy skill. Once the cap hits 0 no
+    # position can be opened, so no trade closes, so the estimate can never
+    # update: total_trades froze at 4359 and net worth sat at exactly
+    # 994497.19 for 1792 consecutive ticks. Same lock reappeared on every
+    # restart. 0.02 matches kelly_default_fraction (the size used pre-warm),
+    # i.e. "keep exploring at the conservative default size" rather than
+    # "stop trading forever the first time the estimate turns negative".
+    kelly_min_fraction: float = 0.02
 
     # kill_switch.py -- KillSwitch
     daily_loss_limit_frac: float = 0.03

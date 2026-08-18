@@ -83,6 +83,12 @@ def build_risk_pipeline(cfg: TrainingConfig, n_envs: int, device: torch.device):
         kelly_multiplier=cfg.risk.kelly_multiplier,
         kelly_cap=cfg.risk.kelly_cap,
         default_fraction=cfg.risk.kelly_default_fraction,
+        # TRAINING-ONLY exploration floor -- see RiskConfig.kelly_min_fraction
+        # and kelly_sizing.py's __init__ docstring. This function is called
+        # only from train.py / train_ddp.py / hyperparam_sweep.py;
+        # eval/backtest_report.py and live/live_loop.py construct their own
+        # KellySizer without it and keep the strict zero-floor behavior.
+        min_fraction=cfg.risk.kelly_min_fraction,
         device=str(device),
     )
     risk_manager = RiskManager(
