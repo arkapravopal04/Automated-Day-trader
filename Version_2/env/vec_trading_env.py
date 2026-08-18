@@ -121,10 +121,17 @@ def load_aligned_volumes(tickers: Sequence[str], aligned_dates: pd.DatetimeIndex
 
     Deliberately fillna(0), NOT ffill like price: a missing/halted bar
     genuinely traded zero shares in that window, it did not trade "the same
-    volume as the last real bar." Zero volume correctly makes
-    max_participation * 0 = 0 fillable shares that bar in execution_sim.py,
-    which is the right behavior for a halt, not an artifact to paper over.
-    Scaling below preserves that: 0 * anything is still 0.
+    volume as the last real bar." Zero volume makes that bar unfillable in
+    execution_sim.py, which is the right behavior for a halt, not an
+    artifact to paper over. Scaling below preserves that: 0 * anything is
+    still 0.
+
+    NOTE: this was only true in the docstring until execution_sim.py's
+    ZERO-LIQUIDITY FIX -- that file clamped the proxy to 1e-6 BEFORE the
+    fill-size cap, so a zero-volume bar yielded a 1e-07-share fill (charged
+    a full ticket fee) instead of no fill. See the comment in its
+    simulate_fill() for the measurement. Roughly 11% of cells on the
+    aligned union grid are no-bar cells, so this path is common, not rare.
 
     Volume is then scaled by paths.VOLUME_SCALE to convert single-venue
     (IEX) prints into an approximation of consolidated tape volume -- see

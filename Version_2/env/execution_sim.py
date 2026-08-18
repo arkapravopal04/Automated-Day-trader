@@ -147,12 +147,45 @@ class ExecutionSimulator:
         size = size.to(self.device).float().clamp(min=0.0)
         limit_offset = limit_offset.to(self.device).float()
         mid_price = mid_price.to(self.device).float()
-        bar_liquidity_proxy = bar_liquidity_proxy.to(self.device).float().clamp(min=1e-6)
+
+        # ZERO-LIQUIDITY FIX. The clamp below exists so the participation
+        # DIVISION (filled/proxy, in _compute_fill_price) can't divide by
+        # zero -- but applying it before the fill-size cap silently turned
+        # "this bar did not trade" into "this bar can absorb 1e-7 shares":
+        #     max_fillable = max_participation * clamp(0.0, min=1e-6)
+        #                  = 0.1 * 1e-6 = 1e-07 shares
+        # So a halted/missing bar produced a NON-ZERO fill of exactly 1e-07
+        # shares, which is a real fill as far as portfolio_state.py is
+        # concerned: it books a position change and gets charged full
+        # commission AND the flat platform ticket fee.
+        #
+        # Measured on a real 50-rollout run: every single sub-$1 fill in the
+        # log was exactly 1.000e-07 shares -- notionals like $0.0000153 --
+        # and they were ~54% of all fills in the sampled window. At $1.00 a
+        # ticket that is pure, structural waste, and it bypassed
+        # risk_manager.py's min_order_notional gate entirely because that
+        # gate (correctly) checks the REQUESTED size, while this dust is
+        # manufactured downstream of it by the participation cap.
+        #
+        # vec_trading_env.load_aligned_volumes()'s docstring already claimed
+        # this behavior ("Zero volume correctly makes max_participation * 0
+        # = 0 fillable shares") -- the clamp is what made that false. Zero
+        # liquidity now means NO fill, and the clamp is kept purely for the
+        # division safety it was actually there for.
+        raw_liquidity = bar_liquidity_proxy.to(self.device).float()
+        no_liquidity = raw_liquidity <= 0
+        bar_liquidity_proxy = raw_liquidity.clamp(min=1e-6)
         overtrading_factor = self._prepare_overtrading_factor(overtrading_factor, mid_price)
 
-        no_order = (direction == 0) | (size == 0)
+        no_order = (direction == 0) | (size == 0) | no_liquidity
 
-        filled_size, is_partial = self._apply_participation_cap(size, bar_liquidity_proxy, no_order)
+        # RAW liquidity here, not the clamped copy: the fill cap must scale
+        # with the volume that actually traded. Passing the clamped value
+        # imposed a hard floor of max_participation * 1e-6 = 1e-7 shares on
+        # EVERY bar regardless of real volume, which is the dust bug above.
+        # The clamped copy is still used for _compute_fill_price's
+        # participation division, which is the only thing it was for.
+        filled_size, is_partial = self._apply_participation_cap(size, raw_liquidity, no_order)
 
         fill_price = self._compute_fill_price(
             direction=direction,
