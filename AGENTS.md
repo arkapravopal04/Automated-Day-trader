@@ -25,5 +25,6 @@ As of the last full sweep, all ~29 files across paths/fetch/preprocess/dataset/d
 
 ## Working agreement for this project
 - Training runs (Kaggle or local) → background them, don't babysit interactively (see SOUL.md Budget & Session Hygiene).
+- Hyperparameter sweep → `sweep_kaggle.py` (one cell per T4, all session GPUs in parallel; 15 rollouts/cell default; ~38s/rollout measured on Kaggle). Local `hyperparam_sweep.py` is CPU-only and not viable for sweeps. Two parallel sessions (`--cells 0-7` / `--cells 8-14`) + `--merge-only` gets the full grid done in ~1h.
 - One tuning hypothesis per session (e.g. reward shaping OR position sizing OR curriculum mix — not all three in one sprawling session).
 - Before claiming a change improved profitability, run it through `eval/backtest_report.py`'s deterministic backtest — don't eyeball training curves alone.

@@ -45,6 +45,44 @@ Notes:
 - Dual-GPU: `python train_ddp.py --resume latest [--total-rollouts N]`
   (checkpoint dir / metrics path / logging cadence all overridable).
 
+## Hyperparameter sweep (Kaggle, ~1 hour)
+
+`sweep_kaggle.py` runs the Tier-0 screening grid (15 one-at-a-time cells
+from `hyperparam_sweep.py`) as one real training run per cell, one cell per
+GPU, all session GPUs in parallel — no DDP needed since cells are
+independent. Per-cell budget defaults to 15 rollouts (vs 50 locally) because
+the sweep exists to *rule out* early pathology (entropy collapse, zero
+trades), which shows in the first handful of rollouts. Measured cost on a
+T4: ~38s/rollout (100 tickers, 256-step rollout, fp32), so:
+
+| cells x rollouts | 1 session (2 GPUs) | 2 sessions (4 GPUs) |
+|---|---|---|
+| 15 x 15 | ~88 min | ~44 min |
+| 13 x 15 (drop clip_range cells 13,14) | ~77 min | ~44 min |
+| 15 x 20 | ~113 min | ~57 min |
+
+Plus ~5-10 min boot. So: one session with `--cells 0-12` gets the full
+grid minus clip_range in ~1.3h; two parallel sessions get everything in
+~1h.
+
+```bash
+# one session, full grid (~1.5h), or --cells 0-12 to drop clip_range (~1.3h)
+!python Version_2/sweep_kaggle.py --rollouts 15
+
+# ~1h plan: two parallel sessions, split the grid
+!python Version_2/sweep_kaggle.py --cells 0-7     # session A
+!python Version_2/sweep_kaggle.py --cells 8-14    # session B
+# then pull both sessions' sweep_output trees together and aggregate:
+!python Version_2/sweep_kaggle.py --merge-only --output-dir sweep_output
+```
+
+Output: `sweep_output/results.csv`, per-run `run_<id>/` dirs (metrics.jsonl,
+result.json, stdout.log), and a printed per-knob winner table (still-trading
++ non-collapsed entropy, best reward_ema) that feeds directly into editing
+`training/config.py` defaults. Cells are fingerprinted, so re-runs and
+crash recovery only retrain what's missing. Prereq: processed data
+(`run_kaggle.py --preprocess` or your cached data Dataset).
+
 ## Module Map
 
 ### Entry points

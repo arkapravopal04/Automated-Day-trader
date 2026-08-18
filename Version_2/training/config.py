@@ -334,15 +334,27 @@ class PPOConfig:
     rollout_length: int = 256            # T env-steps per stream, per rollout
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_range: float = 0.2
+    clip_range: float = 0.15
     value_clip_range: float = 0.2
-    entropy_coef_discrete: float = 0.02    # applied to the direction head's entropy independently
-    entropy_coef_continuous: float = 0.01  # applied to the (FLAT-masked) size + limit_offset entropy independently
+    entropy_coef_discrete: float = 0.05    # applied to the direction head's entropy independently.
+                                            # Raised 0.02 -> 0.05: 0.02 let PPO collapse to
+                                            # always-FLAT ("stopped trading entirely") as a locally
+                                            # safe optimum against real transaction costs -- see
+                                            # hyperparam_sweep.py's SweptParam docstring. 0.05 keeps
+                                            # enough exploration pressure on the SHORT/FLAT/LONG head
+                                            # to keep trading, without the 0.10 over-regularization.
+    entropy_coef_continuous: float = 0.02  # applied to the (FLAT-masked) size + limit_offset entropy
+                                            # independently. Raised 0.01 -> 0.02 to keep the Beta
+                                            # size/limit_offset heads exploring instead of collapsing.
     value_loss_coef: float = 0.5
     max_grad_norm: float = 0.5
-    ppo_epochs: int = 4                   # full-batch epochs per rollout -- see ppo_hybrid.py docstring
-                                            # re: time-axis shuffling being unsafe for a stateful LSTM
-    learning_rate: float = 3e-4
+    ppo_epochs: int = 3                   # full-batch epochs per rollout -- see ppo_hybrid.py docstring
+                                            # re: time-axis shuffling being unsafe for a stateful LSTM.
+                                            # Lowered 4 -> 3: with no KL early-stop, 4 full-batch epochs
+                                            # per rollout overfits the batch and accelerates entropy
+                                            # collapse; 3 still learns the batch without overshooting.
+    learning_rate: float = 1e-4           # lowered 3e-4 -> 1e-4 for stability: the hotter rate
+                                            # overshot the policy into the flat regime on the last run.
     adam_eps: float = 1e-5
 
 
