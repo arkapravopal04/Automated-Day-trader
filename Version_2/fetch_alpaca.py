@@ -92,7 +92,24 @@ HISTORY_YEARS = int(os.getenv("ALPACA_HISTORY_YEARS", "6"))
 # ALPACA_ADJUSTMENT=raw|split|dividend|all. Anything other than "all" will
 # reintroduce unadjusted price jumps -- see the note in the request below.
 ADJUSTMENT = Adjustment(os.getenv("ALPACA_ADJUSTMENT", "all").lower())
-DEFAULT_DATA_FEED = "iex"
+DEFAULT_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "sip")
+
+# Alpaca's free tier serves full historical SIP but blocks the most recent
+# ~15 minutes ("subscription does not permit querying recent SIP data").
+# Verified 2026-08-19: SIP at -24h -> 200, SIP at -10min -> 403.
+#
+# This matters because the 403 is caught below and silently retried on IEX.
+# Since end_date is "now", EVERY ticker's request would span the blocked
+# window, 403, and fall back -- handing back IEX bars for all 100 tickers
+# while the caller believes it has SIP. IEX volume is a small fraction of
+# consolidated volume (77k vs 5.65M on one sampled AAPL bar), so that would
+# understate volume ~70x, inflate participation, and overcharge sqrt-impact:
+# exactly the Session 1 bug, minus the VOLUME_SCALE fudge that was
+# compensating for it.
+#
+# So on SIP we simply never ask for the last SIP_LAG_MINUTES. Losing the
+# most recent quarter-hour of a six-year history costs nothing for training.
+SIP_LAG_MINUTES = int(os.getenv("ALPACA_SIP_LAG_MINUTES", "20"))
 
 
 def _default_skip_fetch() -> bool:
@@ -306,6 +323,17 @@ def fetch_incremental_data(ticker: str, end_date: datetime) -> None:
         return
 
     feed = os.getenv("ALPACA_DATA_FEED", DEFAULT_DATA_FEED)
+
+    # Hold the request end off the SIP embargo window -- see SIP_LAG_MINUTES.
+    if feed == "sip":
+        capped_end = min(end_date, datetime.now(timezone.utc) - timedelta(minutes=SIP_LAG_MINUTES))
+        if capped_end <= start_date:
+            print(
+                f"  └─ [{ticker}] Already current to within the {SIP_LAG_MINUTES}-min SIP "
+                "embargo window -- nothing to fetch."
+            )
+            return
+        end_date = capped_end
     # Alpaca defaults to Adjustment.RAW -- unadjusted for splits. Raw closes
     # feed BOTH the feature pipeline (one ~-90% log return per split; observed
     # z-scores up to 770) and position marking in load_aligned_close_prices()
@@ -329,8 +357,10 @@ def fetch_incremental_data(ticker: str, end_date: datetime) -> None:
         except Exception as exc:
             if feed == "sip" and "subscription does not permit" in str(exc):
                 print(
-                    f"  └─ [{ticker}] SIP feed not available on this account, "
-                    "retrying with IEX feed..."
+                    f"  └─ [{ticker}] *** SIP REJECTED, FALLING BACK TO IEX *** -- this "
+                    f"ticker's volume will be ~70x lower than SIP tickers in the same cache. "
+                    f"A mixed-feed cache silently corrupts participation and impact costs; "
+                    f"re-fetch this ticker on one feed before training. Error: {exc}"
                 )
                 request_params.feed = "iex"
                 bars = _fetch_bars_with_retry(client, request_params)

@@ -248,7 +248,8 @@ OVERTRADE_SURCHARGE_BPS = float(os.environ.get("TRADING_OVERTRADE_SURCHARGE_BPS"
 PLATFORM_FEE_PER_TRADE = float(os.environ.get("TRADING_PLATFORM_FEE_PER_TRADE", "1.0"))
 
 # --- Liquidity-proxy scaling: single-venue (IEX) volume -> consolidated ---
-# fetch_alpaca.py's DEFAULT_DATA_FEED is "iex", so every bar's `volume`
+# HISTORICAL CONTEXT -- see "RESOLVED" at the bottom of this block first.
+# fetch_alpaca.py's DEFAULT_DATA_FEED used to be "iex", so every bar's `volume`
 # column is IEX-only prints, NOT consolidated tape volume. IEX is roughly
 # 2-3% of total US equity volume, and measuring this dataset against
 # real-world figures confirms it: AAPL 1.17M/day here vs ~45M actual,
@@ -267,10 +268,26 @@ PLATFORM_FEE_PER_TRADE = float(os.environ.get("TRADING_PLATFORM_FEE_PER_TRADE", 
 # consolidated volume is the correct liquidity proxy for what a real fill
 # would see. Scaling here (rather than lowering impact_coef to compensate)
 # keeps the impact MODEL honest and fixes the input that was actually
-# wrong. Set TRADING_VOLUME_SCALE=1.0 to disable, or switch the feed
-# entirely with ALPACA_DATA_FEED=sip (needs a paid Alpaca subscription) and
-# then set this back to 1.0 -- SIP volume is already consolidated.
-VOLUME_SCALE = float(os.environ.get("TRADING_VOLUME_SCALE", "35.0"))
+# wrong.
+#
+# RESOLVED 2026-08-19: the fudge is no longer needed. The free Alpaca tier
+# does serve full historical SIP -- only the trailing ~15 minutes is
+# embargoed, which the fetch now steps around (see fetch_alpaca.py's
+# SIP_LAG_MINUTES). DEFAULT_DATA_FEED is therefore "sip" and bar volume is
+# already consolidated, so the correct scale is 1.0.
+#
+# The 35x estimate was also wrong in a way worth recording: measured on one
+# year of AAPL regular-hours bars, SIP median volume is 318,938 against
+# IEX's 14,008 -- a ratio of ~23x, not 35x. Scaling IEX by 35 therefore
+# OVERSTATED volume by ~1.5x, understating participation and UNDERcharging
+# sqrt-impact. (A single earlier spot-check suggested ~73x; that was one
+# unrepresentative bar, which is exactly why per-bar samples are a bad way
+# to calibrate a constant like this.)
+#
+# Leave this at 1.0 whenever the cache was fetched on SIP. It is only
+# meaningful for an IEX-fetched cache, and mixing the two in one cache is a
+# silent corruption -- fetch_alpaca.py shouts loudly if a ticker falls back.
+VOLUME_SCALE = float(os.environ.get("TRADING_VOLUME_SCALE", "1.0"))
 
 # On Kaggle, opportunistically seed from an attached input dataset the first
 # time these directories are touched. Cheap no-op everywhere else.

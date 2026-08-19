@@ -50,6 +50,22 @@ if len(HORIZONS) != len(set(HORIZONS)):
     raise ValueError(f"HORIZONS contains duplicate values: {HORIZONS} -- would create duplicate feature columns")
 
 REQUIRED_RAW_COLUMNS = {"open", "high", "low", "close", "volume", "vwap"}
+
+# Regular US equity trading hours, as minutes past midnight America/New_York:
+# 09:30 (570) inclusive to 16:00 (960) exclusive == 78 five-minute bars.
+#
+# The SIP feed returns extended-hours bars too -- measured on AAPL, 184.6
+# bars/day of which only 78.0 are RTH (IEX by contrast was 95.6% RTH, so
+# this barely mattered before). Every window constant in this file assumes
+# the RTH cadence: VOL_WINDOW=78 means "one trading day", rv annualises by
+# sqrt(252*78), and day_fraction below clips minutes_since_open/390 to
+# [0,1] -- which silently encodes every pre-market bar identically to the
+# open and every post-market bar identically to the close. Filtering here
+# rather than at fetch keeps the raw cache complete (overnight-gap features
+# may want it later); load_aligned_close_prices() reindexes raw onto the
+# feature index, so the dropped bars fall out of the price path too.
+RTH_START_MIN = 9 * 60 + 30
+RTH_END_MIN = 16 * 60
 # Longest rolling window used anywhere below -- used to sanity-check that a
 # ticker has enough history to produce any non-NaN feature rows.
 MIN_ROWS_REQUIRED = max(VOL_WINDOW, RV_WINDOW, max(HORIZONS)) + 1
@@ -162,6 +178,24 @@ def process_ticker(ticker: str) -> pd.DataFrame:
     if len(df) < MIN_ROWS_REQUIRED:
         raise ValueError(
             f"{ticker}: only {len(df)} rows remain after dropping bad-price rows, need at least "
+            f"{MIN_ROWS_REQUIRED} to compute rolling features"
+        )
+
+    # Restrict to regular trading hours -- see RTH_START_MIN. Done before any
+    # feature computation so rolling windows never span an overnight or
+    # extended-hours gap in units they don't expect.
+    ny_index = df.index.tz_convert("America/New_York")
+    minutes_of_day = ny_index.hour * 60 + ny_index.minute
+    rth_mask = (minutes_of_day >= RTH_START_MIN) & (minutes_of_day < RTH_END_MIN)
+    n_ext = int((~rth_mask).sum())
+    if n_ext:
+        print(f"  [INFO] {ticker}: dropping {n_ext} extended-hours bar(s) "
+              f"({n_ext / len(df):.1%}), keeping {int(rth_mask.sum())} RTH bars")
+    df = df[rth_mask]
+
+    if len(df) < MIN_ROWS_REQUIRED:
+        raise ValueError(
+            f"{ticker}: only {len(df)} regular-hours rows remain, need at least "
             f"{MIN_ROWS_REQUIRED} to compute rolling features"
         )
 
