@@ -241,7 +241,7 @@ class VecTradingEnv:
         hold_loser_penalty: float = 0.0005,
         enable_mirroring: bool = True,
         mirror_prob: float = MIRROR_PROB,
-        return_feature_keywords: Tuple[str, ...] = ("ret", "mom"),
+        return_feature_keywords: Tuple[str, ...] = ("ret", "mom", "vwap", "pres", "resid"),
         overtrade_window: int = OVERTRADE_WINDOW,       # ~1hr of 5-min bars by default
         overtrade_free_trades: int = OVERTRADE_FREE_TRADES,   # trades allowed in the window before surcharge kicks in
         overtrade_surcharge_bps: float = OVERTRADE_SURCHARGE_BPS,
@@ -287,6 +287,17 @@ class VecTradingEnv:
         # the observation stays consistent with the mirrored price path.
         # Volatility-style features (e.g. 'rv') are magnitude-based and are
         # deliberately left untouched.
+        #
+        # Keyword -> feature, as of preprocess.FEATURE_COLUMNS:
+        #   "ret"   -> log_ret, log_ret_3/6/12    (flip)
+        #   "vwap"  -> vwap_dev                   (flip)
+        #   "pres"  -> intrabar_pres              (flip)
+        #   "resid" -> xs_resid                   (flip)
+        # Deliberately unmatched, and must stay that way: 'rv', 'vol_z',
+        # 'time_sin', 'time_cos' are magnitudes or absolute clock position,
+        # and flipping them would corrupt mirrored observations rather than
+        # correct them. Confirm against the "[env] mirroring will sign-flip"
+        # line printed below on every construction.
         # market_feature_names, NOT feature_names: mirroring is applied to the
         # raw dataset observation BEFORE the portfolio channels are appended,
         # so these indices must address the market block only.

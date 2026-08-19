@@ -29,10 +29,27 @@ HORIZONS = [3, 6, 12] # Lag steps representing 15m, 30m, and 1h past returns
 RV_WINDOW = 12 # Realized volatility rolling window (1 hour)
 VOL_WINDOW = 78 # Volume z-score rolling window (1 full trading day)
 
+# Feature columns, in the order they appear in the tensor. Defined once here
+# so process_ticker()'s finite-check and generate_features_and_metadata()'s
+# metadata registry can never drift apart.
+#
+# Direction-sensitive features (sign-flipped for mirrored streams by
+# VecTradingEnv) must contain one of env.return_feature_keywords in their
+# name: 'log_ret*' and 'xs_resid' match "ret"/"resid", 'vwap_dev' matches
+# "vwap", 'intrabar_pres' matches "pres". Magnitude-only features ('rv',
+# 'vol_z', 'time_*') must NOT match any keyword. Renaming a column here
+# without checking that tuple silently breaks mirroring: mirrored streams
+# get flipped prices against unflipped signals.
+FEATURE_COLUMNS = (
+    ['log_ret', 'rv', 'vol_z', 'time_sin', 'time_cos']
+    + [f'log_ret_{h}' for h in HORIZONS]
+    + ['vwap_dev', 'intrabar_pres', 'xs_resid']
+)
+
 if len(HORIZONS) != len(set(HORIZONS)):
     raise ValueError(f"HORIZONS contains duplicate values: {HORIZONS} -- would create duplicate feature columns")
 
-REQUIRED_RAW_COLUMNS = {"open", "high", "low", "close", "volume"}
+REQUIRED_RAW_COLUMNS = {"open", "high", "low", "close", "volume", "vwap"}
 # Longest rolling window used anywhere below -- used to sanity-check that a
 # ticker has enough history to produce any non-NaN feature rows.
 MIN_ROWS_REQUIRED = max(VOL_WINDOW, RV_WINDOW, max(HORIZONS)) + 1
@@ -129,7 +146,7 @@ def process_ticker(ticker: str) -> pd.DataFrame:
     # would (a single close<=0 row poisons that row AND, via shift(), the
     # next H rows too, which is exactly why we drop the row itself here
     # rather than letting log() emit -inf/NaN and relying on later dropna).
-    bad_price_mask = (df[["open", "high", "low", "close"]] <= 0).any(axis=1)
+    bad_price_mask = (df[["open", "high", "low", "close", "vwap"]] <= 0).any(axis=1)
     if bad_price_mask.any():
         n_bad = int(bad_price_mask.sum())
         bad_frac = n_bad / len(df)
@@ -174,9 +191,38 @@ def process_ticker(ticker: str) -> pd.DataFrame:
     day_fraction = np.clip(minutes_since_open / 390.0, 0, 1)
     df['time_sin'] = np.sin(day_fraction * 2 * np.pi)
     df['time_cos'] = np.cos(day_fraction * 2 * np.pi)
+
+    # 6. VWAP deviation -- where the bar closed relative to its own
+    # volume-weighted average price. Strongest single signal measured
+    # (IC -0.0044, t=-6.0) vs the close-derived family's IC -0.0010 (t=-1.3,
+    # indistinguishable from noise). Direction-sensitive.
+    df['vwap_dev'] = (df['close'] - df['vwap']) / df['vwap']
+
+    # 7. Intrabar pressure -- close position within the bar's range, as
+    # (distance off the low) minus (distance off the high). +1 = closed on
+    # the high, -1 = closed on the low. Direction-sensitive.
+    #
+    # high == low on a flat/no-trade bar, which would divide by zero. Those
+    # are 1.3%-11.7% of bars depending on ticker (AMGN 11.7%, AVGO 10.1%),
+    # far too many to drop -- doing so would punch scattered holes through
+    # the middle of every series, not just trim the leading rolling-window
+    # rows. A zero-range bar carries no directional pressure information, so
+    # 0.0 is the honest encoding rather than a missing value.
+    rng = df['high'] - df['low']
+    df['intrabar_pres'] = (
+        ((df['close'] - df['low']) - (df['high'] - df['close'])) / rng.where(rng > 0)
+    ).fillna(0.0)
+
     
     # Remove leading rows that contain NaNs due to rolling window calculations
     df.dropna(inplace=True)
+
+    # 8. Cross-sectional residual return -- placeholder, created AFTER the
+    # dropna above (an all-NaN column would otherwise delete every row).
+    # Requires the whole universe on a common index, which this per-ticker
+    # function cannot see; generate_features_and_metadata() fills it in a
+    # second pass and finite-checks it before normalising.
+    df['xs_resid'] = np.nan
 
     if df.empty:
         raise ValueError(
@@ -186,8 +232,11 @@ def process_ticker(ticker: str) -> pd.DataFrame:
 
     # Any remaining non-finite values (e.g. inf from a pathological std==0
     # edge case) would silently poison training -- fail loudly instead.
-    feature_cols = ['log_ret', 'rv', 'vol_z', 'time_sin', 'time_cos'] + [f'log_ret_{h}' for h in HORIZONS]
-    if not np.isfinite(df[feature_cols].to_numpy()).all():
+    # 'xs_resid' is still all-NaN here by construction (filled in pass 2), so
+    # it is excluded -- generate_features_and_metadata() finite-checks the
+    # full set, this one included, after the cross-sectional pass.
+    finite_cols = [c for c in FEATURE_COLUMNS if c != 'xs_resid']
+    if not np.isfinite(df[finite_cols].to_numpy()).all():
         raise ValueError(f"{ticker}: non-finite (inf/NaN) values remain in engineered features")
 
     return df
@@ -242,16 +291,65 @@ def generate_features_and_metadata():
 
     # Initialize Metadata Registry
     metadata = {
-        "features": ['log_ret', 'rv', 'vol_z', 'time_sin', 'time_cos'] + [f'log_ret_{h}' for h in HORIZONS],
+        "features": list(FEATURE_COLUMNS),
         "norm_constants": {},
         "tick_sizes": {ticker: 0.01 for ticker in tickers} # Assuming $0.01 standard US equity tick size
     }
 
     failures = {}
 
+    # ---- Pass 1: per-ticker features -------------------------------------
+    # Held in memory rather than written straight out, because 'xs_resid'
+    # needs the whole universe on a common index and can only be computed
+    # once every ticker is available. Slimmed to FEATURE_COLUMNS immediately
+    # (the raw OHLCV columns are unused from here on) and cast to float32 --
+    # ~100 tickers x ~115k rows x 11 cols is about 0.5 GB, which fits
+    # comfortably in a Kaggle session.
+    frames = {}
     for ticker in tickers:
         try:
-            df = process_ticker(ticker)
+            frames[ticker] = process_ticker(ticker)[list(FEATURE_COLUMNS)].astype(np.float32)
+        except Exception as e:
+            failures[ticker] = str(e)
+            print(f"  [FAILED] {ticker}: {e}")
+
+    if failures:
+        summary = chr(10).join(f"  - {t}: {msg}" for t, msg in failures.items())
+        raise RuntimeError(
+            f"Feature generation failed for {len(failures)}/{len(tickers)} ticker(s); "
+            f"metadata.json NOT written.{chr(10)}{summary}"
+        )
+
+    # ---- Pass 2: cross-sectional residual --------------------------------
+    # resid = own return - equal-weighted universe return, on the aligned
+    # union index. Measured IC -0.0029 (t=-4.0) against next-bar return,
+    # roughly 3x the own-return family's -0.0010 (t=-1.3, i.e. noise).
+    #
+    # Computed here rather than in VecTradingEnv at runtime: the env's
+    # streams are a MIX of mirrored and unmirrored tickers, so a
+    # cross-sectional mean taken there would not be the real market return.
+    # Computed on raw (pre-normalisation) log returns, the only scale on
+    # which an equal-weighted mean means anything. Mirroring then sign-flips
+    # 'xs_resid' like any other return feature.
+    print("Computing cross-sectional residual returns across the universe...")
+    market = pd.concat({t: f['log_ret'] for t, f in frames.items()}, axis=1)
+    market_ret = market.mean(axis=1, skipna=True)
+    coverage = market.notna().sum(axis=1)
+    print(f"  aligned union index: {len(market_ret)} timestamps, median "
+          f"{int(coverage.median())} of {len(frames)} tickers present per bar")
+
+    for ticker, f in frames.items():
+        f['xs_resid'] = (f['log_ret'] - market_ret.reindex(f.index)).astype(np.float32)
+        if not np.isfinite(f['xs_resid'].to_numpy()).all():
+            # Unreachable while every row of f has a finite log_ret and
+            # market_ret is a skipna mean over a superset index -- assert it
+            # rather than discover NaN in the observation tensor later.
+            raise ValueError(f"{ticker}: non-finite values in cross-sectional residual")
+
+    # ---- Pass 3: normalise and write -------------------------------------
+    for ticker in tickers:
+        try:
+            df = frames[ticker]
 
             # Determine the training set mask as the first TRAIN_FRAC of this
             # ticker's history (row-position based, not a fixed calendar date) so
@@ -264,7 +362,7 @@ def generate_features_and_metadata():
                     f"(TRAIN_FRAC={TRAIN_FRAC}, total rows={len(df)}) -- too few to "
                     "compute stable normalization statistics"
                 )
-            train_df = df.iloc[:train_cutoff_idx][metadata["features"]]
+            train_df = df.iloc[:train_cutoff_idx]
 
             # Compute mean and standard deviation ONLY on training data
             mean = train_df.mean()
@@ -296,7 +394,7 @@ def generate_features_and_metadata():
         # downstream training with a cache that looks complete but isn't.
         summary = "\n".join(f"  - {t}: {msg}" for t, msg in failures.items())
         raise RuntimeError(
-            f"Preprocessing failed for {len(failures)}/{len(tickers)} ticker(s); "
+            f"Normalisation failed for {len(failures)}/{len(tickers)} ticker(s); "
             f"metadata.json NOT written.\n{summary}"
         )
 
