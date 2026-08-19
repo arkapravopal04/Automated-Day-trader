@@ -102,6 +102,24 @@ class ExecutionSimulator:
         """Round price to the nearest valid tick increment."""
         return torch.round(price / self.tick_size) * self.tick_size
 
+    def snap_to_tick_adverse(self, price: Tensor, direction: Tensor) -> Tensor:
+        """
+        Snap to the tick grid AGAINST the trader: buys round up, sells round
+        down. Nearest-tick rounding hands back up to half a tick at random,
+        which on a cheap stock is worth far more than the entire modelled
+        cost (half a tick is 5.2 bps on a $9.66 name vs a ~0.55 bps true
+        cost), so `torch.round` silently made execution free -- and randomly
+        free, since whether it rounded for or against you depended on where
+        mid happened to sit on the grid. You never get price improvement
+        from the exchange's rounding; this direction is the honest one.
+        """
+        units = price / self.tick_size
+        snapped = torch.where(direction > 0, torch.ceil(units), torch.floor(units))
+        # direction == 0 never reaches a real fill (see simulate_fill's
+        # no_order mask); keep nearest there so the value stays sane.
+        snapped = torch.where(direction == 0, torch.round(units), snapped)
+        return snapped * self.tick_size
+
     # ------------------------------------------------------------------
     # simulate_fill and its private helpers
     # ------------------------------------------------------------------
@@ -259,18 +277,58 @@ class ExecutionSimulator:
         non-positive price.
         """
         participation = (filled_size / bar_liquidity_proxy).clamp(0.0, 1.0)
-        half_spread_cost = (self.spread_bps / 1e4) * mid_price
+        # MINIMUM-TICK SPREAD. A proportional spread alone is unphysical at
+        # low prices: spread_bps=1.0 implies a half-spread of $0.00048 on a
+        # $9.66 stock, i.e. quoting INSIDE the $0.01 tick grid, which no
+        # venue permits. The true minimum quotable spread is one tick, so the
+        # half-spread floor is half a tick -- 5.2 bps on a $9.66 name, which
+        # is what actually makes cheap stocks expensive to trade rather than
+        # free. Without this floor the modelled cost fell below the rounding
+        # granularity and vanished, reproducing the same 1/price subsidy as
+        # the limit_offset bug in _compute_fill_price().
+        half_spread_cost = torch.clamp(
+            (self.spread_bps / 1e4) * mid_price, min=self.tick_size / 2.0
+        )
         impact_cost = self.impact_coef * torch.sqrt(participation) * mid_price
         overtrade_cost = (self.overtrade_surcharge_bps / 1e4) * overtrading_factor * mid_price
 
-        limit_offset_price = limit_offset * self.tick_size
+        # FREE-MONEY FIX. limit_offset used to be subtracted from the adverse
+        # move with NO CAP and no fill rejection, so a positive offset was an
+        # unconditional price improvement: buys filled below mid and sells
+        # above it, every time, for free. Because the improvement is a fixed
+        # DOLLARS-PER-SHARE amount (offset_ticks * tick_size) its value in bps
+        # scales as 1/price -- $0.20 is 3.6 bps on a $557 stock and 207 bps on
+        # a $9.66 one.
+        #
+        # A 151-rollout run found and maximised exactly this: net worth
+        # +486%, but with a per-bar directional hit rate of 41.6% (WORSE than
+        # a coin flip, t-stat 0.17 on signed return) and 93/100 streams
+        # ending BELOW their starting capital. The entire gain came from
+        # seven of the cheapest tickers, with rank correlation between ticker
+        # price and final equity of -0.921. It was harvesting the subsidy,
+        # not trading. Mirroring made it worse by synthesising very low price
+        # paths that don't correspond to any real quote.
+        #
+        # The cap below is the economically defensible bound: resting a
+        # passive order can at best save you the adverse costs you would have
+        # paid by crossing, so the best achievable fill is MID, never better.
+        # Anything beyond that is inventing money that no counterparty paid.
+        #
+        # STILL OPTIMISTIC, and deliberately flagged rather than silently
+        # accepted: a real passive order may not fill at all. Modelling that
+        # properly needs the bar's high/low (both are in the parquet, only
+        # `close` is loaded today) to fill only when the bar actually trades
+        # through the limit price. Until then a passive order here always
+        # fills at mid, which still favours the agent.
+        adverse_cost = half_spread_cost + impact_cost + overtrade_cost
+        limit_offset_price = (limit_offset * self.tick_size).clamp(max=adverse_cost)
         raw_price = (
             mid_price
-            + direction * (half_spread_cost + impact_cost + overtrade_cost)
+            + direction * adverse_cost
             - direction * limit_offset_price
         )
 
-        fill_price = self.snap_to_tick(raw_price)
+        fill_price = self.snap_to_tick_adverse(raw_price, direction)
         return torch.clamp(fill_price, min=self.tick_size)
 
     # ------------------------------------------------------------------

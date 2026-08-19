@@ -157,7 +157,24 @@ def load_aligned_close_prices(tickers: Sequence[str], aligned_dates: pd.Datetime
 
     Returns: np.ndarray of shape [T, n_tickers], float32.
     """
-    return _load_aligned_column(tickers, aligned_dates, "close", lambda df: df.ffill().bfill())
+    # NON-POSITIVE PRICES ARE CORRUPT DATA, NOT REAL QUOTES. 15 bars across
+    # CRM/KO/LOW/T carry close == 0.00 with non-zero volume (e.g. CRM
+    # 2021-05-27 20:05 UTC, 179 shares at $0.00), which no venue can print.
+    # Left in, a zero price makes that stream's position worth nothing for one
+    # bar -- equity collapses to cash and recovers next bar, a pure fabricated
+    # PnL swing -- and _precompute_mirrored_prices() reflects around
+    # log(clamp(0, min=1e-6)) = -13.8, manufacturing absurd mirrored prices
+    # (max observed $3,489 on a universe whose real median is ~$131).
+    # Masking to NaN first makes ffill treat them as the missing bars they
+    # are, exactly like any other gap.
+    #
+    # NOTE: this repairs the EXECUTION/marking path only. The same zero bars
+    # are still baked into data/processed/*_features.parquet as extreme
+    # log-return outliers (z-scores of -15.8 and +57.9 vs a typical +/-5);
+    # clearing those needs preprocess.py re-run, which is a separate step.
+    return _load_aligned_column(
+        tickers, aligned_dates, "close", lambda df: df.mask(df <= 0).ffill().bfill()
+    )
 
 
 def load_aligned_volumes(tickers: Sequence[str], aligned_dates: pd.DatetimeIndex) -> np.ndarray:

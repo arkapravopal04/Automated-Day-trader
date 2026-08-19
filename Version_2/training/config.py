@@ -418,7 +418,28 @@ class RiskConfig:
     # normalized (0,1) output gets mapped onto BEFORE kelly/risk clip it
     # further down -- see ppo_hybrid.py's action pipeline)
     max_order_shares: float = 10_000.0
-    max_limit_offset_ticks: float = 20.0
+    # 20.0 -> 0.0: DISABLES the limit_offset action, i.e. every order is
+    # modelled as marketable and pays the full spread. Not a tuning choice --
+    # execution_sim.py cannot currently price a passive order honestly. It
+    # fills them unconditionally at the requested price with no rejection and
+    # no adverse selection, so ANY non-zero offset is free money: before the
+    # clamp in _compute_fill_price() a 20-tick offset filled 207 bps below mid
+    # on a $9.66 stock, and even after the clamp it still zeroes the entire
+    # spread + impact cost at every price level, which a real resting order
+    # never does (it may simply not fill, and when it does it is usually
+    # because the market just moved against you).
+    #
+    # This is what a 151-rollout run farmed to +486% net worth while its
+    # per-bar directional hit rate was 41.6% -- WORSE than a coin flip -- with
+    # 93/100 streams ending below their starting capital and a -0.921 rank
+    # correlation between ticker price and final equity.
+    #
+    # Assuming every order crosses the spread is the CONSERVATIVE assumption:
+    # it can understate performance, never overstate it. Re-enable only
+    # alongside a real passive-fill model (fill only when the bar's high/low
+    # trades through the limit price -- both columns exist in the parquet,
+    # only `close` is loaded today).
+    max_limit_offset_ticks: float = 0.0
 
 
 @dataclass
