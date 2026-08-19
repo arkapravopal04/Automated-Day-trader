@@ -242,6 +242,7 @@ class VecTradingEnv:
         enable_mirroring: bool = True,
         mirror_prob: float = MIRROR_PROB,
         return_feature_keywords: Tuple[str, ...] = ("ret", "mom", "vwap", "pres", "resid"),
+        cross_sectional_feature_keywords: Tuple[str, ...] = ("resid",),
         overtrade_window: int = OVERTRADE_WINDOW,       # ~1hr of 5-min bars by default
         overtrade_free_trades: int = OVERTRADE_FREE_TRADES,   # trades allowed in the window before surcharge kicks in
         overtrade_surcharge_bps: float = OVERTRADE_SURCHARGE_BPS,
@@ -310,9 +311,24 @@ class VecTradingEnv:
         # adding a new direction-sensitive feature (e.g. RSI/MACD) without
         # extending return_feature_keywords shows up immediately instead of
         # silently training on inconsistent mirrored observations.
+        # Cross-sectional features cannot be mirrored coherently AT ALL --
+        # see _apply_mirror_to_obs(). Zeroed for mirrored streams instead of
+        # flipped. Matched by name so a renamed column fails loudly here
+        # rather than silently training on a corrupted channel.
+        self._cross_sectional_feature_idx = [
+            i for i, name in enumerate(self.market_feature_names)
+            if any(kw in name.lower() for kw in cross_sectional_feature_keywords)
+        ]
+
         if self._return_feature_idx:
-            flipped = [self.feature_names[i] for i in self._return_feature_idx]
+            flipped = [
+                self.feature_names[i] for i in self._return_feature_idx
+                if i not in self._cross_sectional_feature_idx
+            ]
             print(f"[env] mirroring will sign-flip direction-sensitive features: {flipped}")
+        if self._cross_sectional_feature_idx:
+            zeroed = [self.feature_names[i] for i in self._cross_sectional_feature_idx]
+            print(f"[env] mirroring will ZERO cross-sectional features (cannot be mirrored): {zeroed}")
         elif self.enable_mirroring:
             print(
                 f"[env] WARNING: mirroring is enabled but NO features matched "
@@ -560,13 +576,42 @@ class VecTradingEnv:
         stays consistent with `active_prices`. Magnitude-based features
         (volatility, etc.) are left untouched. No-op if mirroring is off or
         no matching feature names were found.
+
+        CROSS-SECTIONAL FEATURES ARE ZEROED, NOT FLIPPED. A residual is
+        `own_return - market_return`. Mirroring inverts a stream's own price
+        path, but the market return is a fact about the real universe and
+        does not invert with it, so for a mirrored stream:
+
+            correct:      (-own) - market
+            if flipped:  -(own  - market) = -own + market   ->  error 2*market
+            if left:      (own  - market)                   ->  error 2*own
+
+        Neither is right, because a mirrored stream is a synthetic asset with
+        no place in the real cross-section. Measured on 40 tickers of
+        regular-hours bars: std(xs_resid)=0.0019 against std(2*market)=0.0025
+        -- the flip error is 1.30 residual-sigmas, i.e. LARGER than the
+        signal, and systematically anti-correlated with it. With
+        MIRROR_PROB=0.5 that corrupted roughly half of all streams in the
+        151-rollout run of 2026-08-19, whose win rate came in at 0.29 --
+        materially BELOW chance, which is the signature of an inverted input
+        rather than merely an unprofitable one.
+
+        Zeroing costs the mirrored half of the batch this one channel (error
+        = |signal| = 1.0 sigma, less than either alternative) while leaving
+        the unmirrored half fully intact and correct.
         """
-        if not self.enable_mirroring or not self._return_feature_idx or not self.mirror_mask.any():
+        if not self.enable_mirroring or not self.mirror_mask.any():
+            return obs
+        if not self._return_feature_idx and not self._cross_sectional_feature_idx:
             return obs
         obs = obs.clone()
         flip = self.mirror_mask.view(-1, 1)  # broadcast over the window dim
         for f in self._return_feature_idx:
+            if f in self._cross_sectional_feature_idx:
+                continue  # zeroed below -- flipping it is worse than useless
             obs[:, :, f] = torch.where(flip, -obs[:, :, f], obs[:, :, f])
+        for f in self._cross_sectional_feature_idx:
+            obs[:, :, f] = torch.where(flip, torch.zeros_like(obs[:, :, f]), obs[:, :, f])
         return obs
 
     def _current_prices(self) -> Tensor:

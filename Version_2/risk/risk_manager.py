@@ -41,6 +41,10 @@ class RiskLimits:
     max_ticker_concentration_frac: float = 0.35   # max any single ticker's share of *gross exposure* (not equity)
     max_order_notional_frac: float = 0.10         # max single order's notional / equity, regardless of resulting position
     drawdown_halt_frac: float = 0.20              # drawdown from peak equity at which new-exposure orders are blocked (reduce-only)
+    min_order_equity_frac: float = 0.04           # CEILING on min_order_notional, as a fraction of CURRENT equity. See
+                                                  # _drop_dust_orders(): this is what stops the dust gate becoming an
+                                                  # absorbing barrier after a drawdown. MUST stay strictly below
+                                                  # RiskConfig.kelly_min_fraction (0.08) -- see the proof there.
     min_order_notional: float = 100.0             # ABSOLUTE $; drop exposure-increasing orders smaller than this. Kept in
                                                    # sync with training/config.py's RiskConfig.min_order_notional (which is
                                                    # what train.py actually passes) -- see that field for the sizing math. See
@@ -128,7 +132,7 @@ class RiskManager:
         # that was a sane size when the policy asked for it may be dust by the
         # time it gets here. Checking earlier would let a capped-down order
         # through.
-        size, breached = self._drop_dust_orders(size, breached, increasing, mid_price)
+        size, breached = self._drop_dust_orders(size, breached, increasing, mid_price, equity)
 
         direction = torch.where(size == 0, torch.zeros_like(direction), direction)
 
@@ -230,7 +234,8 @@ class RiskManager:
         return size, breached
 
     def _drop_dust_orders(
-        self, size: Tensor, breached: Tensor, increasing: Tensor, mid_price: Tensor
+        self, size: Tensor, breached: Tensor, increasing: Tensor, mid_price: Tensor,
+        equity: Tensor
     ) -> Tuple[Tensor, Tensor]:
         """
         Zeroes exposure-INCREASING orders whose notional is below
@@ -258,10 +263,34 @@ class RiskManager:
         as "LONG, 0.0014 shares" rather than as FLAT -- which still fills and
         still gets billed a full ticket.
 
-        Absolute dollars, not a fraction of equity, because the cost this
-        defends against (the flat per-trade fee) is itself absolute: the
-        thing that makes an order uneconomic is its size relative to a fixed
-        $/ticket, not relative to the account.
+        Absolute dollars, because the cost this defends against (the flat
+        per-trade fee) is itself absolute: what makes an order uneconomic is
+        its size relative to a fixed $/ticket, not relative to the account.
+
+        BUT A PURELY ABSOLUTE FLOOR IS AN ABSORBING BARRIER (measured, from
+        the 151-rollout run of 2026-08-19). Order size is capped at
+        kelly_fraction * equity, so once equity falls to
+        `min_order_notional / kelly_fraction` the largest order the system
+        may place is exactly the smallest one it will accept. Every
+        exposure-increasing order is then rejected as dust, trading stops,
+        and equity can never recover -- it is a one-way door. With
+        min_order_notional=$500 and kelly pinned at its 0.08 floor that door
+        sits at $6,250, i.e. a 37.5% drawdown. All 100 streams of that run
+        found it and froze there within ~95 rollouts (median equity
+        $6,248.8 vs the predicted $6,250.00), after which 151 rollouts
+        produced 520 trades instead of ~50,000.
+
+        So the floor is additionally capped at a fraction of CURRENT equity:
+
+            effective_min = min(min_order_notional, min_order_equity_frac * equity)
+
+        PROOF THE DEADLOCK CANNOT RECUR: the largest permissible order is at
+        least kelly_min_fraction * equity, and the gate is at most
+        min_order_equity_frac * equity. While
+        min_order_equity_frac < kelly_min_fraction (0.04 < 0.08) the cap
+        strictly exceeds the gate at EVERY equity level, so the equity term
+        cancels and no drawdown can close the door. Keep that inequality
+        true if either constant is ever retuned.
 
         Applies in training, backtest AND live -- unlike the training-only
         Kelly floor in kelly_sizing.py. Submitting a 20-cent order to a real
@@ -271,7 +300,11 @@ class RiskManager:
         if self.limits.min_order_notional <= 0:
             return size, breached
         order_notional = size * mid_price
-        too_small = increasing & (size > 0) & (order_notional < self.limits.min_order_notional)
+        effective_min = torch.clamp(
+            self.limits.min_order_equity_frac * equity,
+            max=self.limits.min_order_notional,
+        )
+        too_small = increasing & (size > 0) & (order_notional < effective_min)
         size = torch.where(too_small, torch.zeros_like(size), size)
         breached = breached | too_small
         return size, breached

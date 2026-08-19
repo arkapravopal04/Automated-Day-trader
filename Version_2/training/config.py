@@ -326,6 +326,12 @@ class RiskConfig:
     # kelly_default_fraction * initial_cash ($800) or nothing can fill and
     # training deadlocks -- re-derive all four together if any moves.
     min_order_notional: float = 500.0
+    # Ceiling on the above as a fraction of CURRENT equity, so a drawdown can
+    # never make the dust gate unpassable. MUST stay strictly below
+    # kelly_min_fraction (0.08) -- RiskManager._drop_dust_orders() carries the
+    # proof. The 2026-08-19 run froze all 100 streams at exactly
+    # $500/0.08 = $6,250 for want of this.
+    min_order_equity_frac: float = 0.04
 
     # kelly_sizing.py -- KellySizer
     kelly_lookback_trades: int = 30

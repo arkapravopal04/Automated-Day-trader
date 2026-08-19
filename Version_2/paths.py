@@ -245,7 +245,18 @@ OVERTRADE_SURCHARGE_BPS = float(os.environ.get("TRADING_OVERTRADE_SURCHARGE_BPS"
 # Flat $ ticket fee charged by the broker/platform on any non-zero fill,
 # independent of size (separate from commission_bps/commission_per_share,
 # which model exchange/broker commission proper). Set to 0.0 to disable.
-PLATFORM_FEE_PER_TRADE = float(os.environ.get("TRADING_PLATFORM_FEE_PER_TRADE", "1.0"))
+# Alpaca (which live/broker_client.py targets) is commission-free on US
+# equities, so the correct default is 0.0. This is NOT the Session 1 advice
+# that was retracted: back then the $1 ticket was masking the dust-order bug,
+# and zeroing it would have hidden a real defect. That bug is fixed, and the
+# 151-rollout run of 2026-08-19 measured what the ticket actually costs now:
+#
+#   305,966 trades, $375,288 total loss  ->  $1.227 loss per trade
+#   of which the flat ticket is           ->  $1.000  = 81.5% of ALL losses
+#
+# Everything else (spread, impact, adverse selection) sums to $0.227/trade.
+# Set TRADING_PLATFORM_FEE_PER_TRADE=1.0 to model an IBKR-shaped venue.
+PLATFORM_FEE_PER_TRADE = float(os.environ.get("TRADING_PLATFORM_FEE_PER_TRADE", "0.0"))
 
 # --- Liquidity-proxy scaling: single-venue (IEX) volume -> consolidated ---
 # HISTORICAL CONTEXT -- see "RESOLVED" at the bottom of this block first.

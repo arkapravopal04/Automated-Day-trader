@@ -26,3 +26,6 @@ __pycache__/
 # --- Security audit L1: untracked legacy / tuning-artifact trees ---
 /tuning/
 /sweep_output/
+
+
+AGENTS.md

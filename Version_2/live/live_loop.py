@@ -177,6 +177,7 @@ class LiveLoop:
                 max_order_notional_frac=cfg.risk.max_order_notional_frac,
                 drawdown_halt_frac=cfg.risk.drawdown_halt_frac,
                 min_order_notional=cfg.risk.min_order_notional,
+            min_order_equity_frac=cfg.risk.min_order_equity_frac,
             ),
             device=str(self.device),
         )
