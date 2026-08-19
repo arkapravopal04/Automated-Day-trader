@@ -230,7 +230,7 @@ MIRROR_PROB = float(os.environ.get("TRADING_MIRROR_PROB", "0.5"))
 # one-sided direction history over the last DIVERSITY_WINDOW steps.
 # DIVERSITY_COEF=0.0 disables it.
 DIVERSITY_WINDOW = int(os.environ.get("TRADING_DIVERSITY_WINDOW", "50"))
-DIVERSITY_COEF = float(os.environ.get("TRADING_DIVERSITY_COEF", "0.05"))
+DIVERSITY_COEF = float(os.environ.get("TRADING_DIVERSITY_COEF", "0.015"))
 
 # --- Overtrading surcharge & platform fee ---
 # Extra adverse slippage applied once a stream has traded more than

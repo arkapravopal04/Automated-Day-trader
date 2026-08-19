@@ -230,6 +230,8 @@ class VecTradingEnv:
         overtrade_surcharge_bps: float = OVERTRADE_SURCHARGE_BPS,
         bias_window: int = DIVERSITY_WINDOW,
         diversity_bonus_coef: float = DIVERSITY_COEF,
+        trade_cooldown_bars: int = 0,   # see _apply_trade_cooldown()
+
         device: Optional[str] = None,
     ) -> None:
         self.dataset = dataset
@@ -257,6 +259,7 @@ class VecTradingEnv:
         self.overtrade_window = overtrade_window
         self.overtrade_free_trades = overtrade_free_trades
         self.bias_window = bias_window
+        self.trade_cooldown_bars = int(trade_cooldown_bars)
         self.diversity_bonus_coef = diversity_bonus_coef
 
         self._load_market_data()
@@ -345,6 +348,11 @@ class VecTradingEnv:
         # --- Per-env rolling trade-direction history (circular buffers),
         # used for both the overtrading slippage surcharge and the
         # bias/diversity reward bonus. Allocated here, populated in reset().
+        # Bars since this stream last INCREASED exposure; seeded above the
+        # cooldown so nothing is blocked on the very first bar.
+        self._bars_since_open = torch.full(
+            (self.n_envs,), float(self.trade_cooldown_bars + 1), device=self.device
+        )
         self._trade_hist = torch.zeros((self.n_envs, self.overtrade_window), device=self.device)
         self._trade_hist_ptr = 0
         self._bias_hist = torch.zeros((self.n_envs, self.bias_window), device=self.device)
@@ -397,6 +405,7 @@ class VecTradingEnv:
             self.mirror_mask = torch.zeros(self.n_envs, dtype=torch.bool, device=self.device)
         self.active_prices = torch.where(self.mirror_mask.unsqueeze(0), self.mirrored_prices, self.prices)
 
+        self._bars_since_open.fill_(float(self.trade_cooldown_bars + 1))
         self._trade_hist.zero_()
         self._trade_hist_ptr = 0
         self._bias_hist.zero_()
@@ -457,6 +466,64 @@ class VecTradingEnv:
         extra = torch.stack((pos_frac, unrealized_frac), dim=-1)          # [n_envs, 2]
         extra = extra.unsqueeze(1).expand(-1, obs.shape[1], -1)            # [n_envs, window, 2]
         return torch.cat((obs, extra), dim=-1)
+
+    def _apply_trade_cooldown(self, direction: Tensor, size: Tensor) -> Tuple[Tensor, Tensor]:
+        """
+        Blocks EXPOSURE-INCREASING orders for `trade_cooldown_bars` bars after
+        the stream last increased exposure. Closes and pure reduces always
+        pass, so this can never trap a position.
+
+        Why this exists: with a flat action finally reachable
+        (training/ppo_hybrid.py's _apply_flat_intent) a 51-rollout run produced
+        2,506 opens and 2,507 closes but a MEDIAN TIME FLAT OF 1 BAR -- the
+        policy closed and re-entered five minutes later, churning through flat
+        rather than resting in it. Flat occupancy barely moved (1.0% -> 1.9%)
+        while fills went 2,809 -> 10,156, ticket cost 15.3 -> 27.4 bps, and
+        gross edge collapsed 11.20 -> 4.36 bps.
+
+        The economics this targets: the platform fee is FLAT per trade, so
+        cost-per-trade is fixed while edge-per-trade grows with holding
+        period. At ~$800 orders a round trip costs ~17 bps against a ~5.6 bps
+        median 5-minute move, so a position must be held on the order of tens
+        of bars before its expected move can clear its own ticket. Capping
+        re-entry frequency is what makes edge-per-trade able to exceed
+        cost-per-trade at this account size at all -- no sizing knob can,
+        since even full Kelly on $10k caps an order near $1,300.
+
+        Deliberately a hard env-level constraint rather than another reward
+        penalty: the previous two runs showed the policy optimizing the reward
+        well while still churning, so this removes the option instead of
+        pricing it.
+        """
+        if self.trade_cooldown_bars <= 0:
+            return direction, size
+        position = self.portfolio.positions[:, 0]
+        direction = direction.to(device=self.device, dtype=position.dtype)
+        size = size.to(device=self.device, dtype=position.dtype)
+
+        # "Increasing" = anything that is not a pure reduction of the current
+        # position: opening from flat, adding in the same direction, or
+        # flipping (which opens fresh opposite exposure).
+        opening = (position == 0) & (direction != 0)
+        adding = (torch.sign(direction) == torch.sign(position)) & (position != 0)
+        flipping = (torch.sign(direction) == -torch.sign(position)) & (position != 0) & (size > position.abs())
+        increasing = opening | adding | flipping
+
+        blocked = increasing & (self._bars_since_open < self.trade_cooldown_bars)
+        direction = torch.where(blocked, torch.zeros_like(direction), direction)
+        size = torch.where(blocked, torch.zeros_like(size), size)
+        return direction, size
+
+    def _advance_trade_cooldown(self, positions_before: Tensor, filled_qty: Tensor) -> None:
+        """Ticks the cooldown clock, resetting it wherever exposure actually grew."""
+        if self.trade_cooldown_bars <= 0:
+            return
+        after = self.portfolio.positions[:, 0]
+        grew = (filled_qty != 0) & (after.abs() > positions_before.abs())
+        self._bars_since_open = self._bars_since_open + 1.0
+        self._bars_since_open = torch.where(
+            grew, torch.zeros_like(self._bars_since_open), self._bars_since_open
+        )
 
     def _apply_mirror_to_obs(self, obs: Tensor) -> Tensor:
         """
@@ -530,6 +597,8 @@ class VecTradingEnv:
         # position". Position state is now fed to the actor via
         # _augment_obs_with_portfolio_state() below, which is what makes
         # inventory intent representable in the first place.
+        direction, size = self._apply_trade_cooldown(direction, size)
+
         sim_fill: SimulatedFill = self.execution.simulate_fill(
             direction=direction,
             size=size,
@@ -555,6 +624,7 @@ class VecTradingEnv:
         closed_trade = positions_before.abs() > self.portfolio.positions[:, 0].abs()
 
         self._record_trade_direction(sim_fill.filled_qty)
+        self._advance_trade_cooldown(positions_before, sim_fill.filled_qty)
 
         self.current_idx = min(self.current_idx + 1, self.max_idx)
         done_time = self.current_idx >= self.max_idx

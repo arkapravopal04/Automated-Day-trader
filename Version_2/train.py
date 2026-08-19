@@ -421,6 +421,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         overtrade_surcharge_bps=cfg.env.overtrade_surcharge_bps,
         bias_window=cfg.env.bias_window,
         diversity_bonus_coef=cfg.env.diversity_bonus_coef,
+        trade_cooldown_bars=cfg.env.trade_cooldown_bars,
         device=str(device),
     )
 

@@ -207,7 +207,13 @@ class EnvConfig:
     commission_bps: float = 0.5
     min_commission: float = 0.0
     platform_fee_per_trade: float = PLATFORM_FEE_PER_TRADE
-    r_step_scale: float = 0.5
+    # 0.5 -> 2.0. Scales the vol-normalized step-PnL term, which is the only
+    # DIRECTLY PnL-aligned signal in the whole reward. Measured over 200 steps
+    # x 100 streams it was the SMALLEST component of the env reward
+    # (mean|x| 0.000255) -- smaller than diversity_bonus (0.00118) and
+    # hold_loser_penalty (0.000404). Raising it 4x makes PnL the dominant term
+    # inside StepResult.reward, which is the point of switching raw_weight on.
+    r_step_scale: float = 2.0
     hold_loser_penalty: float = 0.0005
     enable_mirroring: bool = True
     mirror_prob: float = MIRROR_PROB
@@ -216,6 +222,11 @@ class EnvConfig:
     overtrade_surcharge_bps: float = OVERTRADE_SURCHARGE_BPS
     bias_window: int = DIVERSITY_WINDOW
     diversity_bonus_coef: float = DIVERSITY_COEF
+    # Bars a stream must wait after INCREASING exposure before it may increase
+    # again (closes/reduces are never blocked). 12 bars = 1 hour of 5-min bars,
+    # matching overtrade_window. 0 disables. See
+    # VecTradingEnv._apply_trade_cooldown() for the measurements behind this.
+    trade_cooldown_bars: int = 12
 
     @classmethod
     def for_friction(cls, level: str, **overrides: Any) -> "EnvConfig":
@@ -284,7 +295,16 @@ class RiskConfig:
     max_position_frac: float = 0.25
     max_gross_exposure_frac: float = 1.0
     max_ticker_concentration_frac: float = 0.35
-    max_order_notional_frac: float = 0.10
+    # 0.10 -> 0.20. At $10k/stream the old value capped every order at
+    # $1,000, BELOW what Kelly wants, so a flat non-edge-aware cap was the
+    # binding constraint instead of the edge-aware one. Raising it lets
+    # KellySizer bind first, which is the intended pipeline order. Justified
+    # by the deployment shape: each stream is an INDEPENDENT single-asset
+    # account (n_tickers=1 per PortfolioState), and the plan is to deploy on
+    # one ticker -- so these are single-account concentration limits, not
+    # portfolio-diversification limits. max_position_frac (0.25) still bounds
+    # the resulting position.
+    max_order_notional_frac: float = 0.20
     drawdown_halt_frac: float = 0.20
 
     # Absolute $ floor on exposure-INCREASING orders -- see
@@ -300,19 +320,32 @@ class RiskConfig:
     # version of the Kelly chicken-and-egg described under
     # kelly_min_fraction. Re-derive this whenever EnvConfig.initial_cash
     # moves; it is an ABSOLUTE dollar floor, not a fraction.
-    min_order_notional: float = 100.0
+    # 100 -> 500. Now a genuine FEE FLOOR, not just a dust gate: any order
+    # that passes pays at most 1e4/500 = 20 bps of ticket. MUST stay below
+    # both max_order_notional_frac * initial_cash ($2,000) and
+    # kelly_default_fraction * initial_cash ($800) or nothing can fill and
+    # training deadlocks -- re-derive all four together if any moves.
+    min_order_notional: float = 500.0
 
     # kelly_sizing.py -- KellySizer
     kelly_lookback_trades: int = 30
     kelly_min_trades_for_estimate: int = 10
-    kelly_multiplier: float = 0.25     # quarter-Kelly
+    # 0.25 -> 0.5 (half-Kelly). At initial_cash=10_000 quarter-Kelly left the
+    # typical order at ~$325, where the flat $1 ticket alone is 30.8 bps --
+    # against a measured gross edge of only 4-11 bps/trade, i.e. structurally
+    # unwinnable. Half-Kelly doubles it to ~$650-800 and, with the
+    # max_order_notional_frac change below, brings total one-way cost from
+    # ~35.5 bps to ~17.2 bps. Half-Kelly is the standard conservative
+    # operating point; full Kelly would size better still but is too
+    # high-variance to run unattended.
+    kelly_multiplier: float = 0.5
     kelly_cap: float = 1.0
     # PRE-WARM sizing fraction: sets the order cap during exactly the period
     # when no stream has enough closed trades for a real edge estimate. Keep
     # `kelly_default_fraction * initial_cash` comfortably ABOVE
     # min_order_notional (here 0.02 * 10_000 = $200 vs a $100 gate) or every
     # pre-warm order is dropped as dust and the edge estimate can never warm.
-    kelly_default_fraction: float = 0.02
+    kelly_default_fraction: float = 0.08
 
     # TRAINING-ONLY floor on the post-multiplier fractional Kelly (see
     # kelly_sizing.py's __init__ docstring). Consumed ONLY by train.py's
@@ -337,7 +370,7 @@ class RiskConfig:
     # "stop trading forever the first time the estimate turns negative".
     # If either is retuned, move BOTH, and keep the floor strictly above
     # min_order_notional / initial_cash or the deadlock returns.
-    kelly_min_fraction: float = 0.02
+    kelly_min_fraction: float = 0.08
 
     # kill_switch.py -- KillSwitch
     daily_loss_limit_frac: float = 0.03
@@ -397,7 +430,19 @@ class RewardConfig:
     dsr_warmup_steps: int = 2
     dsr_clip: float = 10.0
     sharpe_weight: float = 1.0   # weight on the Sharpe-shaped term
-    raw_weight: float = 0.0      # weight on vec_trading_env.py's own StepResult.reward (vol-normalized step
+    # 0.0 -> 80.0. StepResult.reward was multiplied by ZERO, so the env's own
+    # vol-normalized PnL term, hold_loser_penalty and diversity_bonus never
+    # reached the policy at all -- the entire objective was the differential
+    # Sharpe term, which measured only +0.147 correlation with actual PnL
+    # (R^2 ~ 0.02). 80 is not arbitrary: measured over 200 steps x 100 streams
+    # the DSR term averages |0.1447| against the env reward's |0.0018|, a 79x
+    # scale gap, so anything of order 1 here contributes ~1% and does nothing.
+    # At 80 (with r_step_scale=2.0 and DIVERSITY_COEF=0.015) the blend lands
+    # near DSR 50% / step-PnL 28% / hold-penalty 11% / diversity 10%.
+    # NOTE: terminal_alpha inside that reward measures exactly 0.000000 here --
+    # it only fires on episode end, and an episode is a full pass over the
+    # train split (~118k steps) versus ~13k steps in a 51-rollout run.
+    raw_weight: float = 80.0     # weight on vec_trading_env.py's own StepResult.reward (vol-normalized step
                                   # reward + hold penalty + diversity bonus + terminal alpha -- see that
                                   # file's docstring). Default 0 means training relies purely on the
                                   # Sharpe-shaped signal; raise this if you want the env's own shaping
