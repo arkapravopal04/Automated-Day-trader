@@ -42,6 +42,7 @@ from typing import Optional, Tuple
 
 import pandas as pd
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.enums import Adjustment
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
@@ -86,6 +87,11 @@ TICKERS = [
 ]
 
 HISTORY_YEARS = int(os.getenv("ALPACA_HISTORY_YEARS", "6"))
+
+# Split/dividend adjustment applied by the Alpaca API. Override with
+# ALPACA_ADJUSTMENT=raw|split|dividend|all. Anything other than "all" will
+# reintroduce unadjusted price jumps -- see the note in the request below.
+ADJUSTMENT = Adjustment(os.getenv("ALPACA_ADJUSTMENT", "all").lower())
 DEFAULT_DATA_FEED = "iex"
 
 
@@ -300,12 +306,21 @@ def fetch_incremental_data(ticker: str, end_date: datetime) -> None:
         return
 
     feed = os.getenv("ALPACA_DATA_FEED", DEFAULT_DATA_FEED)
+    # Alpaca defaults to Adjustment.RAW -- unadjusted for splits. Raw closes
+    # feed BOTH the feature pipeline (one ~-90% log return per split; observed
+    # z-scores up to 770) and position marking in load_aligned_close_prices()
+    # (a stream holding GE through its 1-for-8 reverse split books an instant
+    # +700%). ALL covers splits and dividends; SPLIT alone leaves ex-div gaps.
+    # NOTE: the fetch is INCREMENTAL. Any RAW parquet already on disk would be
+    # concatenated with adjusted bars into one incoherent series, so the cache
+    # must be wiped before the first adjusted fetch, not extended.
     request_params = StockBarsRequest(
         symbol_or_symbols=ticker,
         timeframe=TimeFrame(5, TimeFrameUnit.Minute),
         start=start_date,
         end=end_date,
         feed=feed,
+        adjustment=ADJUSTMENT,
     )
 
     try:

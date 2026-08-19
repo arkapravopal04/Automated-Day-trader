@@ -328,8 +328,17 @@ class ExecutionSimulator:
             - direction * limit_offset_price
         )
 
-        fill_price = self.snap_to_tick_adverse(raw_price, direction)
-        return torch.clamp(fill_price, min=self.tick_size)
+        # DELIBERATELY NOT SNAPPED. `mid_price` here is a close price that
+        # already sits ON the tick grid, so adding a half-tick spread and then
+        # rounding away from the trader charged a FULL tick -- double the true
+        # half-spread (20.7 bps round-trip on a $9.66 name where 10.4 is
+        # correct). Snapping to nearest instead reintroduces the opposite
+        # error, silently refunding up to half a tick. Since the cost model
+        # above already prices the spread analytically, any snapping here is
+        # double-counting in one direction or the other; leaving the price
+        # unsnapped is the only unbiased choice. snap_to_tick/
+        # snap_to_tick_adverse remain for callers that need a grid-valid quote.
+        return torch.clamp(raw_price, min=self.tick_size)
 
     # ------------------------------------------------------------------
     # Costs
