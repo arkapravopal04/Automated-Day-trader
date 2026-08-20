@@ -484,7 +484,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     # and rotation policy/defaults. tick_max_bytes wires up
     # cfg.run.max_tick_log_bytes (the tick-log rotation threshold) -- it was
     # previously dead config that MetricsWriter's own 8MB default ignored.
-    metrics_writer = MetricsWriter(cfg.run.metrics_path, tick_max_bytes=cfg.run.max_tick_log_bytes)
+    metrics_writer = MetricsWriter(
+        cfg.run.metrics_path,
+        tick_max_bytes=cfg.run.max_tick_log_bytes,
+        tick_backup_count=cfg.run.tick_backup_count,
+    )
     tick_callback = make_tick_callback(env, metrics_writer, state, log_every_n_ticks=cfg.run.tick_log_every_n_ticks)
 
     # Created ONCE, outside the rollout loop -- see ppo_hybrid.py's

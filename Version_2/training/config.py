@@ -558,12 +558,33 @@ class RunConfig:
     # grow unbounded. Was previously hardcoded inside MetricsWriter itself;
     # pulled out here so it's tunable per-run the same way tick_log_every_n_
     # ticks and dashboard_poll_interval_seconds are, without editing that
-    # module directly. 100 MB is comfortably larger than a full 1000-rollout
-    # run at tick_log_every_n_ticks=1 produces on this project's tick record
-    # schema -- lower it if you're disk-constrained (e.g. a small Kaggle
-    # /kaggle/working quota), raise it if you extend total_rollouts well
-    # past the default or log_every_n_ticks stays at 1 for a much longer run.
-    max_tick_log_bytes: int = 100 * 1024 * 1024   # 100 MB
+    # module directly.
+    #
+    # MEASURED, and the old comment here was wrong: this project's tick record
+    # is ~8.2 KB/line at 100 streams, so tick_log_every_n_ticks=1 writes about
+    # 2.1 MB per 256-step rollout. A 151-rollout run produces ~320 MB and a
+    # 1000-rollout one ~2.1 GB -- the previous note claiming 100 MB "is
+    # comfortably larger than a full 1000-rollout run" was off by ~20x. The
+    # last 151-rollout run rotated, and because only the live segment was
+    # pulled off Kaggle the post-mortem had tick data for rollouts 126-150
+    # only: 28 fills out of 257,137 trades, i.e. none of the active phase.
+    #
+    # Sized below so current + backups span a full run: 64 MB x (1 + 6) =
+    # 448 MB, which holds a 151-rollout run whole and is nothing against
+    # /kaggle/working's quota. If you raise total_rollouts, raise
+    # tick_backup_count with it -- or accept the loss deliberately rather
+    # than discovering it during the next post-mortem.
+    max_tick_log_bytes: int = 64 * 1024 * 1024    # 64 MB per segment
+
+    # How many rotated tick-log segments to retain alongside the live one.
+    # MetricsWriter's own default is 2; at the sizes above that keeps only the
+    # tail of a run. ALL segments must be collected to reconstruct a run --
+    # metrics.ticks.jsonl plus metrics.ticks.jsonl.1 .. .N, newest-first.
+    # Note any log-clearing step must glob "metrics.ticks.jsonl*", not
+    # "*.jsonl": the rotated names do not end in .jsonl, so a narrower glob
+    # leaves the PREVIOUS run's segments in place for the next one to be
+    # mixed with.
+    tick_backup_count: int = 6
 
     # How often the SEPARATE notebook cell running
     # TrainingDashboard.run_polling_loop() (or a manual polling loop) re-reads

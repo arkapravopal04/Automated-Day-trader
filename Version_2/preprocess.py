@@ -24,6 +24,19 @@ import pandas as pd
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd())
 from paths import RAW_DIR, PROCESSED_DIR, TRAIN_FRAC, is_kaggle
 
+# Progress lines below use box-drawing characters. Kaggle's stdout is UTF-8 so
+# they render there, but a Windows console defaults to cp1252 and raises
+# UnicodeEncodeError on the FIRST such print -- which lands inside pass 3's
+# per-ticker try/except, whose handler then prints the same characters again
+# and takes the whole run down with a secondary exception. Net effect: a full,
+# successful preprocess of all 100 tickers reported as a crash. Re-encode
+# instead of de-fanging the messages.
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (ValueError, OSError):
+        pass
+
 # Configuration Parameters
 HORIZONS = [3, 6, 12] # Lag steps representing 15m, 30m, and 1h past returns
 RV_WINDOW = 12 # Realized volatility rolling window (1 hour)
@@ -35,13 +48,15 @@ VOL_WINDOW = 78 # Volume z-score rolling window (1 full trading day)
 #
 # Direction-sensitive features (sign-flipped for mirrored streams by
 # VecTradingEnv) must contain one of env.return_feature_keywords in their
-# name: 'log_ret*' and 'xs_resid' match "ret"/"resid", 'vwap_dev' matches
-# "vwap", 'intrabar_pres' matches "pres". Magnitude-only features ('rv',
-# 'vol_z', 'time_*') must NOT match any keyword. Renaming a column here
-# without checking that tuple silently breaks mirroring: mirrored streams
-# get flipped prices against unflipped signals.
+# name: 'log_ret*', 'overnight_ret' and 'xs_resid' match "ret"/"resid",
+# 'vwap_dev' matches "vwap", 'intrabar_pres' matches "pres". Magnitude-only
+# features ('rv', 'vol_z', 'time_*', 'is_overnight') must NOT match any
+# keyword -- note 'is_overnight' does not contain "ret" but 'overnight_ret'
+# does, which is the intended split. Renaming a column here without checking
+# that tuple silently breaks mirroring: mirrored streams get flipped prices
+# against unflipped signals.
 FEATURE_COLUMNS = (
-    ['log_ret', 'rv', 'vol_z', 'time_sin', 'time_cos']
+    ['log_ret', 'overnight_ret', 'is_overnight', 'rv', 'vol_z', 'time_sin', 'time_cos']
     + [f'log_ret_{h}' for h in HORIZONS]
     + ['vwap_dev', 'intrabar_pres', 'xs_resid']
 )
@@ -182,8 +197,14 @@ def process_ticker(ticker: str) -> pd.DataFrame:
         )
 
     # Restrict to regular trading hours -- see RTH_START_MIN. Done before any
-    # feature computation so rolling windows never span an overnight or
-    # extended-hours gap in units they don't expect.
+    # feature computation so rolling windows never span an EXTENDED-HOURS gap
+    # in units they don't expect.
+    #
+    # It does NOT remove the overnight gap -- it concentrates it. After this
+    # filter the 09:30 row directly follows the previous session's 15:55 row,
+    # so a naive close/close.shift(1) there is a ~17.5-hour return. The
+    # session-boundary block further down is what actually handles that; read
+    # it before adding any new rolling feature here.
     ny_index = df.index.tz_convert("America/New_York")
     minutes_of_day = ny_index.hour * 60 + ny_index.minute
     rth_mask = (minutes_of_day >= RTH_START_MIN) & (minutes_of_day < RTH_END_MIN)
@@ -199,16 +220,73 @@ def process_ticker(ticker: str) -> pd.DataFrame:
             f"{MIN_ROWS_REQUIRED} to compute rolling features"
         )
 
-    # 1. Immediate Log Returns (t vs t-1)
-    df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-    
+    # --- Session boundaries -------------------------------------------------
+    # The RTH filter above removes 09:30-16:00's complement, which means
+    # consecutive rows now straddle the overnight gap: the row stamped 09:30
+    # follows the row stamped 15:55 of the PREVIOUS session. Before this
+    # block existed, close/close.shift(1) at that row was a ~17.5-hour return
+    # living in a column the model reads as a 5-minute one -- one bar per day
+    # per ticker, on all 100 tickers.
+    #
+    # Measured on the marking price path, that bar's median |move| is
+    # 75.8 bps against 9.8 bps for every other bar of the day: a 7.7x ratio
+    # that holds on 100/100 tickers (range 4.6x-9.9x). It is 8.1% of a day's
+    # total absolute movement compressed into 1 of 78 slots.
+    #
+    # `open` is in the raw parquet, so the two components separate exactly
+    # rather than approximately:
+    #     overnight_ret = log(open_t / close_{t-1})   the true close-to-open gap
+    #     log_ret       = log(close_t / open_t)       the true first 5 minutes
+    # Every value in 'log_ret' is therefore a genuine intra-session 5-minute
+    # return, which is what makes the rv annualisation and the multi-horizon
+    # sums below dimensionally correct.
+    session_date = pd.Series(
+        df.index.tz_convert("America/New_York").normalize(), index=df.index
+    )
+    is_session_start = session_date != session_date.shift(1)
+    prev_close = df['close'].shift(1)
+
+    # 1a. Overnight (close-to-open) return -- zero on every intra-session bar.
+    # Direction-sensitive; the name contains "ret" so VecTradingEnv sign-flips
+    # it for mirrored streams along with the other return columns.
+    df['overnight_ret'] = np.where(
+        is_session_start, np.log(df['open'] / prev_close), 0.0
+    )
+
+    # 1b. Session-start indicator. Redundant with time_sin/time_cos in
+    # principle (both are deterministic functions of minute-of-day) but it
+    # makes "this row carries a gap" a single channel the policy can gate on
+    # instead of a trigonometric coincidence it has to infer. Magnitude-only:
+    # the name must NOT match any of env.return_feature_keywords, or mirrored
+    # streams would see it negated.
+    df['is_overnight'] = is_session_start.astype(np.float64)
+
+    # 1. Immediate intra-session log return (t vs t-1, or open->close on the
+    # session's first bar). Never spans the overnight gap.
+    df['log_ret'] = np.where(
+        is_session_start,
+        np.log(df['close'] / df['open']),
+        np.log(df['close'] / prev_close),
+    )
+
     # 2. Multi-Horizon Log Returns (Captures short-term momentum)
+    # Cumulative sum of intra-session returns over the trailing h bars, reset
+    # at each session open. The previous close/close.shift(h) form silently
+    # straddled the boundary for the first h bars of every session -- 12 of
+    # 78 bars/day at the longest horizon -- folding the overnight gap into
+    # what the model reads as intraday momentum. Where fewer than h bars have
+    # elapsed this is the return since the open, which is the honest answer
+    # rather than a NaN that dropna() would punch a hole with.
+    cum = df['log_ret'].groupby(session_date).cumsum()
     for h in HORIZONS:
-        df[f'log_ret_{h}'] = np.log(df['close'] / df['close'].shift(h))
-        
+        prior = cum.shift(h).where(session_date == session_date.shift(h), 0.0)
+        df[f'log_ret_{h}'] = cum - prior
+
     # 3. Annualized Realized Volatility
     # Calculation: standard deviation of recent returns scaled by annualizing factor
-    # (78 5-min bars/day * 252 trading days/year)
+    # (78 5-min bars/day * 252 trading days/year). Valid only because 'log_ret'
+    # is now purely intra-session -- the window may span a session boundary,
+    # but every element in it is a true 5-minute return.
     df['rv'] = df['log_ret'].rolling(window=RV_WINDOW).std() * np.sqrt(252 * 78)
     
     # 4. Volume Z-Score
@@ -363,8 +441,15 @@ def generate_features_and_metadata():
     # streams are a MIX of mirrored and unmirrored tickers, so a
     # cross-sectional mean taken there would not be the real market return.
     # Computed on raw (pre-normalisation) log returns, the only scale on
-    # which an equal-weighted mean means anything. Mirroring then sign-flips
-    # 'xs_resid' like any other return feature.
+    # which an equal-weighted mean means anything.
+    #
+    # Mirroring does NOT sign-flip 'xs_resid'. A residual is
+    # own_return - market_return; mirroring inverts a stream's own path but
+    # the market term is a fact about the real universe and does not invert
+    # with it, so flipping introduces an error of 2x market (measured at 1.30
+    # residual-sigmas, larger than the signal). VecTradingEnv's
+    # cross_sectional_feature_keywords zeroes the channel for mirrored
+    # streams instead.
     print("Computing cross-sectional residual returns across the universe...")
     market = pd.concat({t: f['log_ret'] for t, f in frames.items()}, axis=1)
     market_ret = market.mean(axis=1, skipna=True)

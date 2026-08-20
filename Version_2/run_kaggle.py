@@ -139,10 +139,26 @@ def stage_train(total_rollouts: int, resume: str, fresh: bool, force_single: boo
     run_python(script, *args)
 
 
-def print_summary() -> None:
+def print_summary(trained: bool = True) -> None:
+    """Summarise what this invocation actually did.
+
+    ``trained`` gates the metrics/checkpoint report. It used to print
+    unconditionally, so `--fetch` and `--preprocess` each ended with a
+    full training report read off a PREVIOUS run's metrics.jsonl -- a
+    fetch cell signing off with 'rollout 79 ... net_worth 690630 ...
+    total_trades 244835' from some earlier session. That output lands
+    directly above the Phase 0/1 data gates, which is the worst possible
+    place for a stale number that reads like a fresh result.
+    """
     print("\n" + "=" * 70)
     print("RUN SUMMARY -- what to look for")
     print("=" * 70)
+
+    if not trained:
+        print("[stage] no training stage ran in this invocation.")
+        print("        metrics.jsonl / checkpoints deliberately NOT reported --")
+        print("        any numbers there belong to an earlier run, not this one.")
+        return
 
     metrics = os.path.join("/kaggle/working", "logs", "metrics.jsonl")
     if os.path.exists(metrics):
@@ -183,9 +199,11 @@ EXPECTED ON A HEALTHY QUICK RUN (100 rollouts):
     to ~0 in the first few rollouts (collapse = policy settling on never-trade)
   * total_trades climbs every rollout; halted stays all-False
   * policy_loss/value_loss finite (no NaN/Inf); grad_norm ~0.1-1.0
-  * reward_ema drifts (up or down) -- it is a differential-Sharpe signal,
-    NOT dollar PnL; the env's own vol-normalized reward is off by default
-    (RewardConfig.raw_weight=0)
+  * reward_ema drifts (up or down) -- it is a BLEND, not dollar PnL, and
+    NOT a pure differential-Sharpe signal: RewardConfig.raw_weight=80
+    (not 0 -- that note predated the measured 79x scale gap between the
+    DSR term and the env's own StepResult.reward) puts the mix near
+    DSR 50% / step-PnL 28% / hold-penalty 11% / diversity 10%
   * net_worth is the SUM across ~100 streams, each with $10k -> baseline ~$1M;
     watch its DIRECTION per rollout, not the absolute number
   * checkpoints: checkpoint_0.pt ... checkpoint_75.pt (every 25) +
@@ -260,7 +278,7 @@ def main(argv=None):
     if args.train:
         stage_train(args.total_rollouts, args.resume, args.fresh, args.no_ddp)
 
-    print_summary()
+    print_summary(trained=bool(args.train))
 
 
 if __name__ == "__main__":

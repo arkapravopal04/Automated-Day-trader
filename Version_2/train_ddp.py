@@ -266,7 +266,11 @@ def _worker(
     # separate tick-path or rotation arguments. tick_max_bytes wires up
     # cfg.run.max_tick_log_bytes -- see train.py's matching comment.
     metrics_writer = (
-        MetricsWriter(cfg.run.metrics_path, tick_max_bytes=cfg.run.max_tick_log_bytes)
+        MetricsWriter(
+            cfg.run.metrics_path,
+            tick_max_bytes=cfg.run.max_tick_log_bytes,
+            tick_backup_count=cfg.run.tick_backup_count,
+        )
         if rank == 0 else None
     )
     tick_callback = (
