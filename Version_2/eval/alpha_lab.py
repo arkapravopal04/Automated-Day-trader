@@ -104,12 +104,18 @@ HORIZONS = {
 # overnight 75.8 bps, open hour 18.6, close ramp 11.9, midday 9.6 -- a 7.7x
 # spread that the uniform-across-the-day policy spent its cost budget ignoring.
 REGIMES = {
-    "all": list(range(BARS_PER_DAY)),
+    "all": list(range(BARS_PER_DAY - 1)),
     "open_hour": list(range(0, 12)),
     "midday": list(range(12, 72)),
-    "close_ramp": list(range(75, BARS_PER_DAY)),
-    "overnight": [BARS_PER_DAY - 1],
+    # Bar 77 is excluded everywhere below: with flatten_at_session_close the
+    # env force-closes there and refuses to open, so no entry exists on it.
+    "close_ramp": list(range(74, BARS_PER_DAY - 1)),
 }
+
+# The overnight bar is not a regime here at all: its exit IS the session close,
+# so a session-capped forward return is empty by construction. It appears once
+# in the benchmark block below, uncapped and labelled not tradable, so the size
+# of what flatten_at_session_close declines stays on the page.
 
 
 # ---------------------------------------------------------------------------
@@ -251,16 +257,47 @@ def load_panel(max_tickers=None):
     )
     day_id = pd.factorize(pd.Series(ny.normalize()))[0].astype(np.int64)
 
+    # For every bar, the index of the LAST bar of its own session. The env
+    # force-closes there (EnvConfig.flatten_at_session_close), so no hold may
+    # run past it and forward returns have to be capped the same way.
+    n = len(day_id)
+    session_last_idx = np.empty(n, dtype=np.int64)
+    cur = n - 1
+    for k in range(n - 1, -1, -1):
+        if k == n - 1 or day_id[k] != day_id[k + 1]:
+            cur = k
+        session_last_idx[k] = cur
+
     return dict(X=X, P=P, features=features, tickers=names,
-                day_id=day_id, bar_of_day=bar_of_day)
+                day_id=day_id, bar_of_day=bar_of_day,
+                session_last_idx=session_last_idx)
 
 
-def forward_return_bps(P, h):
-    """log(close[t+h] / close[t]) in bps, NaN in the last h rows."""
+def forward_return_bps(P, h, session_last_idx=None):
+    """log(close[t+h] / close[t]) in bps, capped at the session close.
+
+    With EnvConfig.flatten_at_session_close the env liquidates on the last bar
+    of every session, so a position opened at bar b cannot be held for more
+    than (77 - b) bars however long the nominal horizon is. Scoring an
+    uncapped 78- or 390-bar return would measure a trade the system is
+    incapable of placing -- and those were precisely the horizons with
+    reachable break-even ICs, so an uncapped lab would hand back a PASS on a
+    cell that cannot be built. Entries with no room left to trade (already at
+    the close) return NaN and drop out.
+    """
+    T = P.shape[0]
+    t = np.arange(T)
+    if session_last_idx is None:
+        exit_idx = np.minimum(t + h, T - 1)
+    else:
+        exit_idx = np.minimum(t + h, session_last_idx)
+    exit_idx = np.minimum(exit_idx, T - 1)
     out = np.full_like(P, np.nan, dtype=np.float32)
+    ok = exit_idx > t
     with np.errstate(divide="ignore", invalid="ignore"):
-        out[:-h] = np.log(P[h:] / P[:-h]) * 1e4
+        out[ok] = np.log(P[exit_idx[ok]] / P[t[ok]]) * 1e4
     return out
+
 
 
 def cross_sectional_demean(a):
@@ -449,7 +486,8 @@ def main(argv=None):
     print()
 
     rows = np.arange(T)
-    fwd_cache = {h: forward_return_bps(P, h) for h in HORIZONS.values()}
+    sli = panel["session_last_idx"]
+    fwd_cache = {h: forward_return_bps(P, h, sli) for h in HORIZONS.values()}
 
     # --- opportunity side --------------------------------------------------
     print("REALISED MOVE AND BREAK-EVEN IC (train split)")
@@ -478,7 +516,7 @@ def main(argv=None):
     print("BENCHMARKS -- always long, no model, val split")
     print(f"{'cell':<24}{'mean bps':>12}{'net of cost':>14}{'bets/yr':>10}{'sharpe':>10}")
     bench = {}
-    for rname, hname in [("all", "5min"), ("all", "1day"), ("overnight", "5min")]:
+    for rname, hname in [("all", "5min"), ("all", "1day")]:
         h = HORIZONS[hname]
         entry = np.isin(bod, REGIMES[rname])
         sel = entry & (rows >= i_train) & (rows < i_val)
@@ -491,7 +529,21 @@ def main(argv=None):
         bench[f"{rname}/{hname}"] = sh
         print(f"{rname + ' / ' + hname:<24}{y.mean():>12.3f}"
               f"{y.mean() - rt_cost:>14.3f}{nb:>10.0f}{sh:>10.2f}")
+    # Uncapped, entry on the session's last bar: the trade the env will not
+    # place. Shown so the cost of flatten_at_session_close is a number rather
+    # than an assumption.
+    on_entry = np.isin(bod, [BARS_PER_DAY - 1])
+    on_sel = on_entry & (rows >= i_train) & (rows < i_val)
+    on_y = forward_return_bps(P, 1, None)[on_sel].ravel()
+    on_y = on_y[np.isfinite(on_y)]
+    if on_y.size > 100:
+        nb = TRADING_DAYS
+        sh = ((on_y.mean() - rt_cost) / on_y.std()) * math.sqrt(nb)
+        print(f"{'overnight (NOT tradable)':<24}{on_y.mean():>12.3f}"
+              f"{on_y.mean() - rt_cost:>14.3f}{nb:>10.0f}{sh:>10.2f}")
     print("  A model must beat these. They are risk premia, not skill.")
+    print("  The overnight row is what flatten_at_session_close gives up; the")
+    print("  env cannot place it, so no cell above may be judged against it.")
     print()
 
     # --- the scan ----------------------------------------------------------

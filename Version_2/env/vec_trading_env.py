@@ -249,6 +249,8 @@ class VecTradingEnv:
         bias_window: int = DIVERSITY_WINDOW,
         diversity_bonus_coef: float = DIVERSITY_COEF,
         trade_cooldown_bars: int = 0,   # see _apply_trade_cooldown()
+        flatten_at_session_close: bool = True,  # see _session_close_override()
+        flatten_close_bars: int = 1,   # how many trailing bars force flat
 
         device: Optional[str] = None,
     ) -> None:
@@ -385,6 +387,83 @@ class VecTradingEnv:
                 device=self.device, dtype=torch.float32,
             )
 
+        # --- Session boundaries ---------------------------------------
+        # Until this existed the env had NO concept of a trading session. The
+        # RTH filter in preprocess.py leaves bar 77 of one day adjacent to
+        # bar 0 of the next with nothing marking the seam, so a position open
+        # at 15:55 was simply still open at 09:30 -- overnight exposure that
+        # nobody chose and no risk control could act on. Measured on 81
+        # sessions of adjusted data, the overnight bar carries sigma 171.8 bps
+        # against 23.0 bps intraday (7.5x) with a worst case of -3,681 bps
+        # against -581 bps: the tail you cannot exit is six times the tail you
+        # can. KillSwitch, RiskManager and the drawdown halt are all
+        # step-based and none of them run for those 17.5 hours.
+        #
+        # Derived from real timestamps rather than from a bar counter: a
+        # ticker missing a bar, a half-day session, or a holiday would all
+        # break a modulo-78 assumption, and dataset.aligned_dates is already
+        # sliced to this split.
+        dates = getattr(dataset, "aligned_dates", None)
+        if dates is not None and len(dates):
+            ny = dates.tz_convert("America/New_York") if dates.tz is not None else dates
+            sess = np.asarray(ny.normalize().view("int64"))
+            last = np.empty(len(sess), dtype=bool)
+            last[:-1] = sess[:-1] != sess[1:]
+            last[-1] = True          # nothing follows the final bar
+            first = np.empty(len(sess), dtype=bool)
+            first[0] = True
+            first[1:] = sess[1:] != sess[:-1]
+            self._is_session_first = torch.as_tensor(first, device=self.device)
+            self._n_sessions = int(first.sum())
+            # Widen the force-flat window to the trailing N bars of each
+            # session, so an oversized position gets more than one
+            # attempt at the participation cap.
+            wide = last.copy()
+            for _s in range(1, max(1, int(flatten_close_bars))):
+                wide[:-_s] |= last[_s:]
+            self._is_session_last = torch.as_tensor(wide, device=self.device)
+            self._session_last_only = torch.as_tensor(last, device=self.device)
+        else:
+            self._is_session_last = None
+            self._session_last_only = None
+            self._is_session_first = None
+            self._n_sessions = 0
+
+        self.flatten_at_session_close = bool(flatten_at_session_close)
+        self.flatten_close_bars = max(1, int(flatten_close_bars))
+        if self.flatten_at_session_close and self._is_session_last is None:
+            raise ValueError(
+                "flatten_at_session_close=True but the dataset exposes no "
+                "aligned_dates, so session boundaries cannot be located. Pass "
+                "flatten_at_session_close=False only if carrying overnight "
+                "exposure is a deliberate choice."
+            )
+        # Set by step(): True on the step that lands on a session's FIRST bar.
+        # collect_rollout() uses it to re-anchor KillSwitch's daily-loss
+        # reference on real sessions instead of every N rollouts.
+        self.session_just_started = False
+        self.forced_flatten_count = 0
+        # Positions that were STILL open after a session's final bar. A
+        # forced close is an order, not a guarantee: execution_sim caps
+        # fills at max_participation * bar volume, and a zero-volume bar
+        # fills nothing at all. Exempting the close from that cap would
+        # be inventing liquidity -- the same class of defect as Session
+        # 1's zero-liquidity clamp that manufactured 1e-07-share fills.
+        # So the cap stands and the residual is COUNTED instead. At real
+        # position sizes (~$740 against bar volumes in the millions of
+        # dollars) participation is ~7e-5 and this never binds; if it
+        # ever does, raise flatten_close_bars to wind down over more
+        # bars rather than uncapping the fill.
+        self.residual_overnight_count = 0
+        if self.flatten_at_session_close:
+            print(f"[env] flatten_at_session_close=True -- positions are closed on "
+                  f"the last bar of each of {self._n_sessions} session(s); no "
+                  f"overnight exposure is carried")
+        else:
+            print("[env] flatten_at_session_close=False -- OVERNIGHT EXPOSURE IS "
+                  "CARRIED. No step-based risk control runs between sessions.")
+
+
         self.current_idx = 0
         self.max_idx = len(self.dataset) - 1
         self.benchmark_start_price = None
@@ -451,6 +530,12 @@ class VecTradingEnv:
 
         self._bars_since_open.fill_(float(self.trade_cooldown_bars + 1))
         self._trade_hist.zero_()
+        # current_idx is back at 0, so the first bar of the split is by
+        # definition the first bar of a session -- collect_rollout() should
+        # anchor the daily-loss reference there rather than waiting for the
+        # next boundary.
+        self.session_just_started = True
+        self.forced_flatten_count = 0
         self._trade_hist_ptr = 0
         self._bias_hist.zero_()
         self._bias_hist_ptr = 0
@@ -510,6 +595,63 @@ class VecTradingEnv:
         extra = torch.stack((pos_frac, unrealized_frac), dim=-1)          # [n_envs, 2]
         extra = extra.unsqueeze(1).expand(-1, obs.shape[1], -1)            # [n_envs, window, 2]
         return torch.cat((obs, extra), dim=-1)
+
+    def _session_close_override(self, direction, size):
+        """Force every stream flat on the last bar of a trading session.
+
+        This is a genuine forced liquidation, and it is deliberately NOT
+        expressed by setting direction to 0. step()'s own note explains why:
+        a zero direction arriving at the env has three indistinguishable
+        causes -- real policy intent, risk_manager zeroing a dust-clipped
+        order, and kill_switch halting the stream -- and an earlier version
+        that reinterpreted it as "close" turned every dust rejection and every
+        halt into a liquidation. Here the target is stated positively:
+        direction = -sign(position), size = |position|. There is nothing to
+        misread.
+
+        Applied AFTER _apply_trade_cooldown so the cooldown cannot suppress
+        it. That is belt-and-braces -- the cooldown only blocks exposure-
+        INCREASING orders and a full close is a pure reduction -- but a forced
+        close must not depend on that remaining true.
+
+        It also runs after risk_manager and kill_switch, which live upstream
+        in _run_action_pipeline, so min_order_notional cannot reject it as
+        dust and a halted stream still gets flattened. Flattening a halted
+        stream is the safer reading of "halt": KillSwitch's docstring
+        explicitly leaves flatten-vs-freeze to the caller, and freezing a
+        halted stream into an overnight gap is the one outcome nobody wants.
+        """
+        if not self.flatten_at_session_close:
+            return direction, size
+        t = self.current_idx + self.window_size - 1
+        if t >= len(self._is_session_last) or not bool(self._is_session_last[t]):
+            return direction, size
+
+        position = self.portfolio.positions[:, 0]
+        open_pos = position != 0
+
+        direction = direction.to(device=self.device, dtype=position.dtype).clone()
+        size = size.to(device=self.device, dtype=position.dtype).clone()
+
+        # Close what is open...
+        direction = torch.where(open_pos, -torch.sign(position), direction)
+        size = torch.where(open_pos, position.abs(), size)
+
+        # ...and refuse to open what is flat. Without this second half the
+        # window is "wind down", not "wind down and STAY down": a stream fully
+        # closed on an early bar of the window sees position == 0 on the next
+        # one, takes no override, and the policy simply re-opens it -- so with
+        # an even number of bars left the session can END open. Measured
+        # before this branch existed, residual carry went the wrong way with
+        # window width (47 -> 390 -> 830 for 1 -> 3 -> 6 bars), which is what
+        # exposed it.
+        flat = ~open_pos
+        direction = torch.where(flat, torch.zeros_like(direction), direction)
+        size = torch.where(flat, torch.zeros_like(size), size)
+
+        self.forced_flatten_count += int(open_pos.sum().item())
+        return direction, size
+
 
     def _apply_trade_cooldown(self, direction: Tensor, size: Tensor) -> Tuple[Tensor, Tensor]:
         """
@@ -671,6 +813,7 @@ class VecTradingEnv:
         # _augment_obs_with_portfolio_state() below, which is what makes
         # inventory intent representable in the first place.
         direction, size = self._apply_trade_cooldown(direction, size)
+        direction, size = self._session_close_override(direction, size)
 
         sim_fill: SimulatedFill = self.execution.simulate_fill(
             direction=direction,
@@ -699,7 +842,26 @@ class VecTradingEnv:
         self._record_trade_direction(sim_fill.filled_qty)
         self._advance_trade_cooldown(positions_before, sim_fill.filled_qty)
 
+        # Residual overnight carry: anything still open after this bar, when
+        # this bar is a session's LAST. Must be read BEFORE current_idx
+        # advances -- computing it after made t the NEXT bar, which counted
+        # positions one bar early, i.e. before the forced close had run.
+        # That reported 1,188 carries where the true number was 10.
+        if self._session_last_only is not None and self.flatten_at_session_close:
+            _tc = self.current_idx + self.window_size - 1
+            if _tc < len(self._session_last_only) and bool(self._session_last_only[_tc]):
+                self.residual_overnight_count += int(
+                    (self.portfolio.positions[:, 0] != 0).sum().item()
+                )
         self.current_idx = min(self.current_idx + 1, self.max_idx)
+        # Flag the NEW bar, so collect_rollout() can re-anchor the
+        # KillSwitch daily-loss reference on a real session boundary.
+        if self._is_session_first is not None:
+            _t = self.current_idx + self.window_size - 1
+            self.session_just_started = (
+                _t < len(self._is_session_first)
+                and bool(self._is_session_first[_t])
+            )
         done_time = self.current_idx >= self.max_idx
         next_mid_price = self._current_prices() if not done_time else mid_price
 

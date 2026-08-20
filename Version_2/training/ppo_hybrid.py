@@ -50,6 +50,7 @@ env axis (not the time axis) would be safe to add if this becomes a memory
 bottleneck; shuffling across time would not be.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -383,6 +384,22 @@ def collect_rollout(
                 closed_mask=step_result.info.get("closed_trade"),
             )
             kill_switch.check_daily_loss(step_result.info["equity"])
+            # Re-anchor the daily-loss reference on a REAL session boundary.
+            #
+            # KillSwitch.daily_loss_limit_frac reads as a 3% daily stop, and in
+            # live/live_loop.py it is one. In training it was not: the trainers
+            # call start_new_day() every kill_switch_reset_every_n_rollouts,
+            # which is 1 rollout = 256 bars = 3.3 trading days, re-anchored at
+            # a point that lands mid-session and drifts. So the limit measured
+            # 3% over ~3.3 days from an arbitrary origin, and its name said
+            # something else. The env now knows where sessions begin, so the
+            # reference can be what it claims to be.
+            #
+            # The periodic kill_switch.reset() in the trainer loops is a
+            # separate mechanism with a separate purpose (unsticking streams
+            # halted early in training) and is deliberately left alone.
+            if getattr(env, "session_just_started", False):
+                kill_switch.start_new_day(step_result.info["equity"])
 
             step_return = step_result.info["step_pnl"] / equity_before.clamp(min=1e-6)
             # REWARD-EXPLOSION FIX: clamp per-step return to [-100%, +100%].
@@ -542,12 +559,91 @@ def _replay_trunk_sequence(
         return trunk_all.reshape(T * n_envs, -1)
 
 
+class AdaptiveEntropyCoef:
+    """Dual-ascent controller holding discrete-head entropy near a target.
+
+    WHY A CONTROLLER AND NOT A BIGGER CONSTANT. A fixed entropy bonus enters
+    the loss as -coef * H, so its gradient pressure is constant while the
+    advantage pressure toward "never trade" is not. Against a real cost floor
+    that advantage is relentless and one-signed, so any fixed coef is either
+    eventually overwhelmed or so large the policy is just noise. This project
+    has already tried the constant: 0.02 -> 0.05 is recorded in PPOConfig as a
+    fix for exactly this collapse, and the last run still went to
+    entropy_discrete = 0.000 at rollout 81 and stayed there for 65 more
+    rollouts -- 43% of the compute spent on a policy that could no longer
+    explore, and it happened having seen 22% of the training split.
+
+    The controller instead adapts in log space:
+
+        log_coef <- log_coef + lr * (target - measured)
+
+    so a persistent shortfall grows the coefficient without bound (up to
+    max_coef) until entropy comes back. Falling below target is self-
+    correcting rather than terminal.
+
+    ON THE TARGET. For the 3-way SHORT/FLAT/LONG head, max entropy is
+    ln(3) = 1.0986 nats. A target of 0.5 still permits ~85% of the mass on one
+    action -- (0.8, 0.1, 0.1) measures 0.639 nats -- so this floors exploration
+    without forcing churn. It does NOT prevent the policy from preferring FLAT;
+    it prevents it from becoming incapable of considering anything else.
+
+    DISCRETE HEAD ONLY, deliberately. The continuous size head also collapsed
+    last run (entropy_continuous -> 0.000), but every observed fill was at
+    exactly the Kelly cap -- 0.0799 x median equity, with kelly_fractional
+    pinned to its floor in 98.4% of cells -- so that head's output had no
+    effect on executed size. Forcing entropy into a channel the risk pipeline
+    overrides would burn exploration budget for nothing. Fix the Kelly binding
+    first, then revisit.
+
+    CHECKPOINTED. KellySizer's un-checkpointed state is what made the Session 1
+    lock re-arm on every restart; a controller that silently resets to its
+    initial coefficient on --resume would repeat that class of bug exactly.
+    """
+
+    def __init__(self, target, init_coef, lr=0.1, min_coef=0.005, max_coef=2.0):
+        self.target = float(target)
+        self.lr = float(lr)
+        self.min_coef = float(min_coef)
+        self.max_coef = float(max_coef)
+        self._log_coef = math.log(max(float(init_coef), 1e-8))
+
+    def coef(self):
+        return float(min(max(math.exp(self._log_coef), self.min_coef), self.max_coef))
+
+    def observe(self, measured_entropy):
+        """One dual-ascent step. Call once per PPO epoch, after the backward."""
+        m = float(measured_entropy)
+        if not math.isfinite(m):
+            return
+        self._log_coef += self.lr * (self.target - m)
+        # Clamp in log space too, or the coefficient can wind up far outside
+        # the usable band while coef() silently saturates and the controller
+        # then takes many epochs to respond to a genuine entropy recovery.
+        self._log_coef = min(max(self._log_coef, math.log(self.min_coef)),
+                             math.log(self.max_coef))
+
+    def state_dict(self):
+        return {"log_coef": self._log_coef, "target": self.target, "lr": self.lr,
+                "min_coef": self.min_coef, "max_coef": self.max_coef}
+
+    def load_state_dict(self, d):
+        if not d:
+            return
+        self._log_coef = float(d.get("log_coef", self._log_coef))
+        self.target = float(d.get("target", self.target))
+        self.lr = float(d.get("lr", self.lr))
+        self.min_coef = float(d.get("min_coef", self.min_coef))
+        self.max_coef = float(d.get("max_coef", self.max_coef))
+
+
+
 def ppo_update(
     actor_critic: HybridActorCritic,
     optimizer: torch.optim.Optimizer,
     buffer: RolloutBuffer,
     cfg: TrainingConfig,
     scaler: "Optional[torch.cuda.amp.GradScaler]" = None,
+    entropy_ctl=None,
 ) -> Dict[str, float]:
     """
     Replays the stored trajectory through the CURRENT network parameters
@@ -634,8 +730,13 @@ def ppo_update(
         value_loss_clipped = (value_clipped - flat_returns).pow(2)
         value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
 
+        # entropy_coef_discrete is the INITIAL value when a controller is
+        # supplied; AdaptiveEntropyCoef then owns it. Passing None restores
+        # the old fixed-coefficient behaviour exactly.
+        coef_discrete = (entropy_ctl.coef() if entropy_ctl is not None
+                         else p.entropy_coef_discrete)
         entropy_bonus = (
-            p.entropy_coef_discrete * discrete_entropy + p.entropy_coef_continuous * continuous_entropy
+            coef_discrete * discrete_entropy + p.entropy_coef_continuous * continuous_entropy
         ).mean()
 
         loss = policy_loss + p.value_loss_coef * value_loss - entropy_bonus
@@ -652,6 +753,9 @@ def ppo_update(
             grad_norm = torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), p.max_grad_norm)
             optimizer.step()
 
+        if entropy_ctl is not None:
+            entropy_ctl.observe(discrete_entropy.mean().item())
+
         with torch.no_grad():
             approx_kl = (flat_log_prob_old - log_prob_new).mean().item()
             clip_frac = ((ratio - 1.0).abs() > p.clip_range).float().mean().item()
@@ -664,6 +768,7 @@ def ppo_update(
             "approx_kl": approx_kl,
             "clip_frac": clip_frac,
             "grad_norm": float(grad_norm),
+            "entropy_coef_discrete": float(coef_discrete),
         }
 
     return last_stats

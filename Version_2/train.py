@@ -54,7 +54,9 @@ from paths import is_kaggle  # noqa: E402
 from env.vec_trading_env import VecTradingEnv, StepResult  # noqa: E402
 
 from training.config import TrainingConfig  # noqa: E402
-from training.ppo_hybrid import HybridActorCritic, collect_rollout, compute_gae, ppo_update  # noqa: E402
+from training.ppo_hybrid import (  # noqa: E402
+    AdaptiveEntropyCoef, HybridActorCritic, collect_rollout, compute_gae, ppo_update,
+)
 from training.reward import DifferentialSharpeReward  # noqa: E402
 
 from risk.kelly_sizing import KellyDiagnostics, KellySizer  # noqa: E402
@@ -423,6 +425,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         bias_window=cfg.env.bias_window,
         diversity_bonus_coef=cfg.env.diversity_bonus_coef,
         trade_cooldown_bars=cfg.env.trade_cooldown_bars,
+        flatten_at_session_close=cfg.env.flatten_at_session_close,
         device=str(device),
     )
 
@@ -500,6 +503,28 @@ def main(argv: Optional[List[str]] = None) -> None:
     if resume_path is not None and "scaler" in checkpoint:
         scaler.load_state_dict(checkpoint["scaler"])
 
+
+    # Entropy collapse guard. Created ONCE outside the loop and checkpointed:
+    # KellySizer's un-checkpointed state is exactly what let the Session 1 lock
+    # re-arm on every restart, and a controller silently resetting to its
+    # initial coefficient on --resume would repeat that.
+    entropy_ctl = None
+    if cfg.ppo.target_entropy_discrete is not None:
+        entropy_ctl = AdaptiveEntropyCoef(
+            target=cfg.ppo.target_entropy_discrete,
+            init_coef=cfg.ppo.entropy_coef_discrete,
+            lr=cfg.ppo.entropy_coef_lr,
+            min_coef=cfg.ppo.entropy_coef_min,
+            max_coef=cfg.ppo.entropy_coef_max,
+        )
+        if resume_path is not None and "entropy_ctl" in checkpoint:
+            entropy_ctl.load_state_dict(checkpoint["entropy_ctl"])
+            print(f"[train] resumed entropy controller: coef={entropy_ctl.coef():.4f}")
+    # Collapse detector: consecutive rollouts that are BOTH near-zero entropy
+    # and near-zero trades. Both conditions, because low entropy alone is a
+    # committed policy (fine) and low trades alone can be a cooldown artefact.
+    collapse_streak = 0
+
     obs = env.reset()
     hidden = actor_critic.init_hidden(env.n_envs, device)
     kill_switch.start_new_day(env.portfolio.equity(env._current_prices().unsqueeze(1)))  # noqa: SLF001
@@ -518,7 +543,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         # rollout. See risk/kelly_sizing.py's diagnostics() docstring.
         kelly_diag = kelly_sizer.diagnostics()
         compute_gae(buffer, final_value, cfg.ppo.gamma, cfg.ppo.gae_lambda)
-        stats = ppo_update(actor_critic, optimizer, buffer, cfg, scaler=scaler)
+        stats = ppo_update(actor_critic, optimizer, buffer, cfg, scaler=scaler,
+                           entropy_ctl=entropy_ctl)
 
         # DRAWDOWN-METRIC FIX: snapshot peak_equity BEFORE either reset
         # branch below can touch it. The periodic branch's
@@ -595,6 +621,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                 trades_per_ticker_this_rollout=list(state.trades_this_rollout_per_ticker),
                 total_trades=int(sum(state.total_trades_per_ticker)),
                 total_trades_per_ticker=list(state.total_trades_per_ticker),
+                # Overnight carry telemetry. residual_overnight_count should
+                # stay at 0 (or move only on zero-volume closing bars, where a
+                # forced close genuinely cannot fill). Anything else means
+                # positions are surviving the session close.
+                forced_flatten_count=int(getattr(env, "forced_flatten_count", 0)),
+                residual_overnight_count=int(getattr(env, "residual_overnight_count", 0)),
                 tickers=env.tickers,
                 position=env.portfolio.positions[:, 0].tolist(),
                 **kelly_metrics_fields(kelly_diag),
@@ -611,6 +643,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             "episode_idx": state.episode_idx,
             "total_trades_per_ticker": state.total_trades_per_ticker,
             "scaler": scaler.state_dict(),
+            "entropy_ctl": entropy_ctl.state_dict() if entropy_ctl is not None else None,
         }
 
         if rollout_idx % cfg.run.checkpoint_every_n_rollouts == 0:
@@ -624,6 +657,31 @@ def main(argv: Optional[List[str]] = None) -> None:
             best_path = os.path.join(cfg.run.checkpoint_dir, "checkpoint_best.pt")
             torch.save(checkpoint_state, best_path)
             print(f"[train] rollout {rollout_idx}: new best (EMA reward {best_metric:.6f}) -> {best_path}")
+
+        # --- collapse detector ------------------------------------------
+        # Both conditions, not either: low entropy alone is a committed
+        # policy, and low trade count alone can be a trade_cooldown_bars
+        # artefact. Together they are the signature the last run held for its
+        # final 65 rollouts -- entropy 0.000, 124 trades across all 100
+        # streams, 43% of the compute confirming a conclusion already reached.
+        if cfg.ppo.collapse_patience_rollouts > 0:
+            _h = stats.get("entropy_discrete", float("inf"))
+            _tr = int(sum(state.trades_this_rollout_per_ticker))
+            if (_h < cfg.ppo.collapse_entropy_threshold
+                    and _tr <= cfg.ppo.collapse_trades_threshold):
+                collapse_streak += 1
+            else:
+                collapse_streak = 0
+            if collapse_streak >= cfg.ppo.collapse_patience_rollouts:
+                print(f"[train] COLLAPSE: entropy_discrete < "
+                      f"{cfg.ppo.collapse_entropy_threshold} and <= "
+                      f"{cfg.ppo.collapse_trades_threshold} trades for "
+                      f"{collapse_streak} consecutive rollouts. Stopping at "
+                      f"rollout {rollout_idx} of {cfg.run.total_rollouts}.")
+                print("[train] This is a RESULT, not a crash: the policy found "
+                      "that trading loses on average and stopped. Check the "
+                      "alpha gate (eval/alpha_lab.py) before training again.")
+                break
 
     metrics_writer.close()
 

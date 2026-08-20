@@ -73,7 +73,9 @@ from paths import is_kaggle  # noqa: E402
 from env.vec_trading_env import VecTradingEnv  # noqa: E402
 
 from training.config import TrainingConfig  # noqa: E402
-from training.ppo_hybrid import HybridActorCritic, collect_rollout, compute_gae  # noqa: E402
+from training.ppo_hybrid import (  # noqa: E402
+    AdaptiveEntropyCoef, HybridActorCritic, collect_rollout, compute_gae,
+)
 from training.reward import DifferentialSharpeReward  # noqa: E402
 
 from model.dual_critic import DualCriticHead  # noqa: E402
@@ -130,6 +132,7 @@ def _build_env(cfg: TrainingConfig, device: torch.device) -> VecTradingEnv:
         bias_window=cfg.env.bias_window,
         diversity_bonus_coef=cfg.env.diversity_bonus_coef,
         trade_cooldown_bars=cfg.env.trade_cooldown_bars,
+        flatten_at_session_close=cfg.env.flatten_at_session_close,
         device=str(device),
     )
     return env
@@ -278,6 +281,29 @@ def _worker(
         if rank == 0 else None
     )
 
+
+    # Entropy collapse guard. Created ONCE outside the loop and checkpointed:
+    # KellySizer's un-checkpointed state is exactly what let the Session 1 lock
+    # re-arm on every restart, and a controller silently resetting to its
+    # initial coefficient on --resume would repeat that.
+    entropy_ctl = None
+    if cfg.ppo.target_entropy_discrete is not None:
+        entropy_ctl = AdaptiveEntropyCoef(
+            target=cfg.ppo.target_entropy_discrete,
+            init_coef=cfg.ppo.entropy_coef_discrete,
+            lr=cfg.ppo.entropy_coef_lr,
+            min_coef=cfg.ppo.entropy_coef_min,
+            max_coef=cfg.ppo.entropy_coef_max,
+        )
+        if resume_path is not None and "entropy_ctl" in checkpoint:
+            entropy_ctl.load_state_dict(checkpoint["entropy_ctl"])
+            if rank == 0:
+                print(f"[train_ddp] resumed entropy controller: coef={entropy_ctl.coef():.4f}")
+    # Collapse detector: consecutive rollouts that are BOTH near-zero entropy
+    # and near-zero trades. Both conditions, because low entropy alone is a
+    # committed policy (fine) and low trades alone can be a cooldown artefact.
+    collapse_streak = 0
+
     obs = env.reset()
     hidden = ddp_model.module.init_hidden(env.n_envs, device)
     kill_switch.start_new_day(env.portfolio.equity(env._current_prices().unsqueeze(1)))  # noqa: SLF001
@@ -301,7 +327,8 @@ def _worker(
         # rank 0 needs the snapshot.
         kelly_diag = kelly_sizer.diagnostics() if rank == 0 else None
         compute_gae(buffer, final_value, cfg.ppo.gamma, cfg.ppo.gae_lambda)
-        stats = _ddp_ppo_update(ddp_model, optimizer, buffer, cfg, scaler=scaler)
+        stats = _ddp_ppo_update(ddp_model, optimizer, buffer, cfg, scaler=scaler,
+                                entropy_ctl=entropy_ctl)
 
         # DRAWDOWN-METRIC FIX: snapshot peak_equity BEFORE any reset below
         # touches it. reset_peak_equity() (periodic branch) overwrites
@@ -366,6 +393,12 @@ def _worker(
                 trades_per_ticker_this_rollout=list(state.trades_this_rollout_per_ticker),
                 total_trades=int(sum(state.total_trades_per_ticker)),
                 total_trades_per_ticker=list(state.total_trades_per_ticker),
+                # Overnight carry telemetry. residual_overnight_count should
+                # stay at 0 (or move only on zero-volume closing bars, where a
+                # forced close genuinely cannot fill). Anything else means
+                # positions are surviving the session close.
+                forced_flatten_count=int(getattr(env, "forced_flatten_count", 0)),
+                residual_overnight_count=int(getattr(env, "residual_overnight_count", 0)),
                 tickers=env.tickers,
                 position=env.portfolio.positions[:, 0].tolist(),
                 world_size=world_size,  # tag records so you can tell DDP runs apart from single-GPU ones in the log
@@ -384,6 +417,7 @@ def _worker(
                 "episode_idx": state.episode_idx,
                 "total_trades_per_ticker": state.total_trades_per_ticker,
                 "scaler": scaler.state_dict(),
+                "entropy_ctl": entropy_ctl.state_dict() if entropy_ctl is not None else None,
             }
             if rollout_idx % cfg.run.checkpoint_every_n_rollouts == 0:
                 path = os.path.join(cfg.run.checkpoint_dir, f"checkpoint_{rollout_idx}.pt")
@@ -395,6 +429,40 @@ def _worker(
                 best_path = os.path.join(cfg.run.checkpoint_dir, "checkpoint_best.pt")
                 torch.save(checkpoint_state, best_path)
                 print(f"[train_ddp] rollout {rollout_idx}: new best (EMA reward {best_metric:.6f}) -> {best_path}")
+
+        # --- collapse detector ------------------------------------------
+        # Decided on rank 0 and broadcast: stats["entropy_discrete"] is
+        # per-shard and state.trades_* is maintained on rank 0 only, so each
+        # rank left to itself could reach a different verdict -- one process
+        # leaving the loop while the other blocks forever in the next
+        # collective. See train.py's matching comment for what the two
+        # conditions mean and why both are required.
+        if cfg.ppo.collapse_patience_rollouts > 0:
+            if rank == 0:
+                _h = stats.get("entropy_discrete", float("inf"))
+                _tr = int(sum(state.trades_this_rollout_per_ticker))
+                if (_h < cfg.ppo.collapse_entropy_threshold
+                        and _tr <= cfg.ppo.collapse_trades_threshold):
+                    collapse_streak += 1
+                else:
+                    collapse_streak = 0
+            _stop = torch.tensor(
+                [1 if (rank == 0
+                       and collapse_streak >= cfg.ppo.collapse_patience_rollouts) else 0],
+                device=device, dtype=torch.int32,
+            )
+            dist.broadcast(_stop, src=0)
+            if int(_stop.item()) == 1:
+                if rank == 0:
+                    print(f"[train_ddp] COLLAPSE: entropy_discrete < "
+                          f"{cfg.ppo.collapse_entropy_threshold} and <= "
+                          f"{cfg.ppo.collapse_trades_threshold} trades for "
+                          f"{collapse_streak} consecutive rollouts. Stopping at "
+                          f"rollout {rollout_idx} of {cfg.run.total_rollouts}.")
+                    print("[train_ddp] This is a RESULT, not a crash: the policy "
+                          "found that trading loses on average and stopped. Check "
+                          "the alpha gate (eval/alpha_lab.py) before training again.")
+                break
 
     try:
         if metrics_writer is not None:
@@ -411,6 +479,7 @@ def _ddp_ppo_update(
     buffer,
     cfg: TrainingConfig,
     scaler: "Optional[torch.cuda.amp.GradScaler]" = None,
+    entropy_ctl=None,
 ) -> dict:
     """
     Same math as training/ppo_hybrid.py's ppo_update(). The DDP-specific
@@ -491,8 +560,13 @@ def _ddp_ppo_update(
         value_loss_clipped = (value_clipped - flat_returns).pow(2)
         value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
 
+        # entropy_coef_discrete is the INITIAL value when a controller is
+        # supplied; AdaptiveEntropyCoef then owns it. Passing None restores
+        # the old fixed-coefficient behaviour exactly.
+        coef_discrete = (entropy_ctl.coef() if entropy_ctl is not None
+                         else p.entropy_coef_discrete)
         entropy_bonus = (
-            p.entropy_coef_discrete * discrete_entropy + p.entropy_coef_continuous * continuous_entropy
+            coef_discrete * discrete_entropy + p.entropy_coef_continuous * continuous_entropy
         ).mean()
         loss = policy_loss + p.value_loss_coef * value_loss - entropy_bonus
 
@@ -508,6 +582,19 @@ def _ddp_ppo_update(
             grad_norm = torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), p.max_grad_norm)
             optimizer.step()
 
+        if entropy_ctl is not None:
+            # All-reduce before the controller step. Each rank holds a
+            # different env shard, so per-rank entropies differ; letting each
+            # rank run its own controller would have the two GPUs optimising
+            # slightly different objectives while DDP averages their
+            # gradients. One cheap scalar reduce keeps the coefficient
+            # identical on both ranks.
+            _h = discrete_entropy.mean().detach()
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(_h, op=dist.ReduceOp.SUM)
+                _h = _h / dist.get_world_size()
+            entropy_ctl.observe(_h.item())
+
         with torch.no_grad():
             approx_kl = (flat_log_prob_old - log_prob_new).mean().item()
             clip_frac = ((ratio - 1.0).abs() > p.clip_range).float().mean().item()
@@ -520,6 +607,7 @@ def _ddp_ppo_update(
             "approx_kl": approx_kl,
             "clip_frac": clip_frac,
             "grad_norm": float(grad_norm),
+            "entropy_coef_discrete": float(coef_discrete),
         }
     return last_stats
 

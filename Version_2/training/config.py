@@ -228,6 +228,29 @@ class EnvConfig:
     # VecTradingEnv._apply_trade_cooldown() for the measurements behind this.
     trade_cooldown_bars: int = 12
 
+    # Close every position on the last bar of each trading session.
+    #
+    # Before this flag the env had no notion of a session at all, so overnight
+    # exposure was carried by default -- not chosen, just never prevented. It
+    # was already happening: of only 14 round trips in the last run's tick log
+    # (the dead phase, 28 fills out of 257,137 trades) one was opened at 15:55
+    # and closed at 09:35 the next morning.
+    #
+    # Measured on 81 sessions of adjusted data, the overnight bar carries
+    # sigma 171.8 bps vs 23.0 bps intraday and a worst case of -3,681 bps vs
+    # -581 bps. Every risk control in this project is step-based -- KillSwitch,
+    # RiskManager, the drawdown halt -- so none of them run across those 17.5
+    # hours. And the apparent reward is not edge: the overnight bar's 7.7x
+    # better move-to-cost ratio is exactly its 7.5x larger sigma. A bigger bet
+    # is not a better bet.
+    #
+    # Set False only as a deliberate decision, alongside overnight-specific
+    # risk machinery (per-name gap caps, separate overnight sizing) and
+    # separate accounting for overnight vs intraday PnL -- the overnight
+    # premium is beta, and booking it as alpha is the mistake that cost this
+    # project two sessions.
+    flatten_at_session_close: bool = True
+
     @classmethod
     def for_friction(cls, level: str, **overrides: Any) -> "EnvConfig":
         """
@@ -503,6 +526,33 @@ class PPOConfig:
     entropy_coef_continuous: float = 0.02  # applied to the (FLAT-masked) size + limit_offset entropy
                                             # independently. Raised 0.01 -> 0.02 to keep the Beta
                                             # size/limit_offset heads exploring instead of collapsing.
+
+    # --- entropy collapse guard -----------------------------------------
+    # entropy_coef_discrete above is the INITIAL value when the controller is
+    # on; the controller then moves it. See ppo_hybrid.AdaptiveEntropyCoef for
+    # why a constant cannot hold: the last run collapsed to
+    # entropy_discrete = 0.000 at rollout 81 with entropy_coef_discrete
+    # already raised to 0.05, and spent the remaining 65 rollouts (43% of the
+    # run, 124 trades total) unable to explore -- having seen 22% of the
+    # training split at the moment it stopped.
+    #
+    # Set target_entropy_discrete to None to restore the old fixed-coefficient
+    # behaviour exactly.
+    target_entropy_discrete: "Optional[float]" = 0.5   # nats; ln(3)=1.0986 is the max
+    entropy_coef_lr: float = 0.1                        # dual-ascent step, per PPO epoch
+    entropy_coef_min: float = 0.005
+    entropy_coef_max: float = 2.0
+
+    # Safety net behind the controller. If the discrete head sits below
+    # collapse_entropy_threshold AND the streams place essentially no trades
+    # for collapse_patience_rollouts consecutive rollouts, stop the run rather
+    # than burn the remainder. A converged do-nothing policy is a result, but
+    # it does not need another 65 rollouts of confirmation.
+    # Set collapse_patience_rollouts to 0 to disable.
+    collapse_patience_rollouts: int = 20
+    collapse_entropy_threshold: float = 0.02
+    collapse_trades_threshold: int = 10
+
     value_loss_coef: float = 0.5
     max_grad_norm: float = 0.5
     ppo_epochs: int = 3                   # full-batch epochs per rollout -- see ppo_hybrid.py docstring
