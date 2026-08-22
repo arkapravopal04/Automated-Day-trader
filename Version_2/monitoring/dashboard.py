@@ -17,17 +17,26 @@ available, render into a persistent `ipywidgets.Output` widget and
 IPython.display.clear_output(wait=True) + display() outside a notebook,
 and to Rich's Live() on a real TTY.
 
-v3 (layout redesign): the old layout buried the things you actually care
-about under walls of numbers -- ~100 per-ticker rows, an unreadable market
-tape, reward displayed as dollars, a dead "Sharpe" line, and an entropy
-line that never rendered (training emits entropy_discrete/continuous, not
-entropy). The new layout is six clear sections:
-    1. Run Status   -- health, step/rollout/episode, throughput, data age
-    2. Alerts       -- halted / bankrupt / deep-drawdown streams, or "none"
-    3. Training     -- reward, EMA, entropy (both heads), losses, KL, grad
-    4. Portfolio    -- aggregate net worth + context, spotlight top/bottom
-    5. Market       -- compact grid of all symbols + movers + up/down counts
-    6. Recent Fills -- last few fills, oldest -> newest
+v3 (information architecture): the old layout buried the things you
+actually care about under walls of numbers -- ~100 per-ticker rows, an
+unreadable market tape, reward displayed as dollars, a dead "Sharpe" line,
+and an entropy line that never rendered (training emits
+entropy_discrete/continuous, not entropy).
+
+v4 (visual identity): v3's six numbered sections were right about *what* to
+show and wrong about how it read -- a stack of boxes that looked like a
+debug dump. v4 keeps every number and re-skins it as a trading desk:
+    MASTHEAD   -- brand, LIVE/STALE/NO DATA pill, session clock, pace
+    TAPE       -- scrolling marquee of every symbol, price and tick change
+    RISK       -- one band; "ALL CLEAR" when clean, unmissable when not
+    THE BOOK   -- headline net liquidating value, equity sparkline,
+                  aggregate stats, top/bottom leaderboard by unrealized PnL
+    TELEMETRY  -- reward + trend sparkline, gauges for entropy/clip/KL,
+                  losses, grad norm, Kelly locked/warm
+    BLOTTER    -- recent fills as an execution blotter, newest first
+    THE FLOOR  -- every symbol in a compact grid + breadth bar + movers
+Layout is responsive: above _TWO_COLUMN_MIN_WIDTH the book sits beside
+telemetry/blotter, below it everything stacks into one column.
 
 Decoupling (unchanged): the training loop NEVER renders anything and NEVER
 imports Rich. It only calls MetricsWriter.log(step, **metrics), appending
@@ -47,6 +56,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from rich import box
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -347,19 +357,41 @@ def resolve_mode(cfg_display_mode: str = "auto", argv: Optional[List[str]] = Non
 
     return resolve_display_mode(configured)
 
-
 # --------------------------------------------------------------------------
-# Dashboard constants
+# Terminal identity -- palette, glyphs, constants
 # --------------------------------------------------------------------------
+#
+# v4 (visual identity): the information architecture of v3 was right, the
+# presentation was a stack of six numbered boxes that read like a debug dump.
+# v4 keeps every number and every guarantee (no Live(auto_refresh=True), no
+# rendering imports in the training loop, JSONL only) and re-skins it as a
+# trading desk: a masthead, a scrolling tape, a two-column body, a heat grid
+# and an execution blotter, in one amber/cyan-on-black palette.
 
-_SPINNER_FRAMES = ["⠷", "⠯", "⠟", "⠿", "⡿", "⢿", "⣻", "⣾"]
-_MAX_TRADE_EVENTS = 8          # fills shown in section 6
-_SPOTLIGHT_ROWS = 10           # top/bottom rows in the portfolio spotlight
-_GRID_THRESHOLD = 20           # tickers beyond this get the compact grid
-_MOVERS_COUNT = 3              # biggest movers shown in the market section
+_C_AMBER = "#ffb000"        # primary brand / headline numbers
+_C_AMBER_DIM = "#9a6b00"    # borders, rules, separators
+_C_CYAN = "#38d6ff"         # secondary accent
+_C_UP = "#00e07a"
+_C_DOWN = "#ff4d5e"
+_C_TEXT = "#dbe1ea"
+_C_MUTE = "#6d7784"
+_C_PANEL = "#0c0f14"        # panel background
+_C_BAR = "#161b23"          # masthead / tape background
+
+_BOX = box.SQUARE
+
+_SPINNER_FRAMES = ["◜", "◝", "◞", "◟"]
+_PULSE_FRAMES = ["●", "◉", "◎", "◉"]
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+_MAX_TRADE_EVENTS = 9          # fills shown in the blotter
+_SPOTLIGHT_ROWS = 10           # top/bottom rows in the P&L leaderboard
+_MOVERS_COUNT = 4              # biggest movers called out under the heat grid
 _DD_ALERT_FRAC = 0.25          # per-stream drawdown that raises an alert
 _HEALTH_LIVE_S = 10
 _HEALTH_STALE_S = 30
+_TAPE_SCROLL_CHARS = 2         # tape characters advanced per rendered frame
+_TWO_COLUMN_MIN_WIDTH = 150    # below this the body stacks into one column
 
 
 # --------------------------------------------------------------------------
@@ -409,7 +441,7 @@ def _fmt_int(value: Any) -> str:
     if value is None:
         return "—"
     try:
-        return str(int(value))
+        return f"{int(value):,}"
     except (TypeError, ValueError):
         return str(value)
 
@@ -423,6 +455,32 @@ def _fmt_money(value: Any, signed: bool = False) -> str:
     return f"${number:,.2f}"
 
 
+def _fmt_money_compact(value: Any) -> str:
+    """Desk shorthand: $1.24B / $1.24M / $912.4K / $84.20."""
+    number = _number(value)
+    if number is None:
+        return "—"
+    sign = "-" if number < 0 else ""
+    magnitude = abs(number)
+    if magnitude >= 1e9:
+        return f"{sign}${magnitude / 1e9:,.2f}B"
+    if magnitude >= 1e6:
+        return f"{sign}${magnitude / 1e6:,.2f}M"
+    if magnitude >= 1e4:
+        return f"{sign}${magnitude / 1e3:,.1f}K"
+    return f"{sign}${magnitude:,.2f}"
+
+
+def _fmt_shares(value: Any) -> str:
+    """Share counts are quantities, not rates -- two decimals, always signed."""
+    number = _number(value)
+    if number is None:
+        return "—"
+    if number == 0:
+        return "·"
+    return f"{number:+,.2f}"
+
+
 def _colored_money(
     value: Any,
     *,
@@ -434,7 +492,7 @@ def _colored_money(
         return "—"
     color = explicit_color
     if color is None:
-        color = "bright_green" if number >= 0 else "bright_red"
+        color = _C_UP if number >= 0 else _C_DOWN
     return f"[{color}]{_fmt_money(number, signed=signed)}[/{color}]"
 
 
@@ -443,14 +501,73 @@ def _colored_pct(value: Any, *, lower_is_better: bool = False) -> str:
     if number is None:
         return "—"
     if lower_is_better:
-        color = "bright_green" if number <= 0.10 else "bright_red"
+        color = _C_UP if number <= 0.10 else _C_DOWN
     else:
-        color = "bright_green" if number >= 0 else "bright_red"
+        color = _C_UP if number >= 0 else _C_DOWN
     return f"[{color}]{number:.2%}[/{color}]"
 
 
-def _status_text(status: str, color: str = "grey62") -> Text:
+def _status_text(status: str, color: str = _C_MUTE) -> Text:
     return Text(status, style=color)
+
+
+def _spaced(label: str, gap: str = " ") -> str:
+    """`RISK` -> `R I S K`. Cheap way to make a header read as a masthead."""
+    return gap.join(label)
+
+
+def _sparkline(values: List[Any], width: int = 48) -> str:
+    """Unicode block sparkline, bucket-averaged down to `width` columns."""
+    series = [v for v in (_number(value) for value in values) if v is not None]
+    if len(series) < 2:
+        return ""
+
+    width = max(4, int(width))
+
+    if len(series) > width:
+        bucket = len(series) / width
+        resampled: List[float] = []
+        for index in range(width):
+            start = int(index * bucket)
+            end = max(int((index + 1) * bucket), start + 1)
+            chunk = series[start:end]
+            resampled.append(sum(chunk) / len(chunk))
+        series = resampled
+
+    low = min(series)
+    high = max(series)
+    span = high - low
+
+    if span <= 0:
+        return _SPARK_CHARS[3] * len(series)
+
+    last_index = len(_SPARK_CHARS) - 1
+    return "".join(
+        _SPARK_CHARS[min(last_index, int((value - low) / span * last_index + 0.5))]
+        for value in series
+    )
+
+
+def _gauge(fraction: Optional[float], width: int = 12) -> str:
+    """Solid/hollow bar for a 0..1 quantity."""
+    if fraction is None:
+        return "░" * width
+    fraction = max(0.0, min(1.0, float(fraction)))
+    filled = int(round(fraction * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _runs_to_text(chars: str, styles: List[str]) -> Text:
+    """Collapse a per-character style list into a Text of styled runs."""
+    text = Text()
+    if not chars:
+        return text
+    start = 0
+    for index in range(1, len(chars) + 1):
+        if index == len(chars) or styles[index] != styles[start]:
+            text.append(chars[start:index], style=styles[start])
+            start = index
+    return text
 
 
 # --------------------------------------------------------------------------
@@ -459,14 +576,16 @@ def _status_text(status: str, color: str = "grey62") -> Text:
 
 class TrainingDashboard:
     """
-    Human-readable live view of the training process.
+    Live trading-desk view of the training process.
 
-    Design goals (v3):
-      1. Answer "is training alive?" in one glance (Run Status panel).
-      2. Make risk impossible to miss (dedicated Alerts panel, not a badge
+    Design goals:
+      1. Answer "is training alive?" before you have finished looking -- the
+         status pill, the pulse, and a tape that visibly moves.
+      2. Make risk impossible to miss (a dedicated risk band, not a badge
          buried in a table).
-      3. Show aggregates and spotlights, not 100 rows of numbers.
-      4. Keep market information compact (grid + movers, no giant tape).
+      3. Show aggregates, trends and spotlights, not 100 rows of numbers.
+      4. Read like a trading terminal: one palette, one box style, headline
+         numbers larger than the labels that name them.
       5. Never display a scalar as the wrong kind of thing (reward is a
          dimensionless number, not dollars).
 
@@ -482,6 +601,7 @@ class TrainingDashboard:
         console: Optional[Console] = None,
         tick_metrics_path: Optional[str] = None,
         tick_backup_count: int = MetricsWriter._DEFAULT_TICK_BACKUP_COUNT,
+        desk_name: str = "AUTONOMOUS TRADING DESK",
     ):
         resolved_tick_path = (
             tick_metrics_path
@@ -496,6 +616,7 @@ class TrainingDashboard:
 
         self.mode = resolve_display_mode(mode)
         self.history_window = max(10, int(history_window))
+        self.desk_name = desk_name
 
         self._notebook_capable = _HAS_IPYTHON and _get_ipython() is not None
         self._widget_capable = self._notebook_capable and _HAS_IPYWIDGETS
@@ -506,8 +627,14 @@ class TrainingDashboard:
         elif self._is_tty:
             self.console = Console()
         else:
-            # Notebook/headless output has no reliable terminal width.
-            self.console = Console(width=160)
+            # Notebook/headless output has no reliable terminal width and no
+            # detectable color system -- force truecolor so the hex palette
+            # above survives into Jupyter's ANSI-rendered stream output.
+            self.console = Console(
+                width=160,
+                force_terminal=True,
+                color_system="truecolor",
+            )
 
         self._live: Optional[Live] = None
         self._output_widget = None
@@ -556,6 +683,10 @@ class TrainingDashboard:
     def __exit__(self, *exc) -> None:
         self.stop()
 
+    @property
+    def width(self) -> int:
+        return int(self.console.width or 120)
+
     def render_once(self) -> None:
         history = self.reader.tail(self.history_window)
         if not history:
@@ -575,9 +706,9 @@ class TrainingDashboard:
         step = latest_tick.get("step")
         is_new_step = step != self._last_step
 
-        if is_new_step:
-            self._frame_count += 1
-
+        # Every frame advances the animation counters -- the tape must keep
+        # moving between steps, otherwise a slow trainer looks frozen.
+        self._frame_count += 1
         self._last_step = step
 
         renderable = self._build_renderable(
@@ -643,13 +774,19 @@ class TrainingDashboard:
         temp_console = Console(
             file=buffer,
             record=True,
-            width=100,
+            width=self.width,
             force_terminal=False,
+            color_system="truecolor",
         )
         temp_console.print(renderable)
         return temp_console.export_html(
             inline_styles=True,
-            code_format='<pre style="white-space:pre-wrap;font-family:monospace">{code}</pre>',
+            code_format=(
+                '<pre style="white-space:pre;overflow-x:auto;background:#05070a;'
+                'padding:14px 16px;border-radius:6px;'
+                "font-family:'SFMono-Regular','Menlo','Consolas',monospace;"
+                'font-size:12px;line-height:1.25">{code}</pre>'
+            ),
         )
 
     def _render_headless_inplace(self, renderable: Any) -> None:
@@ -657,7 +794,8 @@ class TrainingDashboard:
         temp_console = Console(
             file=buffer,
             force_terminal=True,
-            width=self.console.width or 100,
+            color_system="truecolor",
+            width=self.width,
         )
         temp_console.print(renderable)
 
@@ -690,7 +828,7 @@ class TrainingDashboard:
             self.stop()
 
     # ------------------------------------------------------------------
-    # Main layout -- six clear sections, aggregates over walls of numbers
+    # Main layout
     # ------------------------------------------------------------------
 
     def _build_renderable(
@@ -706,294 +844,377 @@ class TrainingDashboard:
             for record in history
             if record.get("record_type") == "tick"
         ]
+        rollout_history = [
+            record
+            for record in history
+            if record.get("record_type", "rollout") != "tick"
+        ]
 
         rows = self._compute_per_ticker_rows(tick_record)
 
+        book = self._build_book_panel(tick_record, tick_history, rows)
+        telemetry = self._build_telemetry_panel(rollout_record, rollout_history)
+        blotter = self._build_blotter_panel(tick_history)
+
+        if self.width < _TWO_COLUMN_MIN_WIDTH:
+            # Narrow terminals get one column -- side-by-side panels below
+            # this width truncate the blotter's own columns into ellipses.
+            body: Any = Group(book, telemetry, blotter)
+        else:
+            body = Table.grid(padding=(0, 1), expand=True)
+            body.add_column(ratio=57)
+            body.add_column(ratio=43)
+            body.add_row(book, Group(telemetry, blotter))
+
         return Group(
-            self._build_status_panel(tick_record, rollout_record, tick_history, now, is_new_step, rows),
-            self._build_alerts_panel(rows),
-            self._build_training_panel(rollout_record),
-            self._build_portfolio_panel(tick_record, rows),
-            self._build_market_panel(rows),
-            self._build_fills_panel(tick_history),
+            self._build_masthead(
+                tick_record, rollout_record, tick_history, now, is_new_step,
+            ),
+            self._build_tape(rows),
+            self._build_risk_band(rows),
+            body,
+            self._build_heat_panel(rows),
+            self._build_footer(tick_record, now),
         )
 
     # ------------------------------------------------------------------
-    # Section 1: run status -- is training alive, and at what pace
+    # Masthead -- identity, health, pace
     # ------------------------------------------------------------------
 
-    def _build_status_panel(
+    def _build_masthead(
         self,
         tick: Dict[str, Any],
         rollout: Dict[str, Any],
         tick_history: List[Dict[str, Any]],
         now: float,
         is_new_step: bool,
-        rows: List[Dict[str, Any]],
     ) -> Panel:
         latest_wall_time = _number(tick.get("wall_time")) or now
         age = max(0, now - latest_wall_time)
 
         if age < _HEALTH_LIVE_S:
-            health, health_style = "LIVE", "bold white on green"
+            health, health_style = "LIVE", f"bold #04120b on {_C_UP}"
         elif age < _HEALTH_STALE_S:
-            health, health_style = "STALE", "bold black on yellow"
+            health, health_style = "STALE", f"bold #1a1200 on {_C_AMBER}"
         else:
-            health, health_style = "STOPPED?", "bold white on red"
+            health, health_style = "NO DATA", f"bold #ffffff on {_C_DOWN}"
 
-        spinner = (
-            _SPINNER_FRAMES[self._frame_count % len(_SPINNER_FRAMES)]
+        pulse = (
+            _PULSE_FRAMES[self._frame_count % len(_PULSE_FRAMES)]
             if is_new_step
-            else "●"
+            else "○"
+        )
+        spinner = _SPINNER_FRAMES[self._frame_count % len(_SPINNER_FRAMES)]
+        pulse_color = _C_UP if age < _HEALTH_LIVE_S else _C_DOWN
+
+        clock = time.strftime("%H:%M:%S", time.gmtime(now))
+
+        header = Table.grid(expand=True, padding=(0, 1))
+        header.add_column(justify="left")
+        header.add_column(justify="center")
+        header.add_column(justify="right")
+        header.add_row(
+            Text.from_markup(
+                f"[bold {_C_AMBER}]█▛[/] [bold {_C_AMBER}]{_spaced('QUANTDESK')}[/]"
+                f"  [{_C_AMBER_DIM}]│[/]  [{_C_CYAN}]{self.desk_name}[/]"
+            ),
+            Text.from_markup(
+                f"[{health_style}] {health} [/]  "
+                f"[{pulse_color}]{pulse}[/] [{_C_MUTE}]{spinner} tick +{age:.0f}s[/]"
+            ),
+            Text.from_markup(
+                f"[{_C_MUTE}]SESSION[/] [bold {_C_TEXT}]{_fmt_uptime(now - self._start_time)}[/]"
+                f"  [{_C_AMBER_DIM}]│[/]  [{_C_MUTE}]UTC[/] [bold {_C_TEXT}]{clock}[/]"
+            ),
         )
 
         throughput = self._ticks_per_second(tick_history)
-        throughput_text = f"{throughput:.1f}/s" if throughput is not None else "—"
+        throughput_text = f"{throughput:,.1f}/s" if throughput is not None else "—"
 
         tickers = tick.get("tickers")
         ticker_count = len(tickers) if isinstance(tickers, list) else 0
 
-        halted_count = sum(1 for row in rows if row["is_halted"])
-        bankrupt_count = sum(1 for row in rows if row["is_bankrupt"])
-
-        grid = Table.grid(padding=(0, 2))
-        grid.add_column(justify="left")
-        grid.add_column(justify="right")
-        grid.add_column(justify="left")
-        grid.add_column(justify="right")
-
-        grid.add_row(
-            "[bold]Step[/bold]", _fmt_int(tick.get("step")),
-            "[bold]Rollout[/bold]", _fmt_int(rollout.get("rollout", rollout.get("step"))),
-        )
-        grid.add_row(
-            "[bold]Episode[/bold]", _fmt_int(rollout.get("episode")),
-            "[bold]Symbols[/bold]", str(ticker_count),
-        )
-        grid.add_row(
-            "[bold]Rate[/bold]", throughput_text,
-            "[bold]Data age[/bold]", f"{age:.0f}s",
-        )
-        grid.add_row(
-            "[bold]Runtime[/bold]", _fmt_uptime(now - self._start_time),
-            "[bold]Uptime[/bold]", _fmt_uptime(age),
-        )
-
-        alert_line = ""
-        if halted_count or bankrupt_count:
-            bits = []
-            if halted_count:
-                bits.append(f"[bold white on purple4] {halted_count} HALTED [/bold white on purple4]")
-            if bankrupt_count:
-                bits.append(f"[bold white on red] {bankrupt_count} BANKRUPT [/bold white on red]")
-            alert_line = "  " + "  ".join(bits)
-        else:
-            alert_line = "  [green]no risk alerts[/green]"
-
-        body = Group(
-            Text.from_markup(
-                f"[bold]TRAINING DASHBOARD[/bold]   "
-                f"[{health_style}] {health} [/{health_style}]  "
-                f"[cyan]{spinner}[/cyan]  "
-                f"[grey62]updated {age:.0f}s ago[/grey62]"
-            ),
-            grid,
-            Text.from_markup(alert_line),
+        stats = Table.grid(expand=True, padding=(0, 1))
+        for _ in range(5):
+            stats.add_column(justify="left", ratio=1)
+        stats.add_row(
+            self._stat("STEP", _fmt_int(tick.get("step")), _C_TEXT),
+            self._stat("ROLLOUT", _fmt_int(rollout.get("rollout", rollout.get("step"))), _C_TEXT),
+            self._stat("EPISODE", _fmt_int(rollout.get("episode")), _C_TEXT),
+            self._stat("BOOKS", str(ticker_count), _C_CYAN),
+            self._stat("THROUGHPUT", throughput_text, _C_CYAN),
         )
 
         return Panel(
-            body,
-            title="1. Run Status",
-            border_style="cyan",
-            expand=False,
+            Group(header, Text(""), stats),
+            box=_BOX,
+            border_style=_C_AMBER_DIM,
+            style=f"on {_C_BAR}",
+            padding=(0, 1),
+        )
+
+    @staticmethod
+    def _stat(label: str, value: str, color: str) -> Text:
+        """Label above value, value larger in weight -- the desk's unit cell."""
+        return Text.from_markup(f"[{_C_MUTE}]{label}[/]\n[bold {color}]{value}[/]")
+
+    # ------------------------------------------------------------------
+    # Tape -- the thing that makes it feel alive
+    # ------------------------------------------------------------------
+
+    def _build_tape(self, rows: List[Dict[str, Any]]) -> Panel:
+        width = max(20, self.width - 4)
+
+        if not rows:
+            return Panel(
+                Text("awaiting market data", style=_C_MUTE),
+                box=_BOX,
+                border_style=_C_AMBER_DIM,
+                style=f"on {_C_BAR}",
+                padding=(0, 1),
+            )
+
+        chars: List[str] = []
+        styles: List[str] = []
+
+        def push(fragment: str, style: str) -> None:
+            chars.extend(fragment)
+            styles.extend([style] * len(fragment))
+
+        for row in rows:
+            change = row["change_pct"]
+            if change is None:
+                arrow, color = "·", _C_MUTE
+            elif change > 0:
+                arrow, color = "▲", _C_UP
+            elif change < 0:
+                arrow, color = "▼", _C_DOWN
+            else:
+                arrow, color = "·", _C_MUTE
+
+            price = f"{row['price']:,.2f}" if row["price"] is not None else "—"
+            move = f"{change:+.2%}" if change is not None else "—"
+
+            push(f"{row['ticker']} ", f"bold {_C_TEXT}")
+            push(f"{price} ", _C_TEXT)
+            push(f"{arrow}{move}", color)
+            push("   ◆   ", _C_AMBER_DIM)
+
+        if not chars:
+            return Panel(
+                Text("awaiting market data", style=_C_MUTE),
+                box=_BOX,
+                border_style=_C_AMBER_DIM,
+                style=f"on {_C_BAR}",
+                padding=(0, 1),
+            )
+
+        offset = (self._frame_count * _TAPE_SCROLL_CHARS) % len(chars)
+        repeats = (width // len(chars)) + 2
+        chars = chars * repeats
+        styles = styles * repeats
+
+        tape = _runs_to_text(
+            "".join(chars[offset:offset + width]),
+            styles[offset:offset + width],
+        )
+
+        return Panel(
+            tape,
+            box=_BOX,
+            border_style=_C_AMBER_DIM,
+            style=f"on {_C_BAR}",
+            padding=(0, 1),
         )
 
     # ------------------------------------------------------------------
-    # Section 2: alerts -- risk conditions, named, or a clean bill of health
+    # Risk band -- quiet when clean, unmissable when not
     # ------------------------------------------------------------------
 
-    def _build_alerts_panel(self, rows: List[Dict[str, Any]]) -> Panel:
+    def _build_risk_band(self, rows: List[Dict[str, Any]]) -> Panel:
         halted = [row["ticker"] for row in rows if row["is_halted"]]
         bankrupt = [row["ticker"] for row in rows if row["is_bankrupt"]]
         deep_dd = [
-            row["ticker"] for row in rows
+            row for row in rows
             if not row["is_bankrupt"] and row["drawdown"] is not None
             and row["drawdown"] > _DD_ALERT_FRAC
         ]
 
+        title = f"[bold {_C_AMBER}]▌ {_spaced('RISK')}[/]"
+
         if not halted and not bankrupt and not deep_dd:
             return Panel(
-                "[green]✓ No alerts — all streams healthy.[/green]",
-                title="2. Alerts",
-                border_style="green",
-                expand=False,
+                Text.from_markup(
+                    f"[{_C_UP}]✓ ALL CLEAR[/]  [{_C_MUTE}]no halts, no blown books, "
+                    f"nothing beyond {_DD_ALERT_FRAC:.0%} drawdown[/]"
+                ),
+                title=title,
+                title_align="left",
+                box=_BOX,
+                border_style="#1f4d36",
+                style=f"on {_C_PANEL}",
+                padding=(0, 1),
             )
 
         lines: List[str] = []
-        if halted:
-            lines.append(f"[bold white on purple4] HALTED [/bold white on purple4]  {', '.join(map(str, halted))}")
         if bankrupt:
-            lines.append(f"[bold white on red] BANKRUPT [/bold white on red]  {', '.join(map(str, bankrupt))}")
+            lines.append(
+                f"[bold #ffffff on {_C_DOWN}] BLOWN [/]  "
+                f"[bold {_C_DOWN}]{', '.join(map(str, bankrupt))}[/]"
+            )
+        if halted:
+            lines.append(
+                f"[bold #1a1200 on {_C_AMBER}] HALTED [/]  "
+                f"[bold {_C_AMBER}]{', '.join(map(str, halted))}[/]"
+            )
         if deep_dd:
-            dd_rows = [
-                f"{row['ticker']} [red]{_number(row['drawdown']):.1%}[/red]"
-                for row in rows
-                if row["ticker"] in deep_dd
-            ]
-            lines.append(f"[bold yellow]DEEP DRAWDOWN >{_DD_ALERT_FRAC:.0%}[/bold yellow]  {'  '.join(dd_rows)}")
+            rendered = "  ".join(
+                f"[bold {_C_TEXT}]{row['ticker']}[/] [{_C_DOWN}]{row['drawdown']:.1%}[/]"
+                for row in sorted(deep_dd, key=lambda r: -r["drawdown"])[:12]
+            )
+            lines.append(
+                f"[bold #ffffff on {_C_DOWN}] DRAWDOWN >{_DD_ALERT_FRAC:.0%} [/]  {rendered}"
+            )
 
         return Panel(
-            "\n".join(lines),
-            title="2. Alerts",
-            border_style="red",
-            expand=False,
+            Text.from_markup("\n".join(lines)),
+            title=title,
+            title_align="left",
+            box=_BOX,
+            border_style=_C_DOWN,
+            style=f"on {_C_PANEL}",
+            padding=(0, 1),
         )
 
     # ------------------------------------------------------------------
-    # Section 3: training -- model numbers, correctly typed
+    # The book -- headline equity, trend, leaderboard
     # ------------------------------------------------------------------
 
-    def _build_training_panel(self, rollout: Dict[str, Any]) -> Panel:
-        n_tickers = len(rollout.get("tickers") or [])
-        kelly_zero = rollout.get("kelly_zero_count")
-        kelly_warm = rollout.get("kelly_warm_count")
-        # Red once any stream is locked (fractional_kelly == 0.0 for a warm
-        # stream) -- see risk/kelly_sizing.py's diagnostics() docstring: that
-        # 0.0 is permanent for the rest of the run once it happens, so this
-        # count should only ever climb, never fall, within one run.
-        kelly_zero_text = (
-            "—" if kelly_zero is None
-            else f"[bold red]{kelly_zero}/{n_tickers}[/bold red]" if kelly_zero > 0
-            else f"{kelly_zero}/{n_tickers}"
-        )
-        kelly_warm_text = "—" if kelly_warm is None else f"{kelly_warm}/{n_tickers}"
-
-        fields = [
-            ("Reward", _fmt_signed(rollout.get("reward")), None),
-            ("Reward EMA", _fmt_signed(rollout.get("reward_ema")), None),
-            ("Entropy (direction)", _fmt(rollout.get("entropy_discrete")), None),
-            ("Entropy (size/offset)", _fmt(rollout.get("entropy_continuous")), None),
-            ("Policy loss", _fmt(rollout.get("policy_loss")), None),
-            ("Value loss", _fmt(rollout.get("value_loss")), None),
-            ("Clip fraction", _fmt(rollout.get("clip_frac")), None),
-            ("Approx KL", _fmt(rollout.get("approx_kl")), None),
-            ("Grad norm", _fmt(rollout.get("grad_norm")), None),
-            ("Kelly locked (zero)", kelly_zero_text, None),
-            ("Kelly warm", kelly_warm_text, None),
-        ]
-
-        grid = Table.grid(padding=(0, 2))
-        grid.add_column(justify="left")
-        grid.add_column(justify="right")
-        grid.add_column(justify="left")
-        grid.add_column(justify="right")
-
-        row_pairs = [fields[i:i + 2] for i in range(0, len(fields), 2)]
-        for pair in row_pairs:
-            cells: List[str] = []
-            for label, value, _color in pair:
-                cells += [f"[bold]{label}[/bold]", value]
-            grid.add_row(*cells)
-
-        body = Group(
-            grid,
-            Text.from_markup("[grey62]reward is a differential-Sharpe signal (dimensionless), "
-                             "not dollar PnL[/grey62]"),
-        )
-
-        return Panel(
-            body,
-            title="3. Training",
-            border_style="blue",
-            expand=False,
-        )
-
-    # ------------------------------------------------------------------
-    # Section 4: portfolio -- aggregate + context + top/bottom spotlight
-    # ------------------------------------------------------------------
-
-    def _build_portfolio_panel(
+    def _build_book_panel(
         self,
         tick: Dict[str, Any],
+        tick_history: List[Dict[str, Any]],
         rows: List[Dict[str, Any]],
     ) -> Panel:
-        net_worth = tick.get("net_worth")
+        net_worth = _number(tick.get("net_worth"))
         n_streams = len(rows)
 
-        net_worth_change_style = None
-        current_net_worth = _number(net_worth)
+        delta = None
+        if net_worth is not None and self._previous_net_worth is not None:
+            delta = net_worth - self._previous_net_worth
 
-        if current_net_worth is not None and self._previous_net_worth is not None:
-            if current_net_worth > self._previous_net_worth:
-                net_worth_change_style = "bright_green"
-            elif current_net_worth < self._previous_net_worth:
-                net_worth_change_style = "bright_red"
+        equity_series = [record.get("net_worth") for record in tick_history]
+        opening = next(
+            (value for value in (_number(v) for v in equity_series) if value is not None),
+            None,
+        )
+        session_change = (
+            (net_worth - opening) / opening
+            if net_worth is not None and opening not in (None, 0)
+            else None
+        )
 
-        if current_net_worth is not None:
-            self._previous_net_worth = current_net_worth
+        if delta is None or delta == 0:
+            headline_color, tick_mark = _C_AMBER, "·"
+        elif delta > 0:
+            headline_color, tick_mark = _C_UP, "▲"
+        else:
+            headline_color, tick_mark = _C_DOWN, "▼"
 
-        drawdown = tick.get("drawdown")
-        trades_rollout = tick.get("trades_this_rollout")
-        trades_total = tick.get("total_trades")
+        if net_worth is not None:
+            self._previous_net_worth = net_worth
 
+        spark = _sparkline(equity_series, max(18, int(self.width * 0.57) - 32))
+        spark_color = (
+            _C_MUTE if session_change is None
+            else _C_UP if session_change >= 0
+            else _C_DOWN
+        )
+
+        delta_text = _fmt_money(delta, signed=True) if delta is not None else "—"
+        session_text = f"{session_change:+.2%}" if session_change is not None else "—"
+
+        headline = Table.grid(padding=(0, 3))
+        headline.add_column(justify="left")
+        headline.add_column(justify="left")
+        headline.add_row(
+            Text.from_markup(
+                f"[{_C_MUTE}]NET LIQUIDATING VALUE[/]\n"
+                f"[bold {headline_color}]{_fmt_money(net_worth)}[/] "
+                f"[{headline_color}]{tick_mark}[/]"
+            ),
+            Text.from_markup(
+                f"[{_C_MUTE}]LAST TICK[/]      [{_C_MUTE}]SESSION[/]\n"
+                f"[bold {headline_color}]{delta_text:>13}[/]  "
+                f"[bold {spark_color}]{session_text:>8}[/]"
+            ),
+        )
+
+        drawdown = _number(tick.get("drawdown"))
         open_positions = sum(
             _number(row["position"]) not in (None, 0)
             for row in rows
         )
-        halted = sum(1 for row in rows if row["is_halted"])
-        bankrupt = sum(1 for row in rows if row["is_bankrupt"])
-
-        net_worth_text = _colored_money(
-            net_worth,
-            explicit_color=net_worth_change_style,
-        )
-
         avg_per_stream = (
-            current_net_worth / n_streams
-            if current_net_worth is not None and n_streams
+            net_worth / n_streams
+            if net_worth is not None and n_streams
             else None
         )
 
-        grid = Table.grid(padding=(0, 2))
-        grid.add_column(justify="left")
-        grid.add_column(justify="right")
-        grid.add_column(justify="left")
-        grid.add_column(justify="right")
-        grid.add_row(
-            "[bold]Net worth (Σ streams)[/bold]", net_worth_text,
-            "[bold]Avg per stream[/bold]", _fmt_money(avg_per_stream),
+        stats = Table.grid(expand=True, padding=(0, 1))
+        for _ in range(4):
+            stats.add_column(justify="left", ratio=1)
+        stats.add_row(
+            self._stat("AVG / BOOK", _fmt_money_compact(avg_per_stream), _C_TEXT),
+            self._stat(
+                "AVG DRAWDOWN",
+                f"{drawdown:.2%}" if drawdown is not None else "—",
+                _C_DOWN if (drawdown or 0) > 0.10 else _C_TEXT,
+            ),
+            self._stat("OPEN POS", f"{open_positions}/{n_streams}", _C_CYAN),
+            self._stat("FILLS · TOTAL", _fmt_int(tick.get("total_trades")), _C_TEXT),
         )
-        grid.add_row(
-            "[bold]Avg drawdown[/bold]", _colored_pct(drawdown, lower_is_better=True),
-            "[bold]Trades this rollout[/bold]", _fmt_int(trades_rollout),
-        )
-        grid.add_row(
-            "[bold]Total trades[/bold]", _fmt_int(trades_total),
-            "[bold]Open positions[/bold]", str(open_positions),
-        )
-        grid.add_row(
-            "[bold]Halted[/bold]", str(halted),
-            "[bold]Bankrupt[/bold]", str(bankrupt),
+        stats.add_row(Text(""), Text(""), Text(""), Text(""))
+        stats.add_row(
+            self._stat("FILLS · ROLLOUT", _fmt_int(tick.get("trades_this_rollout")), _C_TEXT),
+            self._stat("HALTED", str(sum(1 for row in rows if row["is_halted"])), _C_AMBER),
+            self._stat("BLOWN", str(sum(1 for row in rows if row["is_bankrupt"])), _C_DOWN),
+            self._stat("BOOKS", str(n_streams), _C_TEXT),
         )
 
-        components: List[Any] = [
-            grid,
-            Text.from_markup("[grey62]Aggregate = sum across all streams; each stream is an "
-                             "independent simulated book. Watch direction, not the absolute number.[/grey62]"),
-        ]
-        spotlight = self._build_spotlight_table(rows)
-        if spotlight is not None:
-            components.append(spotlight)
+        components: List[Any] = [headline]
+
+        if spark:
+            components.append(
+                Text.from_markup(f"[{_C_MUTE}]EQUITY [/][{spark_color}]{spark}[/]")
+            )
+
+        components.append(Text(""))
+        components.append(stats)
+
+        leaderboard = self._build_spotlight_table(rows)
+        if leaderboard is not None:
+            components.append(Text(""))
+            components.append(leaderboard)
 
         return Panel(
             Group(*components),
-            title="4. Portfolio",
-            border_style="green",
-            expand=False,
+            title=f"[bold {_C_AMBER}]▌ {_spaced('THE BOOK')}[/]",
+            title_align="left",
+            subtitle=(
+                f"[{_C_MUTE}]Σ over {n_streams} independent simulated books[/]"
+                if self.width >= 100
+                else f"[{_C_MUTE}]Σ over {n_streams} books[/]"
+            ),
+            subtitle_align="right",
+            box=_BOX,
+            border_style=_C_AMBER_DIM,
+            style=f"on {_C_PANEL}",
+            padding=(0, 1),
         )
 
     def _build_spotlight_table(self, rows: List[Dict[str, Any]]) -> Optional[Table]:
-        """Top and bottom `_SPOTLIGHT_ROWS/2` streams by unrealized PnL."""
+        """Top and bottom `_SPOTLIGHT_ROWS/2` books by unrealized PnL."""
         ranked = sorted(
             (row for row in rows if row["unrealized_value"] is not None),
             key=lambda row: row["unrealized_value"],
@@ -1004,57 +1225,194 @@ class TrainingDashboard:
 
         half = _SPOTLIGHT_ROWS // 2
         if len(ranked) <= _SPOTLIGHT_ROWS:
-            spotlight_rows = ranked
+            spotlight_rows: List[Optional[Dict[str, Any]]] = list(ranked)
         else:
-            spotlight_rows = ranked[:half] + ranked[-half:]
+            spotlight_rows = ranked[:half] + [None] + ranked[-half:]
 
-        table = Table(title="Spotlight (unrealized PnL)", expand=False)
-        table.add_column("Symbol")
-        table.add_column("Price", justify="right")
-        table.add_column("Pos", justify="right")
-        table.add_column("Unrealized", justify="right")
-        table.add_column("Drawdown", justify="right")
-        table.add_column("Status")
+        table = Table(
+            box=box.SIMPLE_HEAD,
+            expand=True,
+            pad_edge=False,
+            padding=(0, 1),
+            header_style=_C_MUTE,
+            border_style="#232a34",
+        )
+        table.add_column("SYMBOL", style=f"bold {_C_TEXT}")
+        table.add_column("LAST", justify="right")
+        table.add_column("POS", justify="right")
+        table.add_column("UNREALIZED", justify="right")
+        table.add_column("DD", justify="right")
+        table.add_column("", justify="center", width=1)
 
         for row in spotlight_rows:
-            status = (
-                "[white on red]BANKRUPT[/white on red]"
-                if row["is_bankrupt"]
-                else "[white on purple4]HALTED[/white on purple4]"
-                if row["is_halted"]
-                else "[green]OK[/green]"
+            if row is None:
+                omitted = len(ranked) - _SPOTLIGHT_ROWS
+                table.add_row(
+                    Text.from_markup(f"[{_C_MUTE}]⋯[/]"),
+                    "",
+                    "",
+                    Text.from_markup(f"[{_C_MUTE}]{omitted} books between[/]"),
+                    "",
+                    "",
+                )
+                continue
+
+            flag = (
+                f"[{_C_DOWN}]✖[/]" if row["is_bankrupt"]
+                else f"[{_C_AMBER}]‖[/]" if row["is_halted"]
+                else f"[{_C_UP}]✓[/]"
             )
             table.add_row(
                 str(row["ticker"]),
                 f"{row['price']:,.2f}" if row["price"] is not None else "—",
-                _fmt(row["position"]),
+                _fmt_shares(row["position"]),
                 _colored_money(row["unrealized_value"], signed=True),
                 (
                     _colored_pct(row["drawdown"], lower_is_better=True)
                     if row["drawdown"] is not None
                     else "—"
                 ),
-                status,
+                Text.from_markup(flag),
             )
 
-        if len(ranked) > _SPOTLIGHT_ROWS:
-            table.caption = (
-                f"{len(ranked) - _SPOTLIGHT_ROWS} middle streams omitted "
-                "(see the market grid for all of them)"
-            )
         return table
 
     # ------------------------------------------------------------------
-    # Section 5: market -- compact grid, movers, up/down counts
+    # Telemetry -- the model's vitals
     # ------------------------------------------------------------------
 
-    def _build_market_panel(self, rows: List[Dict[str, Any]]) -> Panel:
+    def _build_telemetry_panel(
+        self,
+        rollout: Dict[str, Any],
+        rollout_history: List[Dict[str, Any]],
+    ) -> Panel:
+        n_tickers = len(rollout.get("tickers") or [])
+        kelly_zero = rollout.get("kelly_zero_count")
+        kelly_warm = rollout.get("kelly_warm_count")
+        # Red once any stream is locked (fractional_kelly == 0.0 for a warm
+        # stream) -- see risk/kelly_sizing.py's diagnostics() docstring: that
+        # 0.0 is permanent for the rest of the run once it happens, so this
+        # count should only ever climb, never fall, within one run.
+        kelly_zero_text = (
+            "—" if kelly_zero is None
+            else f"[bold {_C_DOWN}]{kelly_zero}/{n_tickers}[/]" if kelly_zero > 0
+            else f"[bold {_C_TEXT}]{kelly_zero}/{n_tickers}[/]"
+        )
+        kelly_warm_text = (
+            "—" if kelly_warm is None
+            else f"[bold {_C_TEXT}]{kelly_warm}/{n_tickers}[/]"
+        )
+
+        reward = _number(rollout.get("reward"))
+        reward_ema = _number(rollout.get("reward_ema"))
+        reward_color = _C_MUTE if reward is None else _C_UP if reward >= 0 else _C_DOWN
+        ema_color = _C_MUTE if reward_ema is None else _C_UP if reward_ema >= 0 else _C_DOWN
+
+        reward_spark = _sparkline(
+            [record.get("reward") for record in rollout_history],
+            max(14, int(self.width * 0.43) - 26),
+        )
+
+        components: List[Any] = [
+            Text.from_markup(
+                f"[{_C_MUTE}]REWARD  differential Sharpe[/]\n"
+                f"[bold {reward_color}]{_fmt_signed(reward, 5)}[/]   "
+                f"[{_C_MUTE}]EMA[/] [bold {ema_color}]{_fmt_signed(reward_ema, 5)}[/]"
+            )
+        ]
+
+        if reward_spark:
+            components.append(
+                Text.from_markup(f"[{_C_MUTE}]TREND  [/][{ema_color}]{reward_spark}[/]")
+            )
+        components.append(Text(""))
+
+        # Bounded-ish quantities get a gauge against a nominal ceiling; the
+        # ceiling is a display scale only, never a threshold the model sees.
+        gauges = [
+            ("ENTROPY · dir", rollout.get("entropy_discrete"), 1.6),
+            ("ENTROPY · size", rollout.get("entropy_continuous"), 3.0),
+            ("CLIP FRACTION", rollout.get("clip_frac"), 0.40),
+            ("APPROX KL", rollout.get("approx_kl"), 0.05),
+        ]
+
+        gauge_grid = Table.grid(expand=True, padding=(0, 1))
+        gauge_grid.add_column(justify="left", width=16)
+        gauge_grid.add_column(justify="left", width=12)
+        gauge_grid.add_column(justify="right", width=10)
+        gauge_grid.add_column(ratio=1)   # spacer: absorbs the panel's slack
+
+        for label, raw, ceiling in gauges:
+            value = _number(raw)
+            fraction = None if value is None else max(0.0, min(1.0, value / ceiling))
+            if value is None:
+                color = _C_MUTE
+            elif fraction is not None and fraction > 0.85:
+                color = _C_DOWN
+            else:
+                color = _C_CYAN
+            gauge_grid.add_row(
+                Text.from_markup(f"[{_C_MUTE}]{label}[/]"),
+                Text.from_markup(f"[{color}]{_gauge(fraction, 12)}[/]"),
+                Text.from_markup(f"[bold {_C_TEXT}]{_fmt(raw)}[/]"),
+                "",
+            )
+
+        components.append(gauge_grid)
+        components.append(Text(""))
+
+        numeric = Table.grid(expand=True, padding=(0, 1))
+        numeric.add_column(justify="left", width=20)
+        numeric.add_column(justify="left", width=21)
+        numeric.add_column(ratio=1)      # spacer: keeps the pairs left-packed
+        numeric.add_row(
+            self._stat("POLICY LOSS", _fmt(rollout.get("policy_loss")), _C_TEXT),
+            self._stat("VALUE LOSS", _fmt(rollout.get("value_loss")), _C_TEXT),
+            "",
+        )
+        numeric.add_row(Text(""), Text(""), "")
+        numeric.add_row(
+            self._stat("GRAD NORM", _fmt(rollout.get("grad_norm")), _C_TEXT),
+            Text.from_markup(
+                f"[{_C_MUTE}]KELLY  locked · warm[/]\n"
+                f"{kelly_zero_text}  [{_C_MUTE}]·[/]  {kelly_warm_text}"
+            ),
+            "",
+        )
+        components.append(numeric)
+
+        return Panel(
+            Group(*components),
+            title=f"[bold {_C_AMBER}]▌ {_spaced('TELEMETRY')}[/]",
+            title_align="left",
+            subtitle=(
+                f"[{_C_MUTE}]reward is dimensionless, not dollar PnL[/]"
+                if self.width >= 100
+                else f"[{_C_MUTE}]dimensionless[/]"
+            ),
+            subtitle_align="right",
+            box=_BOX,
+            border_style=_C_AMBER_DIM,
+            style=f"on {_C_PANEL}",
+            padding=(0, 1),
+        )
+
+    # ------------------------------------------------------------------
+    # The floor -- every symbol at a glance
+    # ------------------------------------------------------------------
+
+    def _build_heat_panel(self, rows: List[Dict[str, Any]]) -> Panel:
+        title = f"[bold {_C_AMBER}]▌ {_spaced('THE FLOOR')}[/]"
+
         if not rows:
             return Panel(
-                "[grey62]No ticker price data is available in this record.[/grey62]",
-                title="5. Market",
-                border_style="grey42",
-                expand=False,
+                Text("no ticker price data in this record", style=_C_MUTE),
+                title=title,
+                title_align="left",
+                box=_BOX,
+                border_style=_C_AMBER_DIM,
+                style=f"on {_C_PANEL}",
+                padding=(0, 1),
             )
 
         grid = self._build_compact_grid(rows)
@@ -1071,48 +1429,74 @@ class TrainingDashboard:
         flat = sum(1 for row in rows if row["change_pct"] is not None and row["change_pct"] == 0)
         unknown = len(rows) - up - down - flat
 
-        summary = f"[bold green]{up} ▲[/bold green]  [bold red]{down} ▼[/bold red]  [grey62]{flat} •[/grey62]"
-        if unknown:
-            summary += f"  [grey42]{unknown} ?[/grey42]"
+        breadth_width = 24
+        up_cells = int(round(up / max(1, up + down) * breadth_width)) if (up + down) else 0
+        breadth = (
+            f"[{_C_UP}]{'█' * up_cells}[/]"
+            f"[{_C_DOWN}]{'█' * (breadth_width - up_cells)}[/]"
+            if (up + down) else f"[{_C_MUTE}]{'░' * breadth_width}[/]"
+        )
+
+        summary = Text.from_markup(
+            f"[bold {_C_UP}]{up:>3} ▲[/]   [bold {_C_DOWN}]{down:>3} ▼[/]   "
+            f"[{_C_MUTE}]{flat:>3} ·[/]"
+            + (f"   [{_C_MUTE}]{unknown:>3} ?[/]" if unknown else "")
+            + f"    {breadth}  [{_C_MUTE}]breadth[/]"
+        )
 
         movers_text = Text()
         if movers:
-            movers_text.append("Movers  ")
-            for i, row in enumerate(movers):
-                color = "bright_green" if row["change_pct"] > 0 else "bright_red"
+            movers_text.append("MOVERS   ", style=_C_MUTE)
+            for index, row in enumerate(movers):
+                color = _C_UP if row["change_pct"] > 0 else _C_DOWN
                 arrow = "▲" if row["change_pct"] > 0 else "▼"
-                movers_text.append(f"{arrow} {row['ticker']} ", style=color)
+                movers_text.append(f"{arrow} {row['ticker']} ", style=f"bold {color}")
                 movers_text.append(f"{row['change_pct']:+.2%}", style=color)
-                if i < len(movers) - 1:
-                    movers_text.append("   ")
+                if index < len(movers) - 1:
+                    movers_text.append("   ◆   ", style=_C_AMBER_DIM)
         else:
-            movers_text.append("no meaningful price moves this tick", style="grey62")
-
-        body = Group(
-            Text.from_markup(summary),
-            grid,
-            movers_text,
-        )
+            movers_text.append("flat tape — no meaningful moves this tick", style=_C_MUTE)
 
         return Panel(
-            body,
-            title=f"5. Market — {len(rows)} symbols",
-            border_style="magenta",
-            expand=False,
+            Group(summary, Text(""), grid, Text(""), movers_text),
+            title=title,
+            title_align="left",
+            subtitle=f"[{_C_MUTE}]{len(rows)} symbols[/]",
+            subtitle_align="right",
+            box=_BOX,
+            border_style=_C_AMBER_DIM,
+            style=f"on {_C_PANEL}",
+            padding=(0, 1),
         )
 
     # ------------------------------------------------------------------
-    # Section 6: fills/trades
+    # Blotter -- what actually got executed
     # ------------------------------------------------------------------
 
-    def _build_fills_panel(
+    def _build_blotter_panel(
         self,
         tick_history: List[Dict[str, Any]],
     ) -> Panel:
-        events: List[str] = []
+        table = Table(
+            box=box.SIMPLE_HEAD,
+            expand=False,
+            pad_edge=False,
+            padding=(0, 1),
+            header_style=_C_MUTE,
+            border_style="#232a34",
+        )
+        table.add_column("STEP", justify="right", style=_C_MUTE)
+        table.add_column("", justify="left", width=1)
+        table.add_column("SIDE", width=4)
+        table.add_column("SYMBOL", style=f"bold {_C_TEXT}")
+        table.add_column("QTY", justify="right")
+        table.add_column("PRICE", justify="right")
+        table.add_column("NOTIONAL", justify="right")
+
+        count = 0
 
         for record in reversed(tick_history):
-            if len(events) >= _MAX_TRADE_EVENTS:
+            if count >= _MAX_TRADE_EVENTS:
                 break
 
             tickers = record.get("tickers")
@@ -1125,57 +1509,72 @@ class TrainingDashboard:
             step = record.get("step")
 
             for index, quantity in enumerate(filled):
-                if len(events) >= _MAX_TRADE_EVENTS:
+                if count >= _MAX_TRADE_EVENTS:
                     break
 
                 quantity_number = _number(quantity)
                 if quantity_number is None or quantity_number == 0:
                     continue
 
-                ticker = (
-                    tickers[index]
-                    if index < len(tickers)
-                    else "?"
-                )
-
+                ticker = tickers[index] if index < len(tickers) else "?"
                 price = (
-                    prices[index]
+                    _number(prices[index])
                     if isinstance(prices, list) and index < len(prices)
                     else None
                 )
 
-                if quantity_number > 0:
-                    side = "BUY "
-                    color = "bright_green"
-                else:
-                    side = "SELL"
-                    color = "bright_red"
-
-                price_text = (
-                    f" @ ${_number(price):,.2f}"
-                    if _number(price) is not None
-                    else ""
+                side, color, arrow = (
+                    ("BUY", _C_UP, "▲") if quantity_number > 0
+                    else ("SELL", _C_DOWN, "▼")
                 )
+                notional = abs(quantity_number) * price if price is not None else None
 
-                events.append(
-                    f"[grey62]t{_fmt_int(step):>7}[/grey62]  "
-                    f"[bold {color}]{side}[/bold {color}]  "
-                    f"[bold]{str(ticker):<8}[/bold]  "
-                    f"{abs(quantity_number):>8.2f} sh"
-                    f"{price_text}"
+                table.add_row(
+                    _fmt_int(step),
+                    Text.from_markup(f"[{color}]{arrow}[/]"),
+                    Text.from_markup(f"[bold {color}]{side}[/]"),
+                    str(ticker),
+                    f"{abs(quantity_number):,.2f}",
+                    f"${price:,.2f}" if price is not None else "—",
+                    _fmt_money_compact(notional),
                 )
+                count += 1
 
-        if not events:
-            body = "[grey62]No fills recorded in the visible history.[/grey62]"
-        else:
-            body = "\n".join(events)
+        body: Any = table
+        if count == 0:
+            body = Text("no fills in the visible history", style=_C_MUTE)
 
         return Panel(
             body,
-            title="6. Recent Fills",
-            border_style="yellow",
-            expand=False,
+            title=f"[bold {_C_AMBER}]▌ {_spaced('BLOTTER')}[/]",
+            title_align="left",
+            subtitle=f"[{_C_MUTE}]most recent first[/]",
+            subtitle_align="right",
+            box=_BOX,
+            border_style=_C_AMBER_DIM,
+            style=f"on {_C_PANEL}",
+            padding=(0, 1),
         )
+
+    # ------------------------------------------------------------------
+    # Footer
+    # ------------------------------------------------------------------
+
+    def _build_footer(self, tick: Dict[str, Any], now: float) -> Text:
+        age = max(0, now - (_number(tick.get("wall_time")) or now))
+        separator = f"   [{_C_AMBER_DIM}]│[/]   "
+
+        parts = [
+            f"[{_C_MUTE}]SIMULATED BOOKS · NO CAPITAL AT RISK[/]",
+            f"[{_C_UP}]✓ live[/]  [{_C_AMBER}]‖ halted[/]  [{_C_DOWN}]✖ blown[/]",
+        ]
+        if self.width >= 130:
+            parts.append(
+                f"[{_C_MUTE}]frame {self._frame_count} · data +{age:.0f}s · "
+                f"window {self.history_window}[/]"
+            )
+
+        return Text.from_markup(separator.join(parts))
 
     # ------------------------------------------------------------------
     # Row model
@@ -1192,26 +1591,11 @@ class TrainingDashboard:
 
         count = len(tickers)
 
-        net_worth = _as_list(
-            tick_record.get("net_worth_per_ticker"),
-            count,
-        )
-        prices = _as_list(
-            tick_record.get("price_per_ticker"),
-            count,
-        )
-        unrealized = _as_list(
-            tick_record.get("unrealized_pnl"),
-            count,
-        )
-        drawdown = _as_list(
-            tick_record.get("drawdown_per_ticker"),
-            count,
-        )
-        halted = _as_list(
-            tick_record.get("halted"),
-            count,
-        )
+        net_worth = _as_list(tick_record.get("net_worth_per_ticker"), count)
+        prices = _as_list(tick_record.get("price_per_ticker"), count)
+        unrealized = _as_list(tick_record.get("unrealized_pnl"), count)
+        drawdown = _as_list(tick_record.get("drawdown_per_ticker"), count)
+        halted = _as_list(tick_record.get("halted"), count)
 
         rows: List[Dict[str, Any]] = []
 
@@ -1246,53 +1630,50 @@ class TrainingDashboard:
         return rows
 
     def _build_compact_grid(self, rows: List[Dict[str, Any]]) -> Table:
-        column_width = 28
-        columns = max(
-            2,
-            min(6, (self.console.width or 100) // column_width),
-        )
+        column_width = 26
+        columns = max(2, min(6, (self.width - 4) // column_width))
 
-        grid = Table.grid(padding=(0, 1))
-
+        grid = Table.grid(padding=(0, 1), expand=True)
         for _ in range(columns):
-            grid.add_column()
+            grid.add_column(ratio=1)
 
-        cells: List[str] = []
+        cells: List[Text] = []
 
         for row in rows:
-            if row["is_bankrupt"]:
-                marker = "[red]●[/red]"
-            elif row["is_halted"]:
-                marker = "[purple4]●[/purple4]"
-            else:
-                marker = "[grey42]●[/grey42]"
-
-            price = (
-                f"{row['price']:,.2f}"
-                if row["price"] is not None
-                else "—"
-            )
-
             change = row["change_pct"]
             if change is None:
-                arrow, color = "", "grey62"
+                arrow, color = " ", _C_MUTE
             elif change > 0:
-                arrow, color = "▲", "bright_green"
+                arrow, color = "▲", _C_UP
             elif change < 0:
-                arrow, color = "▼", "bright_red"
+                arrow, color = "▼", _C_DOWN
             else:
-                arrow, color = "•", "grey62"
+                arrow, color = "·", _C_MUTE
 
-            pos = row["position"]
-            try:
-                pos_f = float(pos)
-                pos_text = f"p:{pos_f:+.2f}"
-            except (TypeError, ValueError):
-                pos_text = "p:—"
+            if row["is_bankrupt"]:
+                marker, marker_color = "✖", _C_DOWN
+            elif row["is_halted"]:
+                marker, marker_color = "‖", _C_AMBER
+            else:
+                marker, marker_color = "▏", color
+
+            price = f"{row['price']:,.2f}" if row["price"] is not None else "—"
+
+            position = _number(row["position"])
+            if position is None or position == 0:
+                position_text, position_color = "·", _C_MUTE
+            else:
+                position_text = f"{position:+.2f}"
+                position_color = _C_UP if position > 0 else _C_DOWN
 
             cells.append(
-                f"{marker} [bold]{str(row['ticker']):<6}[/bold] "
-                f"{price}[{color}]{arrow}[/{color}] {pos_text}"
+                Text.from_markup(
+                    f"[{marker_color}]{marker}[/]"
+                    f"[bold {_C_TEXT}]{str(row['ticker'])[:6]:<6}[/] "
+                    f"[{_C_TEXT}]{price:>8}[/]"
+                    f"[{color}]{arrow}[/]"
+                    f"[{position_color}]{position_text:>7}[/]"
+                )
             )
 
             if len(cells) == columns:
@@ -1300,7 +1681,7 @@ class TrainingDashboard:
                 cells = []
 
         if cells:
-            cells.extend([""] * (columns - len(cells)))
+            cells.extend([Text("")] * (columns - len(cells)))
             grid.add_row(*cells)
 
         return grid

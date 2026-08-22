@@ -78,7 +78,46 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     test_dataset = MultiTickerRolloutDataset(
         window_size=cfg.env.window_size, split="test", device=str(device)
     )
-    env = VecTradingEnv(dataset=test_dataset, initial_cash=cfg.env.initial_cash, device=str(device))
+    # Every friction/behaviour param cfg.env carries, matching train.py's
+    # VecTradingEnv construction term for term -- this was previously just
+    # initial_cash + device, so the backtest silently ran on VecTradingEnv's
+    # raw class defaults for everything else. Two of those defaults are not
+    # cosmetic: impact_coef=0.1 is the un-recalibrated, ~7x-too-high value
+    # Session 1 fixed to 0.015, and trade_cooldown_bars=0 drops the churn
+    # constraint entirely. Either would make backtest results incomparable
+    # to what the policy was actually trained under.
+    #
+    # enable_mirroring is force-FALSE regardless of cfg.env, not read from
+    # it: mirroring fabricates a synthetic price path by reflecting log
+    # prices (see vec_trading_env.py's docstring), which is a training-time
+    # augmentation. Test data must be the real, unaltered market -- the ONE
+    # evaluation this project treats as ground truth cannot run against a
+    # coin-flip mix of real and synthetic streams. This is also why the
+    # verdict must never be trusted from a run where this line regressed.
+    env = VecTradingEnv(
+        dataset=test_dataset,
+        initial_cash=cfg.env.initial_cash,
+        max_position_frac=cfg.env.max_position_frac,
+        tick_size=cfg.env.tick_size,
+        spread_bps=cfg.env.spread_bps,
+        impact_coef=cfg.env.impact_coef,
+        max_participation=cfg.env.max_participation,
+        commission_per_share=cfg.env.commission_per_share,
+        commission_bps=cfg.env.commission_bps,
+        min_commission=cfg.env.min_commission,
+        platform_fee_per_trade=cfg.env.platform_fee_per_trade,
+        r_step_scale=cfg.env.r_step_scale,
+        hold_loser_penalty=cfg.env.hold_loser_penalty,
+        enable_mirroring=False,
+        overtrade_window=cfg.env.overtrade_window,
+        overtrade_free_trades=cfg.env.overtrade_free_trades,
+        overtrade_surcharge_bps=cfg.env.overtrade_surcharge_bps,
+        bias_window=cfg.env.bias_window,
+        diversity_bonus_coef=cfg.env.diversity_bonus_coef,
+        trade_cooldown_bars=cfg.env.trade_cooldown_bars,
+        flatten_at_session_close=cfg.env.flatten_at_session_close,
+        device=str(device),
+    )
 
     # env.feature_names, not test_dataset.feature_names -- VecTradingEnv appends
     # portfolio-state channels to the observation, so sizing off the dataset
