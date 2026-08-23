@@ -54,6 +54,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
 from rich import box
@@ -548,6 +549,97 @@ def _sparkline(values: List[Any], width: int = 48) -> str:
     )
 
 
+_BRAILLE_BASE = 0x2800
+_BRAILLE_BIT = {
+    (0, 0): 0x01, (1, 0): 0x02, (2, 0): 0x04, (3, 0): 0x40,
+    (0, 1): 0x08, (1, 1): 0x10, (2, 1): 0x20, (3, 1): 0x80,
+}
+
+
+def _lerp_hex(low: str, high: str, t: float) -> str:
+    """Linear-interpolate two `#rrggbb` colors at t in [0, 1]."""
+    t = max(0.0, min(1.0, t))
+    a = tuple(int(low[i:i + 2], 16) for i in (1, 3, 5))
+    b = tuple(int(high[i:i + 2], 16) for i in (1, 3, 5))
+    mixed = tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
+    return f"#{mixed[0]:02x}{mixed[1]:02x}{mixed[2]:02x}"
+
+
+def _braille_trace(
+    values: List[Any],
+    width_chars: int,
+    height_rows: int = 2,
+    color_from: str = _C_MUTE,
+    color_to: str = _C_CYAN,
+) -> List[Text]:
+    """
+    A thin, high-resolution line trace rendered in Unicode Braille dots --
+    2 sub-columns and 4 sub-rows of vertical resolution per character cell,
+    so `height_rows` lines of text carry `height_rows * 4` levels of detail.
+
+    Deliberately understated next to the block-character sparklines used
+    elsewhere: dots read as fine structure rather than a loud bar chart, and
+    the color fades from `color_from` (oldest) to `color_to` (most recent)
+    instead of flashing a single verdict color across the whole series.
+    Returns one Text per output row, top to bottom; empty list if there
+    isn't enough history to draw anything.
+    """
+    series = [v for v in (_number(value) for value in values) if v is not None]
+    if len(series) < 2 or width_chars < 2 or height_rows < 1:
+        return []
+
+    sub_cols = max(2, width_chars * 2)
+    sub_rows = height_rows * 4
+
+    if len(series) > sub_cols:
+        bucket = len(series) / sub_cols
+        resampled: List[float] = []
+        for index in range(sub_cols):
+            start = int(index * bucket)
+            end = max(int((index + 1) * bucket), start + 1)
+            chunk = series[start:end]
+            resampled.append(sum(chunk) / len(chunk))
+        series = resampled
+
+    low, high = min(series), max(series)
+    span = high - low
+
+    def level_of(value: float) -> int:
+        if span <= 0:
+            return (sub_rows - 1) // 2
+        # Row 0 is the top of the cell; a high value belongs near the top.
+        return round((high - value) / span * (sub_rows - 1))
+
+    levels = [level_of(value) for value in series]
+
+    matrix = [[False] * len(levels) for _ in range(sub_rows)]
+    for col, level in enumerate(levels):
+        if col == 0:
+            matrix[level][col] = True
+            continue
+        lo, hi = sorted((levels[col - 1], level))
+        for row in range(lo, hi + 1):
+            matrix[row][col] = True
+
+    lines: List[Text] = []
+    for row_group in range(height_rows):
+        line = Text()
+        for col_group in range(width_chars):
+            bits = 0
+            for local_row in range(4):
+                for local_col in range(2):
+                    row = row_group * 4 + local_row
+                    col = col_group * 2 + local_col
+                    if col < len(levels) and matrix[row][col]:
+                        bits |= _BRAILLE_BIT[(local_row, local_col)]
+            char = chr(_BRAILLE_BASE + bits) if bits else " "
+            fade = col_group / max(1, width_chars - 1)
+            line.append(char, style=_lerp_hex(color_from, color_to, fade))
+        lines.append(line)
+
+    return lines
+
+
 def _gauge(fraction: Optional[float], width: int = 12) -> str:
     """Solid/hollow bar for a 0..1 quantity."""
     if fraction is None:
@@ -688,6 +780,15 @@ class TrainingDashboard:
         return int(self.console.width or 120)
 
     def render_once(self) -> None:
+        # A single malformed record or panel-building bug must never kill an
+        # unattended multi-hour Kaggle run -- catch everything, show a
+        # one-line error frame, and let the next tick try again.
+        try:
+            self._render_once_unsafe()
+        except Exception as exc:
+            self._render_frame_error(exc)
+
+    def _render_once_unsafe(self) -> None:
         history = self.reader.tail(self.history_window)
         if not history:
             return
@@ -720,6 +821,29 @@ class TrainingDashboard:
         )
 
         self._render(renderable)
+
+    def _render_frame_error(self, exc: Exception) -> None:
+        """Swap in a one-line error frame for this tick; log the traceback
+        to stderr (never stdout -- that would corrupt the in-place redraw)
+        so a bad frame is visible without taking the whole run down."""
+        traceback.print_exc(file=sys.stderr)
+        message = f"{type(exc).__name__}: {exc}"
+        panel = Panel(
+            Text.from_markup(
+                f"[{_C_DOWN}]dashboard render failed on this frame -- retrying next tick[/]\n"
+                f"[{_C_MUTE}]{message}[/]"
+            ),
+            title=f"[bold {_C_DOWN}]▌ DASHBOARD ERROR[/]",
+            title_align="left",
+            box=_BOX,
+            border_style=_C_DOWN,
+            style=f"on {_C_PANEL}",
+            padding=(0, 1),
+        )
+        try:
+            self._render(panel)
+        except Exception:
+            pass  # the error frame itself failed to render -- skip, try again next tick
 
     @staticmethod
     def _latest_record(
@@ -1124,7 +1248,9 @@ class TrainingDashboard:
         if net_worth is not None:
             self._previous_net_worth = net_worth
 
-        spark = _sparkline(equity_series, max(18, int(self.width * 0.57) - 32))
+        equity_trace = _braille_trace(
+            equity_series, max(18, int(self.width * 0.57) - 32), height_rows=2,
+        )
         spark_color = (
             _C_MUTE if session_change is None
             else _C_UP if session_change >= 0
@@ -1184,10 +1310,10 @@ class TrainingDashboard:
 
         components: List[Any] = [headline]
 
-        if spark:
-            components.append(
-                Text.from_markup(f"[{_C_MUTE}]EQUITY [/][{spark_color}]{spark}[/]")
-            )
+        if equity_trace:
+            label = Text("EQUITY", style=_C_MUTE)
+            components.append(label)
+            components.extend(equity_trace)
 
         components.append(Text(""))
         components.append(stats)
@@ -1287,20 +1413,20 @@ class TrainingDashboard:
         rollout_history: List[Dict[str, Any]],
     ) -> Panel:
         n_tickers = len(rollout.get("tickers") or [])
-        kelly_zero = rollout.get("kelly_zero_count")
-        kelly_warm = rollout.get("kelly_warm_count")
+        kelly_zero = _number(rollout.get("kelly_zero_count"))
+        kelly_warm = _number(rollout.get("kelly_warm_count"))
         # Red once any stream is locked (fractional_kelly == 0.0 for a warm
         # stream) -- see risk/kelly_sizing.py's diagnostics() docstring: that
         # 0.0 is permanent for the rest of the run once it happens, so this
         # count should only ever climb, never fall, within one run.
         kelly_zero_text = (
             "—" if kelly_zero is None
-            else f"[bold {_C_DOWN}]{kelly_zero}/{n_tickers}[/]" if kelly_zero > 0
-            else f"[bold {_C_TEXT}]{kelly_zero}/{n_tickers}[/]"
+            else f"[bold {_C_DOWN}]{kelly_zero:.0f}/{n_tickers}[/]" if kelly_zero > 0
+            else f"[bold {_C_TEXT}]{kelly_zero:.0f}/{n_tickers}[/]"
         )
         kelly_warm_text = (
             "—" if kelly_warm is None
-            else f"[bold {_C_TEXT}]{kelly_warm}/{n_tickers}[/]"
+            else f"[bold {_C_TEXT}]{kelly_warm:.0f}/{n_tickers}[/]"
         )
 
         reward = _number(rollout.get("reward"))
@@ -1585,12 +1711,15 @@ class TrainingDashboard:
         tick_record: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
         tickers = tick_record.get("tickers")
-        position = tick_record.get("position")
-        if not isinstance(tickers, list) or not isinstance(position, list):
+        if not isinstance(tickers, list):
             return []
 
         count = len(tickers)
 
+        # `_as_list` rather than a raw isinstance-list check: a short or
+        # missing `position` array (e.g. a partial/racy write) degrades to
+        # all-None entries instead of an IndexError below.
+        position = _as_list(tick_record.get("position"), count)
         net_worth = _as_list(tick_record.get("net_worth_per_ticker"), count)
         prices = _as_list(tick_record.get("price_per_ticker"), count)
         unrealized = _as_list(tick_record.get("unrealized_pnl"), count)
