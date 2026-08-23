@@ -277,6 +277,39 @@ class HybridPolicyHead(nn.Module):
         return size_raw * max_size
 
     @staticmethod
+    def size_cap_shares(
+        equity: torch.Tensor,
+        mid_price: torch.Tensor,
+        max_order_notional_frac: float,
+        max_order_shares: float,
+    ) -> torch.Tensor:
+        """Per-env share cap for rescale_size, derived from EQUITY.
+
+        rescale_size maps the Beta head's (0,1) output onto [0, max_size]. That
+        ceiling used to be cfg.risk.max_order_shares -- a flat 10,000 SHARES,
+        an absolute count with no relationship to account size. Against this
+        project's $10,000-per-stream equity at a ~$150 median price that is
+        $1.5M of requested notional, about 161x equity, while the Kelly cap
+        downstream allows 8% of equity (~$744, or 4.96 shares).
+
+        The consequence is that 99.95% of the size head's output range mapped
+        to "capped at exactly the Kelly fraction". The Beta head would have had
+        to emit below 0.0005 for its size output to change the order at all, so
+        sizing was constant by construction and the head received no usable
+        gradient -- which is why entropy_continuous collapsed to 0.000 and why
+        every observed fill in three consecutive runs came in at exactly
+        0.08 x equity.
+
+        Deriving the ceiling from equity puts the Kelly cap INSIDE the policy's
+        range (at max_order_notional_frac=0.20 and a 0.08 Kelly fraction it
+        bites at 40% of the range), so the head finally has somewhere to move.
+        max_order_shares is retained as an absolute backstop rather than the
+        primary scale.
+        """
+        shares = (max_order_notional_frac * equity.clamp(min=0.0)) / mid_price.clamp(min=1e-6)
+        return shares.clamp(max=float(max_order_shares))
+
+    @staticmethod
     def rescale_limit_offset(limit_offset_raw: torch.Tensor, max_offset_ticks: float) -> torch.Tensor:
         """
         limit_offset_raw: (0, 1) from HybridActionSample.limit_offset.

@@ -228,6 +228,44 @@ class EnvConfig:
     # VecTradingEnv._apply_trade_cooldown() for the measurements behind this.
     trade_cooldown_bars: int = 12
 
+    # Minimum bars a position must be held before the policy may reduce it.
+    #
+    # trade_cooldown_bars above blocks re-ENTRY; this blocks EXIT. They are
+    # complements, and only having the first one is what produced the last
+    # run's defining number: 140 of 140 completed round trips lasted exactly
+    # one bar -- median, mean, p90 and max all 1.0. Blocking re-entry cut trade
+    # frequency but left "open, close next bar, sit out the cooldown" as the
+    # policy's best available move.
+    #
+    # That is the gap between the alpha gate and the equity curve. The gate
+    # found its edge at 30min-1hr horizons (6-12 bars). A 1-bar hold captures
+    # about one bar of that move (median 9.84 bps) against the full 7.28 bps
+    # round trip, every time. Holding h bars scales the move by sqrt(h) while
+    # the cost stays fixed.
+    #
+    # Set this to the horizon of whichever alpha_lab cell actually passed --
+    # 6 for a 30min cell, 12 for a 1hr cell. Left at 0 (off) by default so
+    # nothing changes until that number is known; enabling it blind would just
+    # be a different arbitrary constraint.
+    min_hold_bars: int = 0
+
+    # Bars of the session on which the policy may OPEN or ADD exposure, as a
+    # half-open [start, end) range of bar-of-day indices (0 == 09:30, 77 is the
+    # last RTH bar). Reductions and the session-close flatten are never gated.
+    #
+    # Median |5-min move| by regime, on the marking price path: open hour
+    # 18.6 bps, close ramp 11.9, midday 9.6 -- against a round-trip cost near
+    # 7.3 bps that does not vary with time of day. Spreading the cost budget
+    # uniformly across all 77 tradable bars spends most of it where the move
+    # barely clears the spread.
+    #
+    # Match this to the regime of whichever alpha_lab cell passed:
+    #     open_hour  -> (0, 12)
+    #     midday     -> (12, 72)
+    #     close_ramp -> (74, 77)
+    # None (default) means every bar is tradable, i.e. previous behaviour.
+    trading_window: Optional[Tuple[int, int]] = None
+
     # Close every position on the last bar of each trading session.
     #
     # Before this flag the env had no notion of a session at all, so overnight
@@ -442,10 +480,21 @@ class RiskConfig:
     # live-only).
     kill_switch_reset_every_n_rollouts: int = 1
 
-    # order sizing that hybrid_policy.py's rescale_* helpers need but which
-    # isn't itself derived from equity (a hard ceiling the network's
-    # normalized (0,1) output gets mapped onto BEFORE kelly/risk clip it
-    # further down -- see ppo_hybrid.py's action pipeline)
+    # ABSOLUTE BACKSTOP on order size, no longer the primary scale.
+    #
+    # This used to be the ceiling the Beta size head's (0,1) output was mapped
+    # onto directly. At 10,000 shares against $10,000-per-stream equity and a
+    # ~$150 median price that is $1.5M of requested notional -- about 161x
+    # equity -- while the Kelly cap downstream permits 8% (~$744, 4.96 shares).
+    # So 99.95% of the head's output range mapped to "capped", it received no
+    # usable gradient, entropy_continuous collapsed to 0.000, and every
+    # observed fill across three consecutive runs came in at exactly
+    # 0.08 x equity. Sizing was a constant by construction.
+    #
+    # The mapping ceiling is now derived from equity via
+    # HybridPolicyHead.size_cap_shares (max_order_notional_frac x equity /
+    # price), which puts the Kelly cap inside the policy's range. This value
+    # survives only as a hard clamp against a pathological price or equity.
     max_order_shares: float = 10_000.0
     # 20.0 -> 0.0: DISABLES the limit_offset action, i.e. every order is
     # modelled as marketable and pays the full spread. Not a tuning choice --

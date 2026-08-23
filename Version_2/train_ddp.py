@@ -132,6 +132,8 @@ def _build_env(cfg: TrainingConfig, device: torch.device) -> VecTradingEnv:
         bias_window=cfg.env.bias_window,
         diversity_bonus_coef=cfg.env.diversity_bonus_coef,
         trade_cooldown_bars=cfg.env.trade_cooldown_bars,
+        min_hold_bars=cfg.env.min_hold_bars,
+        trading_window=cfg.env.trading_window,
         flatten_at_session_close=cfg.env.flatten_at_session_close,
         device=str(device),
     )

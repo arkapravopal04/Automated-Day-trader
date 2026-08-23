@@ -153,7 +153,11 @@ def run_backtest(
                 action_sample = actor_critic.policy_head.act(trunk, deterministic=True)
 
                 size_shares = HybridPolicyHead.rescale_size(
-                    action_sample.size, torch.full_like(action_sample.size, cfg.risk.max_order_shares)
+                    action_sample.size,
+                    HybridPolicyHead.size_cap_shares(
+                        equity_before, mid_price,
+                        cfg.risk.max_order_notional_frac, cfg.risk.max_order_shares,
+                    ),
                 )
                 limit_offset_ticks = HybridPolicyHead.rescale_limit_offset(
                     action_sample.limit_offset, cfg.risk.max_limit_offset_ticks

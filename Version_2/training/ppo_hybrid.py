@@ -193,8 +193,15 @@ def _run_action_pipeline(
     triple env.step() expects. Must be called under the same no_grad scope
     as the rest of collect_rollout() -- see that function's docstring.
     """
+    # Equity-relative ceiling, not a flat share count -- see
+    # HybridPolicyHead.size_cap_shares for why the old absolute 10,000-share
+    # scale left 99.95% of the size head's range dead.
     size_shares_uncapped = HybridPolicyHead.rescale_size(
-        action_sample.size, torch.full_like(action_sample.size, cfg.risk.max_order_shares)
+        action_sample.size,
+        HybridPolicyHead.size_cap_shares(
+            equity_before, mid_price,
+            cfg.risk.max_order_notional_frac, cfg.risk.max_order_shares,
+        ),
     )
     limit_offset_ticks = HybridPolicyHead.rescale_limit_offset(
         action_sample.limit_offset, cfg.risk.max_limit_offset_ticks

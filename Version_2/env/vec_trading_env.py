@@ -249,6 +249,8 @@ class VecTradingEnv:
         bias_window: int = DIVERSITY_WINDOW,
         diversity_bonus_coef: float = DIVERSITY_COEF,
         trade_cooldown_bars: int = 0,   # see _apply_trade_cooldown()
+        min_hold_bars: int = 0,         # see _apply_min_hold()
+        trading_window: "Optional[Tuple[int, int]]" = None,  # see _apply_trading_window()
         flatten_at_session_close: bool = True,  # see _session_close_override()
         flatten_close_bars: int = 1,   # how many trailing bars force flat
 
@@ -280,6 +282,11 @@ class VecTradingEnv:
         self.overtrade_free_trades = overtrade_free_trades
         self.bias_window = bias_window
         self.trade_cooldown_bars = int(trade_cooldown_bars)
+        self.min_hold_bars = max(0, int(min_hold_bars))
+        self.trading_window = (
+            None if trading_window is None
+            else (int(trading_window[0]), int(trading_window[1]))
+        )
         self.diversity_bonus_coef = diversity_bonus_coef
 
         self._load_market_data()
@@ -415,6 +422,20 @@ class VecTradingEnv:
             first[1:] = sess[1:] != sess[:-1]
             self._is_session_first = torch.as_tensor(first, device=self.device)
             self._n_sessions = int(first.sum())
+            # Bar-of-day index (0 == 09:30) from the clock, not a row counter,
+            # for the same reason the session masks are: a missing bar, a
+            # half-day or a holiday would shift every later label.
+            bod = np.asarray(
+                ((ny.hour * 60 + ny.minute) - (9 * 60 + 30)) // 5, dtype=np.int16
+            )
+            self._bar_of_day = torch.as_tensor(bod.astype(np.int64), device=self.device)
+            if trading_window is None:
+                self._is_tradable_bar = None
+            else:
+                lo, hi = int(trading_window[0]), int(trading_window[1])
+                self._is_tradable_bar = torch.as_tensor(
+                    (bod >= lo) & (bod < hi), device=self.device
+                )
             # Widen the force-flat window to the trailing N bars of each
             # session, so an oversized position gets more than one
             # attempt at the participation cap.
@@ -426,6 +447,8 @@ class VecTradingEnv:
         else:
             self._is_session_last = None
             self._session_last_only = None
+            self._bar_of_day = None
+            self._is_tradable_bar = None
             self._is_session_first = None
             self._n_sessions = 0
 
@@ -463,6 +486,20 @@ class VecTradingEnv:
             print("[env] flatten_at_session_close=False -- OVERNIGHT EXPOSURE IS "
                   "CARRIED. No step-based risk control runs between sessions.")
 
+        if self.trading_window is not None and self._is_tradable_bar is None:
+            raise ValueError(
+                "trading_window was set but the dataset exposes no aligned_dates, "
+                "so bar-of-day cannot be located."
+            )
+        if self.trading_window is not None:
+            _lo, _hi = self.trading_window
+            _n = int(self._is_tradable_bar.sum())
+            print("[env] trading_window=[%d,%d) -- new exposure may only be opened"
+                  % (_lo, _hi))
+            print("      on bars %d-%d of the session (%d of 78 bars, %d rows)."
+                  % (_lo, _hi - 1, _hi - _lo, _n))
+            print("      Reductions and the session-close flatten are unaffected.")
+
 
         self.current_idx = 0
         self.max_idx = len(self.dataset) - 1
@@ -475,6 +512,11 @@ class VecTradingEnv:
         # cooldown so nothing is blocked on the very first bar.
         self._bars_since_open = torch.full(
             (self.n_envs,), float(self.trade_cooldown_bars + 1), device=self.device
+        )
+        # Bars since this stream last OPENED from flat. Seeded above the
+        # threshold so nothing is trapped on the very first bar.
+        self._bars_since_entry = torch.full(
+            (self.n_envs,), float(self.min_hold_bars + 1), device=self.device
         )
         self._trade_hist = torch.zeros((self.n_envs, self.overtrade_window), device=self.device)
         self._trade_hist_ptr = 0
@@ -529,6 +571,7 @@ class VecTradingEnv:
         self.active_prices = torch.where(self.mirror_mask.unsqueeze(0), self.mirrored_prices, self.prices)
 
         self._bars_since_open.fill_(float(self.trade_cooldown_bars + 1))
+        self._bars_since_entry.fill_(float(self.min_hold_bars + 1))
         self._trade_hist.zero_()
         # current_idx is back at 0, so the first bar of the split is by
         # definition the first bar of a session -- collect_rollout() should
@@ -653,6 +696,25 @@ class VecTradingEnv:
         return direction, size
 
 
+    @staticmethod
+    def _increasing_mask(direction: Tensor, size: Tensor, position: Tensor) -> Tensor:
+        """Orders that GROW exposure, as opposed to a pure reduction.
+
+        Opening from flat, adding in the same direction, or flipping (which
+        opens fresh opposite exposure). Shared by _apply_trade_cooldown and
+        _apply_trading_window so the two cannot drift apart -- they gate the
+        same class of order on different clocks (time-since-last-increase vs
+        time-of-day).
+        """
+        opening = (position == 0) & (direction != 0)
+        adding = (torch.sign(direction) == torch.sign(position)) & (position != 0)
+        flipping = (
+            (torch.sign(direction) == -torch.sign(position))
+            & (position != 0)
+            & (size > position.abs())
+        )
+        return opening | adding | flipping
+
     def _apply_trade_cooldown(self, direction: Tensor, size: Tensor) -> Tuple[Tensor, Tensor]:
         """
         Blocks EXPOSURE-INCREASING orders for `trade_cooldown_bars` bars after
@@ -687,18 +749,111 @@ class VecTradingEnv:
         direction = direction.to(device=self.device, dtype=position.dtype)
         size = size.to(device=self.device, dtype=position.dtype)
 
-        # "Increasing" = anything that is not a pure reduction of the current
-        # position: opening from flat, adding in the same direction, or
-        # flipping (which opens fresh opposite exposure).
-        opening = (position == 0) & (direction != 0)
-        adding = (torch.sign(direction) == torch.sign(position)) & (position != 0)
-        flipping = (torch.sign(direction) == -torch.sign(position)) & (position != 0) & (size > position.abs())
-        increasing = opening | adding | flipping
+        increasing = self._increasing_mask(direction, size, position)
 
         blocked = increasing & (self._bars_since_open < self.trade_cooldown_bars)
         direction = torch.where(blocked, torch.zeros_like(direction), direction)
         size = torch.where(blocked, torch.zeros_like(size), size)
         return direction, size
+
+    def _apply_trading_window(self, direction, size):
+        """Allow new exposure only on bars inside the configured window.
+
+        Gates ENTRY, never exit. A position opened inside the window can always
+        be reduced or closed outside it -- gating exits too would trap
+        inventory the moment the window ended, and would fight both
+        _apply_min_hold and the session-close flatten.
+
+        WHY. Median |5-min move| by regime, measured on the marking price path:
+        open hour 18.6 bps, close ramp 11.9, midday 9.6, against a round-trip
+        cost of ~7.3 bps that does not vary with time of day. The policy was
+        spreading its cost budget uniformly over all 77 tradable bars, so most
+        of it was spent in the stretch where the available move barely clears
+        the spread. time_sin/time_cos have been in the feature set the whole
+        time and the policy demonstrably did not use them, so this removes the
+        option rather than pricing it -- the same call made for
+        trade_cooldown_bars.
+
+        Set this to the regime of whichever alpha_lab cell passed:
+        open_hour = (0, 12), midday = (12, 72), close_ramp = (74, 77).
+        None means every bar is tradable, which is the previous behaviour.
+        """
+        if self._is_tradable_bar is None:
+            return direction, size
+        t = self.current_idx + self.window_size - 1
+        if t < len(self._is_tradable_bar) and bool(self._is_tradable_bar[t]):
+            return direction, size
+
+        position = self.portfolio.positions[:, 0]
+        direction = direction.to(device=self.device, dtype=position.dtype)
+        size = size.to(device=self.device, dtype=position.dtype)
+        increasing = self._increasing_mask(direction, size, position)
+        direction = torch.where(increasing, torch.zeros_like(direction), direction)
+        size = torch.where(increasing, torch.zeros_like(size), size)
+        return direction, size
+
+
+    def _apply_min_hold(self, direction, size):
+        """Block exposure-REDUCING orders for min_hold_bars after an entry.
+
+        The exact complement of _apply_trade_cooldown, and the mechanism that
+        was missing. trade_cooldown_bars=12 blocks re-ENTRY for 12 bars, which
+        cuts trade FREQUENCY but says nothing about holding period -- so the
+        policy's optimal response was to open, close on the very next bar, and
+        sit out the cooldown. Measured on the last run's tick log: 140 of 140
+        completed round trips lasted exactly 1 bar. Median, mean, p90 and max
+        all 1.0, not a single 2-bar hold.
+
+        That is the gap between the alpha gate and the equity curve. The gate
+        found its edge at 30min-1hr horizons (6-12 bars); a 1-bar hold captures
+        roughly one bar of that move -- median 9.84 bps -- while paying the
+        full 7.28 bps round trip every time. Holding 12 bars scales the move by
+        sqrt(12) to ~34 bps against the same fixed cost. Cutting frequency was
+        the wrong lever; holding is the right one.
+
+        A hard env constraint rather than a reward term, following the
+        precedent set for trade_cooldown_bars: two earlier runs optimised the
+        reward well while still churning, so the option is removed rather than
+        priced.
+
+        SAFETY. This runs BEFORE _session_close_override, so the forced
+        session-close flatten always wins and no position can be trapped past
+        the bell. Within a session it can delay a risk_manager-mandated
+        reduction by up to min_hold_bars, because by the time an action reaches
+        the env a reduction's origin is no longer distinguishable (the same
+        ambiguity step() documents for direction == 0). That exposure is
+        bounded -- at most min_hold_bars, and always released at the close --
+        but it is real, so keep min_hold_bars well under a session.
+        """
+        if self.min_hold_bars <= 0:
+            return direction, size
+        position = self.portfolio.positions[:, 0]
+        direction = direction.to(device=self.device, dtype=position.dtype)
+        size = size.to(device=self.device, dtype=position.dtype)
+
+        # "Reducing" = trading against an existing position. Opening from flat
+        # and adding in the same direction are untouched; the cooldown governs
+        # those.
+        holding = position != 0
+        against = torch.sign(direction) == -torch.sign(position)
+        reducing = holding & against & (direction != 0)
+
+        blocked = reducing & (self._bars_since_entry < self.min_hold_bars)
+        direction = torch.where(blocked, torch.zeros_like(direction), direction)
+        size = torch.where(blocked, torch.zeros_like(size), size)
+        return direction, size
+
+    def _advance_min_hold(self, positions_before: Tensor) -> None:
+        """Ticks the hold clock, resetting it wherever a position opened from flat."""
+        if self.min_hold_bars <= 0:
+            return
+        after = self.portfolio.positions[:, 0]
+        opened = (positions_before == 0) & (after != 0)
+        self._bars_since_entry = self._bars_since_entry + 1.0
+        self._bars_since_entry = torch.where(
+            opened, torch.zeros_like(self._bars_since_entry), self._bars_since_entry
+        )
+
 
     def _advance_trade_cooldown(self, positions_before: Tensor, filled_qty: Tensor) -> None:
         """Ticks the cooldown clock, resetting it wherever exposure actually grew."""
@@ -812,7 +967,9 @@ class VecTradingEnv:
         # position". Position state is now fed to the actor via
         # _augment_obs_with_portfolio_state() below, which is what makes
         # inventory intent representable in the first place.
+        direction, size = self._apply_trading_window(direction, size)
         direction, size = self._apply_trade_cooldown(direction, size)
+        direction, size = self._apply_min_hold(direction, size)
         direction, size = self._session_close_override(direction, size)
 
         sim_fill: SimulatedFill = self.execution.simulate_fill(
@@ -841,6 +998,7 @@ class VecTradingEnv:
 
         self._record_trade_direction(sim_fill.filled_qty)
         self._advance_trade_cooldown(positions_before, sim_fill.filled_qty)
+        self._advance_min_hold(positions_before)
 
         # Residual overnight carry: anything still open after this bar, when
         # this bar is a session's LAST. Must be read BEFORE current_idx

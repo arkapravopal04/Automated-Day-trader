@@ -256,7 +256,11 @@ class LiveLoop:
             action_sample = self.actor_critic.policy_head.act(trunk, deterministic=True)
 
         size_shares = HybridPolicyHead.rescale_size(
-            action_sample.size, torch.full_like(action_sample.size, self.cfg.risk.max_order_shares)
+            action_sample.size,
+            HybridPolicyHead.size_cap_shares(
+                equity_before, mid_price,
+                self.cfg.risk.max_order_notional_frac, self.cfg.risk.max_order_shares,
+            ),
         )
         limit_offset_ticks = HybridPolicyHead.rescale_limit_offset(
             action_sample.limit_offset, self.cfg.risk.max_limit_offset_ticks
