@@ -29,8 +29,8 @@ debug dump. v4 keeps every number and re-skins it as a trading desk:
     MASTHEAD   -- brand, LIVE/STALE/NO DATA pill, session clock, pace
     TAPE       -- scrolling marquee of every symbol, price and tick change
     RISK       -- one band; "ALL CLEAR" when clean, unmissable when not
-    THE BOOK   -- headline net liquidating value, equity sparkline,
-                  aggregate stats, top/bottom leaderboard by unrealized PnL
+    THE BOOK   -- headline net liquidating value, aggregate stats,
+                  top/bottom leaderboard by unrealized PnL
     TELEMETRY  -- reward + trend sparkline, gauges for entropy/clip/KL,
                   losses, grad norm, Kelly locked/warm
     BLOTTER    -- recent fills as an execution blotter, newest first
@@ -381,8 +381,8 @@ _C_BAR = "#161b23"          # masthead / tape background
 
 _BOX = box.SQUARE
 
-_SPINNER_FRAMES = ["◜", "◝", "◞", "◟"]
-_PULSE_FRAMES = ["●", "◉", "◎", "◉"]
+_SPINNER_FRAMES = ["|", "/", "-", "\\"]
+_PULSE_FRAMES = ["●", "○", "●", "○"]
 _SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
 _MAX_TRADE_EVENTS = 9          # fills shown in the blotter
@@ -584,89 +584,6 @@ def _sparkline(values: List[Any], width: int = 48) -> str:
         _SPARK_CHARS[min(last_index, int((value - low) / span * last_index + 0.5))]
         for value in series
     )
-
-
-_BRAILLE_BASE = 0x2800
-_BRAILLE_BIT = {
-    (0, 0): 0x01, (1, 0): 0x02, (2, 0): 0x04, (3, 0): 0x40,
-    (0, 1): 0x08, (1, 1): 0x10, (2, 1): 0x20, (3, 1): 0x80,
-}
-
-
-def _lerp_hex(low: str, high: str, t: float) -> str:
-    """Linear-interpolate two `#rrggbb` colors at t in [0, 1]."""
-    t = max(0.0, min(1.0, t))
-    a = tuple(int(low[i:i + 2], 16) for i in (1, 3, 5))
-    b = tuple(int(high[i:i + 2], 16) for i in (1, 3, 5))
-    mixed = tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
-    return f"#{mixed[0]:02x}{mixed[1]:02x}{mixed[2]:02x}"
-
-
-def _braille_trace(
-    values: List[Any],
-    width_chars: int,
-    height_rows: int = 2,
-    color_from: str = _C_MUTE,
-    color_to: str = _C_CYAN,
-) -> List[Text]:
-    """
-    A thin, high-resolution line trace rendered in Unicode Braille dots --
-    2 sub-columns and 4 sub-rows of vertical resolution per character cell,
-    so `height_rows` lines of text carry `height_rows * 4` levels of detail.
-
-    Deliberately understated next to the block-character sparklines used
-    elsewhere: dots read as fine structure rather than a loud bar chart, and
-    the color fades from `color_from` (oldest) to `color_to` (most recent)
-    instead of flashing a single verdict color across the whole series.
-    Returns one Text per output row, top to bottom; empty list if there
-    isn't enough history to draw anything.
-    """
-    series = [v for v in (_number(value) for value in values) if v is not None]
-    if len(series) < 2 or width_chars < 2 or height_rows < 1:
-        return []
-
-    sub_cols = max(2, width_chars * 2)
-    sub_rows = height_rows * 4
-
-    series = _resample_series(series, sub_cols)
-
-    low, high = min(series), max(series)
-    span = high - low
-
-    def level_of(value: float) -> int:
-        if span <= 0:
-            return (sub_rows - 1) // 2
-        # Row 0 is the top of the cell; a high value belongs near the top.
-        return round((high - value) / span * (sub_rows - 1))
-
-    levels = [level_of(value) for value in series]
-
-    matrix = [[False] * len(levels) for _ in range(sub_rows)]
-    for col, level in enumerate(levels):
-        if col == 0:
-            matrix[level][col] = True
-            continue
-        lo, hi = sorted((levels[col - 1], level))
-        for row in range(lo, hi + 1):
-            matrix[row][col] = True
-
-    lines: List[Text] = []
-    for row_group in range(height_rows):
-        line = Text()
-        for col_group in range(width_chars):
-            bits = 0
-            for local_row in range(4):
-                for local_col in range(2):
-                    row = row_group * 4 + local_row
-                    col = col_group * 2 + local_col
-                    if col < len(levels) and matrix[row][col]:
-                        bits |= _BRAILLE_BIT[(local_row, local_col)]
-            char = chr(_BRAILLE_BASE + bits) if bits else " "
-            fade = col_group / max(1, width_chars - 1)
-            line.append(char, style=_lerp_hex(color_from, color_to, fade))
-        lines.append(line)
-
-    return lines
 
 
 def _gauge(fraction: Optional[float], width: int = 12) -> str:
@@ -1068,7 +985,7 @@ class TrainingDashboard:
         header.add_column(justify="right")
         header.add_row(
             Text.from_markup(
-                f"[bold {_C_AMBER}]█▛[/] [bold {_C_AMBER}]{_spaced('QUANTDESK')}[/]"
+                f"[bold {_C_AMBER}]█[/] [bold {_C_AMBER}]{_spaced('QUANTDESK')}[/]"
                 f"  [{_C_AMBER_DIM}]│[/]  [{_C_CYAN}]{self.desk_name}[/]"
             ),
             Text.from_markup(
@@ -1151,7 +1068,7 @@ class TrainingDashboard:
             push(f"{row['ticker']} ", f"bold {_C_TEXT}")
             push(f"{price} ", _C_TEXT)
             push(f"{arrow}{move}", color)
-            push("   ◆   ", _C_AMBER_DIM)
+            push("   •   ", _C_AMBER_DIM)
 
         if not chars:
             return Panel(
@@ -1277,9 +1194,6 @@ class TrainingDashboard:
         if net_worth is not None:
             self._previous_net_worth = net_worth
 
-        equity_trace = _braille_trace(
-            equity_series, max(18, int(self.width * 0.57) - 32), height_rows=2,
-        )
         spark_color = (
             _C_MUTE if session_change is None
             else _C_UP if session_change >= 0
@@ -1337,14 +1251,7 @@ class TrainingDashboard:
             self._stat("BOOKS", str(n_streams), _C_TEXT),
         )
 
-        components: List[Any] = [headline]
-
-        if equity_trace:
-            label = Text("EQUITY", style=_C_MUTE)
-            components.append(label)
-            components.extend(equity_trace)
-
-        components.append(Text(""))
+        components: List[Any] = [headline, Text("")]
         components.append(stats)
 
         leaderboard = self._build_spotlight_table(rows)
@@ -1361,7 +1268,7 @@ class TrainingDashboard:
                 if self.width >= 100
                 else f"[{_C_MUTE}]Σ over {n_streams} books[/]"
             ),
-            subtitle_align="right",
+            subtitle_align="left",
             box=_BOX,
             border_style=_C_AMBER_DIM,
             style=f"on {_C_PANEL}",
@@ -1403,7 +1310,7 @@ class TrainingDashboard:
             if row is None:
                 omitted = len(ranked) - _SPOTLIGHT_ROWS
                 table.add_row(
-                    Text.from_markup(f"[{_C_MUTE}]⋯[/]"),
+                    Text.from_markup(f"[{_C_MUTE}]...[/]"),
                     "",
                     "",
                     Text.from_markup(f"[{_C_MUTE}]{omitted} books between[/]"),
@@ -1414,7 +1321,7 @@ class TrainingDashboard:
 
             flag = (
                 f"[{_C_DOWN}]✖[/]" if row["is_bankrupt"]
-                else f"[{_C_AMBER}]‖[/]" if row["is_halted"]
+                else f"[{_C_AMBER}]H[/]" if row["is_halted"]
                 else f"[{_C_UP}]✓[/]"
             )
             table.add_row(
@@ -1545,7 +1452,7 @@ class TrainingDashboard:
                 if self.width >= 100
                 else f"[{_C_MUTE}]dimensionless[/]"
             ),
-            subtitle_align="right",
+            subtitle_align="left",
             box=_BOX,
             border_style=_C_AMBER_DIM,
             style=f"on {_C_PANEL}",
@@ -1608,7 +1515,7 @@ class TrainingDashboard:
                 movers_text.append(f"{arrow} {row['ticker']} ", style=f"bold {color}")
                 movers_text.append(f"{row['change_pct']:+.2%}", style=color)
                 if index < len(movers) - 1:
-                    movers_text.append("   ◆   ", style=_C_AMBER_DIM)
+                    movers_text.append("   •   ", style=_C_AMBER_DIM)
         else:
             movers_text.append("flat tape — no meaningful moves this tick", style=_C_MUTE)
 
@@ -1617,7 +1524,7 @@ class TrainingDashboard:
             title=title,
             title_align="left",
             subtitle=f"[{_C_MUTE}]{len(rows)} symbols[/]",
-            subtitle_align="right",
+            subtitle_align="left",
             box=_BOX,
             border_style=_C_AMBER_DIM,
             style=f"on {_C_PANEL}",
@@ -1704,7 +1611,7 @@ class TrainingDashboard:
             title=f"[bold {_C_AMBER}]▌ {_spaced('BLOTTER')}[/]",
             title_align="left",
             subtitle=f"[{_C_MUTE}]most recent first[/]",
-            subtitle_align="right",
+            subtitle_align="left",
             box=_BOX,
             border_style=_C_AMBER_DIM,
             style=f"on {_C_PANEL}",
@@ -1721,7 +1628,7 @@ class TrainingDashboard:
 
         parts = [
             f"[{_C_MUTE}]SIMULATED BOOKS · NO CAPITAL AT RISK[/]",
-            f"[{_C_UP}]✓ live[/]  [{_C_AMBER}]‖ halted[/]  [{_C_DOWN}]✖ blown[/]",
+            f"[{_C_UP}]✓ live[/]  [{_C_AMBER}]H halted[/]  [{_C_DOWN}]✖ blown[/]",
         ]
         if self.width >= 130:
             parts.append(
@@ -1811,7 +1718,7 @@ class TrainingDashboard:
             if row["is_bankrupt"]:
                 marker, marker_color = "✖", _C_DOWN
             elif row["is_halted"]:
-                marker, marker_color = "‖", _C_AMBER
+                marker, marker_color = "H", _C_AMBER
             else:
                 marker, marker_color = "▏", color
 

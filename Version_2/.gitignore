@@ -33,6 +33,7 @@ kaggle_data/
 
 # --- Local-only agent/session notes ---
 AGENTS.md
+report.md
 
 # --- Virtual environments ---
 venv/

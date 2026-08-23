@@ -86,6 +86,15 @@ TRADING_DAYS = 252
 # selective trader gets on the same signal.
 SELECTIVITY_K = 1.75
 
+# Order participation assumed for the impact term. NOT zero: at zero the
+# impact term vanishes and the round trip prices at 3.64 bps, while the two
+# most recent completed runs actually paid a fitted 4.20 bps + $0.0048/share,
+# i.e. 9.0 bps round trip at the median price. 0.00032 is the participation
+# that reconciles the two, so the gate screens against the friction the system
+# demonstrably pays rather than a frictionless ideal. Running at zero made
+# every break-even IC in the opportunity table 2.6x too easy.
+DEFAULT_PARTICIPATION = 0.00032
+
 # Gate thresholds. A cell must clear ALL of them.
 MIN_SHARPE = 0.50          # net of cost, per name, no diversification credit
 MIN_ABS_T = 2.0            # block-clustered
@@ -273,6 +282,49 @@ def load_panel(max_tickers=None):
                 session_last_idx=session_last_idx)
 
 
+def exit_index(T, h, session_last_idx=None):
+    """The bar a position opened at t is actually closed on, for horizon h.
+
+    Factored out of forward_return_bps because the session cap makes several
+    nominal horizons the SAME trade, and the only exact way to detect that is
+    to compare the exit bars themselves.
+    """
+    t = np.arange(T)
+    if session_last_idx is None:
+        exit_idx = np.minimum(t + h, T - 1)
+    else:
+        exit_idx = np.minimum(t + h, session_last_idx)
+    return np.minimum(exit_idx, T - 1)
+
+
+def distinct_horizons(T, horizons, entry_mask, session_last_idx):
+    """Drop horizons that are a relabelling of a shorter one on these entries.
+
+    The session cap means a hold cannot run past the close, so on entries in
+    the close ramp a nominal 30min, 1hr, 1day and 1week horizon all describe
+    the same two-or-three-bar trade, and on any regime every horizon >= one
+    session collapses onto 1day. Scoring them separately was not harmless:
+    the duplicates were credited FEWER bets per year on an identical return
+    series, so they entered the table as strictly dominated ghost rows, and
+    they inflated the Benjamini-Hochberg denominator -- 300 cells corrected as
+    300 when only 210 carried independent information, making the correction
+    about 30% stricter than the evidence warranted.
+
+    Returns [(name, h, aliases)], shortest first, keeping the shortest name of
+    each equivalence class so bets_per_year is computed from the hold that is
+    really being taken.
+    """
+    kept, seen = [], {}
+    for name, h in sorted(horizons.items(), key=lambda kv: kv[1]):
+        sig = exit_index(T, h, session_last_idx)[entry_mask].tobytes()
+        if sig in seen:
+            kept[seen[sig]][2].append(name)
+            continue
+        seen[sig] = len(kept)
+        kept.append((name, h, []))
+    return kept
+
+
 def forward_return_bps(P, h, session_last_idx=None):
     """log(close[t+h] / close[t]) in bps, capped at the session close.
 
@@ -287,11 +339,7 @@ def forward_return_bps(P, h, session_last_idx=None):
     """
     T = P.shape[0]
     t = np.arange(T)
-    if session_last_idx is None:
-        exit_idx = np.minimum(t + h, T - 1)
-    else:
-        exit_idx = np.minimum(t + h, session_last_idx)
-    exit_idx = np.minimum(exit_idx, T - 1)
+    exit_idx = exit_index(T, h, session_last_idx)
     out = np.full_like(P, np.nan, dtype=np.float32)
     ok = exit_idx > t
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -504,8 +552,10 @@ def two_sided_p(t, dof):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Supervised alpha gate.")
     ap.add_argument("--tickers", type=int, default=None, help="cap universe size")
-    ap.add_argument("--participation", type=float, default=0.0,
-                    help="assumed order participation for the impact term")
+    ap.add_argument("--participation", type=float, default=DEFAULT_PARTICIPATION,
+                    help="assumed order participation for the impact term "
+                         f"(default {DEFAULT_PARTICIPATION}, the value that "
+                         "reproduces the round trip the live runs paid)")
     ap.add_argument("--top", type=int, default=25, help="rows to print")
     ap.add_argument("--json", type=str, default=None, help="write results here")
     args = ap.parse_args(argv)
@@ -536,15 +586,29 @@ def main(argv=None):
     sli = panel["session_last_idx"]
     fwd_cache = {h: forward_return_bps(P, h, sli) for h in HORIZONS.values()}
 
+    # Horizons the session cap collapses onto a shorter one, per regime. Done
+    # once here so the opportunity table and the scan below agree on which
+    # cells actually exist.
+    horizons_for = {
+        rname: distinct_horizons(T, HORIZONS, np.isin(bod, bars), sli)
+        for rname, bars in REGIMES.items()
+    }
+
     # --- opportunity side --------------------------------------------------
     print("REALISED MOVE AND BREAK-EVEN IC (train split)")
     hdr = f"{'regime':<12}" + "".join(f"{h:>15}" for h in HORIZONS)
     print(hdr)
     sigma_tab = {}
+    aliased = []
     for rname, bars in REGIMES.items():
         entry = np.isin(bod, bars)
         line = f"{rname:<12}"
+        keep = {name: al for name, _, al in horizons_for[rname]}
         for hname, h in HORIZONS.items():
+            if hname not in keep:
+                # A relabelling of a shorter horizon; marked, not scored.
+                line += f"{'=':>15}"
+                continue
             sel = fwd_cache[h][entry & (rows < i_train)]
             sel = sel[np.isfinite(sel)]
             if sel.size < 500:
@@ -556,7 +620,13 @@ def main(argv=None):
             med = float(np.median(np.abs(sel)))
             line += f"{med:>8.1f}/{rt_cost / (sigma * SELECTIVITY_K):>6.4f}"
         print(line)
-    print("  (median |move| bps / break-even IC)")
+        for name, _, al in horizons_for[rname]:
+            if al:
+                aliased.append(f"{rname}: {', '.join(al)} == {name}")
+    print("  (median |move| bps / break-even IC;  '=' the session cap makes "
+          "this the same trade as a shorter horizon)")
+    for a in aliased:
+        print(f"  {a}")
     print()
 
     # --- benchmarks --------------------------------------------------------
@@ -602,7 +672,7 @@ def main(argv=None):
         if tr.sum() < 200 or va.sum() < 50:
             continue
 
-        for hname, h in HORIZONS.items():
+        for hname, h, _ in horizons_for[rname]:
             sigma = sigma_tab.get((rname, hname))
             if not sigma or not np.isfinite(sigma):
                 continue
