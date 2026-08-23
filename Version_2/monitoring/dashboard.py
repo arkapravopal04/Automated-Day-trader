@@ -517,23 +517,60 @@ def _spaced(label: str, gap: str = " ") -> str:
     return gap.join(label)
 
 
+def _resample_series(series: List[float], target_len: int) -> List[float]:
+    """
+    Stretch or shrink `series` to exactly `target_len` points so a trace
+    always spans its full allotted width.
+
+    Downsampling (more history than room to show it) bucket-averages, same
+    as before. Upsampling (less history than room -- the common case early
+    in a run, or whenever `history_window` hasn't filled yet) used to be a
+    no-op: the trace stayed anchored to its native short length and left
+    every remaining column blank. That looked like a completely different,
+    unstable shape every frame as history grew past the target width, and
+    for a per-column colour fade it also mislabeled genuinely-recent points
+    as "old" because they landed left of center instead of at the right
+    (most-recent) edge. Linear interpolation keeps "now" pinned to the
+    right edge at every history length.
+    """
+    if target_len <= 0 or not series:
+        return []
+    if len(series) == target_len:
+        return list(series)
+
+    if len(series) > target_len:
+        bucket = len(series) / target_len
+        return [
+            sum(chunk) / len(chunk)
+            for start, end in (
+                (int(i * bucket), max(int((i + 1) * bucket), int(i * bucket) + 1))
+                for i in range(target_len)
+            )
+            for chunk in (series[start:end],)
+        ]
+
+    if len(series) == 1:
+        return series * target_len
+
+    last = len(series) - 1
+    resampled: List[float] = []
+    for i in range(target_len):
+        position = i * last / (target_len - 1)
+        lo = int(position)
+        hi = min(lo + 1, last)
+        frac = position - lo
+        resampled.append(series[lo] * (1 - frac) + series[hi] * frac)
+    return resampled
+
+
 def _sparkline(values: List[Any], width: int = 48) -> str:
-    """Unicode block sparkline, bucket-averaged down to `width` columns."""
+    """Unicode block sparkline, resampled to exactly `width` columns."""
     series = [v for v in (_number(value) for value in values) if v is not None]
     if len(series) < 2:
         return ""
 
     width = max(4, int(width))
-
-    if len(series) > width:
-        bucket = len(series) / width
-        resampled: List[float] = []
-        for index in range(width):
-            start = int(index * bucket)
-            end = max(int((index + 1) * bucket), start + 1)
-            chunk = series[start:end]
-            resampled.append(sum(chunk) / len(chunk))
-        series = resampled
+    series = _resample_series(series, width)
 
     low = min(series)
     high = max(series)
@@ -591,15 +628,7 @@ def _braille_trace(
     sub_cols = max(2, width_chars * 2)
     sub_rows = height_rows * 4
 
-    if len(series) > sub_cols:
-        bucket = len(series) / sub_cols
-        resampled: List[float] = []
-        for index in range(sub_cols):
-            start = int(index * bucket)
-            end = max(int((index + 1) * bucket), start + 1)
-            chunk = series[start:end]
-            resampled.append(sum(chunk) / len(chunk))
-        series = resampled
+    series = _resample_series(series, sub_cols)
 
     low, high = min(series), max(series)
     span = high - low
@@ -1795,13 +1824,20 @@ class TrainingDashboard:
                 position_text = f"{position:+.2f}"
                 position_color = _C_UP if position > 0 else _C_DOWN
 
+            net_worth_text = (
+                _fmt_money_compact(row["net_worth"])
+                if row["net_worth"] is not None
+                else "—"
+            )
+
             cells.append(
                 Text.from_markup(
                     f"[{marker_color}]{marker}[/]"
                     f"[bold {_C_TEXT}]{str(row['ticker'])[:6]:<6}[/] "
                     f"[{_C_TEXT}]{price:>8}[/]"
                     f"[{color}]{arrow}[/]"
-                    f"[{position_color}]{position_text:>7}[/]"
+                    f"[{position_color}]{position_text:>7}[/]\n"
+                    f" [{_C_MUTE}]{net_worth_text}[/]"
                 )
             )
 
