@@ -25,7 +25,11 @@ halves:
 
     edge_bps  = ic * SELECTIVITY_K * sigma_h
     net_bps   = edge_bps - round_trip_cost
-    sharpe    = (net_bps / sigma_h) * sqrt(bets_per_year)
+    sharpe    = (net_bps / sigma_h) * sqrt(bets_per_year * SELECTIVITY_FRACTION)
+
+SELECTIVITY_K and SELECTIVITY_FRACTION are one assumption, not two: a trader
+who only takes the top decile gets 1.75x the edge AND one tenth of the bets.
+Taking the first without the second overstated every cell here by 3.16x.
 
 `bets_per_year` respects the fact that a position held h bars cannot be
 re-entered every bar. This is per name and assumes no diversification -- a
@@ -85,6 +89,13 @@ TRADING_DAYS = 252
 # The policy need not trade every bar; this is the concentration a top-decile
 # selective trader gets on the same signal.
 SELECTIVITY_K = 1.75
+
+# The fraction of opportunities that same top-decile trader actually takes.
+# SELECTIVITY_K is the edge concentration selectivity buys; this is what it
+# costs in bet count. They are two halves of one assumption and net_sharpe()
+# must apply both -- applying only the first overstated every cell in this
+# gate by sqrt(1/0.10) = 3.16x. Change them together or not at all.
+SELECTIVITY_FRACTION = 0.10
 
 # Order participation assumed for the impact term. NOT zero: at zero the
 # impact term vanishes and the round trip prices at 3.64 bps, while the two
@@ -485,11 +496,30 @@ def bets_per_year(regime_bars, h):
 
 
 def net_sharpe(ic, sigma_bps, rt_cost_bps, n_bets):
-    """Annual Sharpe per name, net of round-trip cost, no diversification."""
+    """Annual Sharpe per name, net of round-trip cost, no diversification.
+
+    SELECTIVITY AND BET COUNT MUST AGREE. The earlier form took the top-decile
+    edge concentration (SELECTIVITY_K = 1.75) and then multiplied by
+    sqrt(n_bets) for EVERY opportunity -- claiming both the selectivity of a
+    trader who sits out 90% of bars and the bet count of one who never does.
+    That inflated every cell by sqrt(1 / SELECTIVITY_FRACTION) = 3.16x, which
+    is the whole gap between the gate reporting Sharpe 0.96 on
+    all/next_close/uni:log_ret_1560 and a portfolio backtest of the same signal
+    returning ~0.3. Both consistent readings agree at ~0.30:
+
+        trade everything   edge = ic * 1.00 * sigma, bets = n_bets
+        top-decile         edge = ic * 1.75 * sigma, bets = n_bets * 0.10
+
+    The selective form is kept because it is the higher of the two and the
+    honest ceiling, but the bet count is now scaled to match it.
+    """
     if not np.isfinite(ic) or sigma_bps <= 0 or n_bets <= 0:
         return np.nan
     edge = ic * SELECTIVITY_K * sigma_bps
-    return ((edge - rt_cost_bps) / sigma_bps) * math.sqrt(n_bets)
+    effective_bets = n_bets * SELECTIVITY_FRACTION
+    if effective_bets <= 0:
+        return np.nan
+    return ((edge - rt_cost_bps) / sigma_bps) * math.sqrt(effective_bets)
 
 
 def breadth_factor(signal, n_names):

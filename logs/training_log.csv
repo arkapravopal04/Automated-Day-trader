@@ -1,0 +1,2 @@
+episode,ticker,total_reward,final_balance,growth_pct,num_trades,win_rate,max_drawdown,std,new_best,is_bankrupt
+1,ADANIPORTS.NS,-41.1195,9762.45,-2.38,208,0.4856,0.0721,0.4491,False,False

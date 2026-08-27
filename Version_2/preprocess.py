@@ -40,7 +40,27 @@ if hasattr(sys.stdout, "reconfigure"):
 # Configuration Parameters
 HORIZONS = [3, 6, 12] # Lag steps representing 15m, 30m, and 1h past returns
 RV_WINDOW = 12 # Realized volatility rolling window (1 hour)
-VOL_WINDOW = 78 # Volume z-score rolling window (1 full trading day)
+BARS_PER_SESSION = 78 # RTH 5-min bars in one session (09:30-16:00)
+VOL_WINDOW = BARS_PER_SESSION # Volume z-score rolling window (1 full trading day)
+
+# Multi-day short-term reversal, in bars. These are NOT part of HORIZONS and
+# are deliberately computed differently: HORIZONS features are session-reset
+# cumulative sums that must never straddle the overnight gap, whereas reversal
+# is a close-to-close effect that only exists ACROSS sessions. Running these
+# through the HORIZONS loop would silently reduce them to "return since this
+# morning's open" -- for any h > 78 the session reset makes the two identical.
+#
+# Added after the alpha gate found them to be the only signal in the panel that
+# clears cost: walk-forward over 5 folds spanning 2022-10 to 2026-01 gives net
+# Sharpe positive in every fold (min 0.28, mean 0.80-0.97 per name) with the
+# train-split sign consistently NEGATIVE in all folds, i.e. genuine reversal.
+# Everything shorter fails: the intraday reversal in the close ramp reaches
+# t=6.2 and still prices at Sharpe -10 because the hold is too short to
+# amortise the 9.1 bps round trip.
+REVERSAL_HORIZONS = {
+    'log_ret_5d': 5 * BARS_PER_SESSION,
+    'log_ret_20d': 20 * BARS_PER_SESSION,
+}
 
 # Feature columns, in the order they appear in the tensor. Defined once here
 # so process_ticker()'s finite-check and generate_features_and_metadata()'s
@@ -55,11 +75,18 @@ VOL_WINDOW = 78 # Volume z-score rolling window (1 full trading day)
 # does, which is the intended split. Renaming a column here without checking
 # that tuple silently breaks mirroring: mirrored streams get flipped prices
 # against unflipped signals.
+#
+# 'log_ret_5d'/'log_ret_20d' match "ret" and so are sign-flipped, which is
+# correct: they are directional return features like every other log_ret_*.
 FEATURE_COLUMNS = (
     ['log_ret', 'overnight_ret', 'is_overnight', 'rv', 'vol_z', 'time_sin', 'time_cos']
     + [f'log_ret_{h}' for h in HORIZONS]
+    + list(REVERSAL_HORIZONS)
     + ['vwap_dev', 'intrabar_pres', 'xs_resid']
 )
+
+if set(REVERSAL_HORIZONS) & {f'log_ret_{h}' for h in HORIZONS}:
+    raise ValueError("REVERSAL_HORIZONS collides with a HORIZONS column name")
 
 if len(HORIZONS) != len(set(HORIZONS)):
     raise ValueError(f"HORIZONS contains duplicate values: {HORIZONS} -- would create duplicate feature columns")
@@ -83,7 +110,9 @@ RTH_START_MIN = 9 * 60 + 30
 RTH_END_MIN = 16 * 60
 # Longest rolling window used anywhere below -- used to sanity-check that a
 # ticker has enough history to produce any non-NaN feature rows.
-MIN_ROWS_REQUIRED = max(VOL_WINDOW, RV_WINDOW, max(HORIZONS)) + 1
+MIN_ROWS_REQUIRED = max(
+    VOL_WINDOW, RV_WINDOW, max(HORIZONS), max(REVERSAL_HORIZONS.values())
+) + 1
 
 
 def _atomic_write_parquet(df: pd.DataFrame, out_path: str) -> None:
@@ -281,6 +310,16 @@ def process_ticker(ticker: str) -> pd.DataFrame:
     for h in HORIZONS:
         prior = cum.shift(h).where(session_date == session_date.shift(h), 0.0)
         df[f'log_ret_{h}'] = cum - prior
+
+    # 2b. Multi-day short-term reversal (see REVERSAL_HORIZONS).
+    # Plain close-to-close over h bars, deliberately crossing session
+    # boundaries -- the effect lives in the multi-day drift, so the session
+    # reset applied above would destroy it rather than protect it. Leading
+    # rows are NaN and are removed by the dropna() below, costing one warmup
+    # window per ticker (20 sessions at the longest horizon).
+    log_close = np.log(df['close'])
+    for name, h in REVERSAL_HORIZONS.items():
+        df[name] = log_close - log_close.shift(h)
 
     # 3. Annualized Realized Volatility
     # Calculation: standard deviation of recent returns scaled by annualizing factor

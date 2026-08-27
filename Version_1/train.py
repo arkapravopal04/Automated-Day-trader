@@ -7,6 +7,14 @@ import random
 import os
 import sys
 import csv
+
+# Windows consoles / redirected pipes default to cp1252, which cannot encode the
+# currency symbols and box characters used below.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):
+        pass
  
 from engine import Tensor
 from Neural_Nets import LSTM, Conv2D, Flatten, Attention, MultiHeadAttention,FusionLayers, RegimeDetector
@@ -20,7 +28,7 @@ from telemetry import Telemetry
 
 import environment as _env_check
 print(f"[IMPORT CHECK] env loaded from: {_env_check.__file__}")
-print(f"[IMPORT CHECK] R_STEP_SCALE={_env_check.R_STEP_SCALE}")
+print(f"[IMPORT CHECK] R_STRESS_SCALE={_env_check.R_STRESS_SCALE}")
 print(f"[IMPORT CHECK] TradingEnvironment reset method: {_env_check.TradingEnvironment.reset}")
 
 
@@ -72,7 +80,12 @@ def load_best_net_worth(log_path, initial_balance):
     return best
 
 
-BASE_PATH = '/kaggle/working' if os.path.exists('/kaggle') else '.'
+# NOTE: on Windows a bare '/kaggle' path resolves to C:\kaggle, so a plain
+# os.path.exists('/kaggle') check false-positives locally.
+IS_KAGGLE = bool(os.environ.get('KAGGLE_KERNEL_RUN_TYPE')) or (
+    os.name == 'posix' and os.path.isdir('/kaggle/working')
+)
+BASE_PATH = '/kaggle/working' if IS_KAGGLE else '.'
 os.makedirs(f"{BASE_PATH}/models", exist_ok=True)
 os.makedirs(f"{BASE_PATH}/logs", exist_ok=True)
  
@@ -81,7 +94,7 @@ CHECKPOINT_PATH  = f"{BASE_PATH}/models/checkpoint.pkl"
 LOG_PATH         = f"{BASE_PATH}/logs/training_log.csv"
 
 # $ , ₹, €
-currency_units = "₹"  # use symbol corresponding to currency
+currency_units = "hii"  # use symbol corresponding to currency
 TICKERS = ["ADANIPORTS.NS", "TCS.NS", "INFY.NS", "ITC.NS", "ICICIBANK.NS", "RELIANCE.NS"]
 #TICKERS = ["YESBANK.NS", "ICICIBANK.NS", "HINDUNILVR.NS", "TCS.NS", "RELIANCE.NS", "LT.NS", "ADANIPORTS.NS", "ITC.NS", "INFY.NS", "ZEEL.NS"]
 START_DATE = "2015-01-01"
@@ -95,6 +108,8 @@ INITIAL_BALANCE = 10000
 RESET_CRITIC = False 
 RESET_ACTOR = False
 #remomvber to change this
+
+TBPTT_CHUNK = 32   # must match CHUNK_SIZE in agent.py
 
 CNN_FLAT_SIZE = 128
 FUSED_STATE_SIZE = 75
@@ -160,6 +175,7 @@ agent = PPOAgent(
     flatten=flatten,
     regime=regime,
     fusion=fusion,
+    num_envs=1,
 )
 
 
@@ -189,7 +205,8 @@ try:
         env = TradingEnvironment(
             X, y, lstm, attention, cnn, flatten,
             regime, fusion, nlp, prices,
-            initial_balance=INITIAL_BALANCE
+            initial_balance=INITIAL_BALANCE,
+            symbol=ticker,
         )
         env.precomputed_nlp = Tensor(np.zeros((1, 64), dtype=np.float64))
 
@@ -201,19 +218,39 @@ try:
         winning_trades= 0
         episode_net_worths = [INITIAL_BALANCE]
         episode_bankrupt= False
+        dir_mean = 0.0
+        step_count = 0
 
 
 
-        out = agent._actor_forward(state)
-        dir_mean  = float(out[0].tanh().data.flat[0])
-        size_mean = float(out[1].sigmoid().data.flat[0])
+        # actor head now emits 3 direction logits + 1 size logit
+        dir_logits, size_out = agent._actor_forward(state)
+        probs      = np.exp(dir_logits.data - np.max(dir_logits.data))
+        probs      = (probs / (probs.sum() + 1e-8)).flatten()
+        dir_mean   = float(probs[2] - probs[0])
+        size_mean  = float(size_out.sigmoid().data.flat[0])
         print(f"[ACTOR] {ticker} ep{episode} | dir_mean={dir_mean:.3f} size_mean={size_mean:.3f} | std={agent.std:.3f}")
 
 
         while not done:
-            action                         = agent.select_action(state)
+            # the agent is vectorized now — drive it with a batch of one env
+            actions = agent.select_vectorized_action([state])
+            action  = actions[0]
+            dir_mean = float(agent._last_dir_probs[0][2] - agent._last_dir_probs[0][0])
+
             next_state, reward, done, info = env.step(action)
-            agent.rewards.append(reward)
+
+            # snapshot raw input (+ LSTM h/c at chunk boundaries) for TBPTT replay
+            raw_s, h_snap, c_snap = env.get_raw_state()
+            is_chunk_boundary = (step_count % TBPTT_CHUNK == 0)
+
+            agent.store_vectorized_transition(
+                [reward], [done],
+                adjusted_actions=[info['adjusted_action']],
+                raw_inputs=[raw_s],
+                lstm_h_snaps=[h_snap if is_chunk_boundary else None],
+                lstm_c_snaps=[c_snap if is_chunk_boundary else None],
+            )
 
             if info.get('is_bankrupt', False):
                 episode_bankrupt = True
@@ -244,18 +281,25 @@ try:
                 std=agent.std,num_trades=num_trades,
                 winning_trades=winning_trades, total_reward=total_reward,
                 milestones_crossed=env.milestones_crossed,
+                dir_mean=dir_mean,
+                action_direction=float(action[0]), action_size=float(action[1]),
                 r_trade=env.last_reward_breakdown['trade'],
                 r_step=env.last_reward_breakdown['step'],
                 r_hold_loser=env.last_reward_breakdown['hold_loser'],
                 r_stress=env.last_reward_breakdown['stress'],
+                r_premature_close=env.last_reward_breakdown['premature_close'],
                 r_milestone=env.last_reward_breakdown['milestone'],
                 r_terminal=env.last_reward_breakdown['terminal'],
                 r_total=env.last_reward_breakdown['total'],)
+
+            step_count += 1
             if next_state is not None:
                 state = next_state
 
-        head_norm, ext_norm = agent.update()
-        telemetry.update_grad_norms(head_norm, ext_norm)
+        # bootstrap the terminal value, then run the PPO update
+        next_values = agent.get_vectorized_values([next_state])
+        head_norm, ext_norm, fus_norm = agent.update(next_values=next_values)
+        telemetry.update_grad_norms(head_norm, ext_norm, fus_norm)
 
         final_net_worth = env.net_worth
         win_rate = winning_trades / num_trades if num_trades > 0 else 0.0
@@ -287,6 +331,7 @@ try:
             num_trades=num_trades,win_rate=win_rate,
             max_drawdown=max_drawdown,std=agent.std,
             bankrupt=episode_bankrupt,
+            dir_mean=dir_mean,
         )
 
         if is_new_best:
