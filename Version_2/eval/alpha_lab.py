@@ -371,6 +371,104 @@ def cross_sectional_demean(a):
 
 
 # ---------------------------------------------------------------------------
+# Volatility-conditioned feature augmentation
+# ---------------------------------------------------------------------------
+
+# Directional features worth conditioning on volatility. Deliberately only the
+# return/reversal family: these are the ones with a sign that means "up" or
+# "down", so scaling or regime-splitting them is meaningful. Conditioning
+# is_overnight or time_sin on volatility would just manufacture noise columns
+# and inflate the Benjamini-Hochberg denominator for nothing.
+AUGMENT_BASE = ("log_ret", "log_ret_3", "log_ret_6", "log_ret_12",
+                "log_ret_5d", "log_ret_20d", "vwap_dev", "xs_resid")
+
+# Feature carrying the volatility read. First match wins.
+AUGMENT_VOL = ("vol_z", "rv")
+
+
+def _vol_rank(vol):
+    """Per-bar cross-sectional rank of `vol` (T, N) mapped to (0, 1].
+
+    A RANK, not the raw value, because preprocess.py z-scores every feature on
+    train-split statistics: `rv`/`vol_z` arrive centred near zero and can be
+    negative, so dividing a signal by them directly would flip its sign on
+    roughly half the panel and explode near zero. The cross-sectional rank is
+    strictly positive, bounded, and scale-free, so it survives whatever
+    normalisation upstream applied. NaN volatility ranks to the middle (0.5)
+    rather than dropping the observation.
+    """
+    T, N = vol.shape
+    out = np.full((T, N), 0.5, dtype=np.float32)
+    for t in range(T):
+        v = vol[t]
+        ok = np.isfinite(v)
+        n = int(ok.sum())
+        if n < 2:
+            continue
+        order = np.argsort(np.argsort(v[ok]))
+        out[t, ok] = (order + 1.0) / n
+    return out
+
+
+def augment_features(X, features):
+    """Append volatility-conditioned variants of the directional features.
+
+    Three variants per base feature, addressing the two things asked of them:
+
+      vsc:<f>  volatility-SCALED and cross-sectionally CENTRED.
+               f / (0.5 + vol_rank) down-weights high-volatility names so a
+               few noisy ones cannot dominate, then the per-bar cross-
+               sectional mean is removed. Centring is what makes this a
+               directional-bias fix: a signal with zero cross-sectional mean
+               every bar cannot express a systematic long or short tilt, so
+               the long/short imbalance is removed by construction rather
+               than penalised after the fact the way the env's
+               _diversity_bonus() does it.
+
+      vch:<f>  the signal, live only in the HIGH-volatility half of the
+      vcl:<f>  cross-section (vol_rank > 0.5) / the LOW-volatility half.
+               Splitting rather than interacting (f * vol_z) keeps each
+               column on the same scale as its parent and makes an
+               asymmetric result readable: if reversal only pays when
+               volatility is high, vch scores and vcl does not.
+
+    Returns (X_aug, features_aug). A no-op returning the inputs unchanged if
+    no volatility feature is present, so this cannot silently half-apply.
+    """
+    vol_name = next((v for v in AUGMENT_VOL if v in features), None)
+    if vol_name is None:
+        print("[augment] no volatility feature "
+              f"({'/'.join(AUGMENT_VOL)}) in panel -- skipped")
+        return X, features
+
+    base = [f for f in AUGMENT_BASE if f in features]
+    if not base:
+        print("[augment] no directional base features in panel -- skipped")
+        return X, features
+
+    vr = _vol_rank(X[:, :, features.index(vol_name)])
+    scale = (0.5 + vr)[:, :, None]          # in [0.5, 1.5], never zero
+    hi = (vr > 0.5)[:, :, None]
+
+    idx = [features.index(f) for f in base]
+    B = X[:, :, idx]
+
+    vsc = cross_sectional_demean(B / scale)
+    vch = np.where(hi, B, 0.0).astype(np.float32)
+    vcl = np.where(hi, 0.0, B).astype(np.float32)
+
+    X_aug = np.concatenate([X, vsc, vch, vcl], axis=2).astype(np.float32)
+    features_aug = (list(features)
+                    + [f"vsc:{f}" for f in base]
+                    + [f"vch:{f}" for f in base]
+                    + [f"vcl:{f}" for f in base])
+    print(f"[augment] vol feature '{vol_name}', {len(base)} base "
+          f"({', '.join(base)}) -> +{3 * len(base)} columns, "
+          f"{len(features)} -> {len(features_aug)} features")
+    return X_aug, features_aug
+
+
+# ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
 
@@ -588,6 +686,12 @@ def main(argv=None):
                          "reproduces the round trip the live runs paid)")
     ap.add_argument("--top", type=int, default=25, help="rows to print")
     ap.add_argument("--json", type=str, default=None, help="write results here")
+    ap.add_argument("--augment", dest="augment", action="store_true", default=True,
+                    help="add volatility-scaled/centred (vsc:) and "
+                         "vol-regime-split (vch:/vcl:) variants of the "
+                         "directional features (default on)")
+    ap.add_argument("--no-augment", dest="augment", action="store_false",
+                    help="score only the panel's own features, as before")
     args = ap.parse_args(argv)
 
     cost_bps, cost_desc = build_cost_model(args.participation)
@@ -599,6 +703,11 @@ def main(argv=None):
     panel = load_panel(args.tickers)
     X, P = panel["X"], panel["P"]
     features, tickers = panel["features"], panel["tickers"]
+    if args.augment:
+        # Before any split index is taken: the augmentation is a per-bar
+        # cross-sectional transform, so it never reads across time and cannot
+        # leak validation information backwards into train.
+        X, features = augment_features(X, features)
     day_id, bod = panel["day_id"], panel["bar_of_day"]
     T, N = P.shape
 
