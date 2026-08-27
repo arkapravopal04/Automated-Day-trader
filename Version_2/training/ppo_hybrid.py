@@ -626,6 +626,15 @@ class AdaptiveEntropyCoef:
     max_coef) until entropy comes back. Falling below target is self-
     correcting rather than terminal.
 
+    ASYMMETRIC, because that update is a pure integrator and a pure integrator
+    always lags. On run 19 it did recover a collapse the fixed-coefficient
+    version never recovered -- entropy 0.156 at rollout 59 back to 0.988 by
+    71 -- but only after ~19 rollouts of phase lag, undershooting to 31% of
+    target and then overshooting to ~2x it: a limit cycle, not a hold. Since
+    undershooting ends the run's usefulness and overshooting only costs some
+    exploration budget, the climb runs lr_up_mult times faster than the decay.
+    See PPOConfig.entropy_coef_lr_up_mult.
+
     ON THE TARGET. For the 3-way SHORT/FLAT/LONG head, max entropy is
     ln(3) = 1.0986 nats. A target of 0.5 still permits ~85% of the mass on one
     action -- (0.8, 0.1, 0.1) measures 0.639 nats -- so this floors exploration
@@ -657,9 +666,10 @@ class AdaptiveEntropyCoef:
     """
 
     def __init__(self, target, init_coef, lr=0.1, min_coef=0.005, max_coef=2.0,
-                 warmup_rollouts=0):
+                 warmup_rollouts=0, lr_up_mult=1.0):
         self.target = float(target)
         self.lr = float(lr)
+        self.lr_up_mult = float(lr_up_mult)
         self.min_coef = float(min_coef)
         self.max_coef = float(max_coef)
         self.warmup_rollouts = int(warmup_rollouts)
@@ -681,7 +691,13 @@ class AdaptiveEntropyCoef:
         m = float(measured_entropy)
         if not math.isfinite(m):
             return
-        self._log_coef += self.lr * (self.target - m)
+        # Asymmetric step: climbing (entropy below target) is lr_up_mult times
+        # faster than decaying. See PPOConfig.entropy_coef_lr_up_mult for the
+        # measured lag this exists to remove, and why the two directions carry
+        # very different costs. lr_up_mult = 1.0 is the symmetric controller.
+        err = self.target - m
+        step = self.lr * (self.lr_up_mult if err > 0.0 else 1.0)
+        self._log_coef += step * err
         # Clamp in log space too, or the coefficient can wind up far outside
         # the usable band while coef() silently saturates and the controller
         # then takes many epochs to respond to a genuine entropy recovery.
@@ -693,6 +709,7 @@ class AdaptiveEntropyCoef:
         # records what it was trained under -- but are NOT read back on load;
         # see load_state_dict().
         return {"log_coef": self._log_coef, "target": self.target, "lr": self.lr,
+                "lr_up_mult": self.lr_up_mult,
                 "min_coef": self.min_coef, "max_coef": self.max_coef,
                 "warmup_rollouts": self.warmup_rollouts}
 

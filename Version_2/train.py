@@ -519,6 +519,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             min_coef=cfg.ppo.entropy_coef_min,
             max_coef=cfg.ppo.entropy_coef_max,
             warmup_rollouts=cfg.ppo.entropy_coef_warmup_rollouts,
+            lr_up_mult=cfg.ppo.entropy_coef_lr_up_mult,
         )
         if resume_path is not None and "entropy_ctl" in checkpoint:
             entropy_ctl.load_state_dict(checkpoint["entropy_ctl"])

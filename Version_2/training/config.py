@@ -590,6 +590,43 @@ class PPOConfig:
     target_entropy_discrete: "Optional[float]" = 0.5   # nats; ln(3)=1.0986 is the max
     entropy_coef_lr: float = 0.1                        # dual-ascent step, per PPO epoch
 
+    # Asymmetry: how much faster the coefficient climbs (entropy BELOW target)
+    # than it decays (entropy above). 1.0 restores the symmetric controller.
+    #
+    # The symmetric version is a pure integrator, so it can only respond to
+    # ACCUMULATED error and always lags. Measured on the run 19 trace: entropy
+    # crossed the 0.5 target at rollout 46, and the coefficient did not reach
+    # the level that actually reversed the fall (~0.20) until rollout 65 --
+    # about 19 rollouts of phase lag, during which entropy undershot to 0.156,
+    # 31% of target. It then overshot back to 0.988, ~2x target. The run
+    # survived (unlike the terminal collapse in report.md Sec 12) but settled
+    # into a limit cycle rather than holding near target.
+    #
+    # The two directions are not equally costly, so a symmetric response is
+    # the wrong prior: undershooting collapses the policy into always-FLAT and
+    # ends the run's usefulness, while overshooting merely spends some
+    # exploration budget. Only the CLIMB is accelerated -- the decay stays at
+    # lr, so an overshoot still unwinds at the old rate and cannot latch high.
+    #
+    # 3.0 rather than something larger. Replaying run 19's measured entropy
+    # trace through the controller, the coefficient at rollout 59 reaches:
+    #     mult 1.0 -> 0.12   (what actually happened; too slow)
+    #     mult 2.0 -> 0.30
+    #     mult 4.0 -> 1.80   <- near max_coef, the "policy is just noise" end
+    #     mult 6.0 -> 2.00   (saturated)
+    # That replay is OPEN-LOOP -- it feeds the historical entropy regardless of
+    # what the coefficient does, so it overstates the peak (in a real run the
+    # rising coefficient lifts entropy, the error flips sign, and the climb
+    # stops). But it brackets the risk, and 4.0+ sits close enough to
+    # saturation that the extra speed is not worth it. 3.0 cuts the lag roughly
+    # threefold; entropy should turn near 0.30 rather than 0.156.
+    #
+    # SATURATION SIGNATURE, if this is ever retuned upward: entropy_coef_
+    # discrete climbing past ~1.0 while entropy_discrete is STILL falling.
+    # That is the controller losing the race, not winning it, and the answer is
+    # a lower multiplier or a different lever -- not a higher max_coef.
+    entropy_coef_lr_up_mult: float = 3.0
+
     # entropy_coef_min raised 0.005 -> 0.05, to equal entropy_coef_discrete's
     # init value. A fresh discrete head starts near ln(3), well above the 0.5
     # target, before it has learned anything -- the controller cannot tell
