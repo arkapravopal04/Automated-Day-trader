@@ -518,6 +518,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             lr=cfg.ppo.entropy_coef_lr,
             min_coef=cfg.ppo.entropy_coef_min,
             max_coef=cfg.ppo.entropy_coef_max,
+            warmup_rollouts=cfg.ppo.entropy_coef_warmup_rollouts,
         )
         if resume_path is not None and "entropy_ctl" in checkpoint:
             entropy_ctl.load_state_dict(checkpoint["entropy_ctl"])
@@ -546,7 +547,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         kelly_diag = kelly_sizer.diagnostics()
         compute_gae(buffer, final_value, cfg.ppo.gamma, cfg.ppo.gae_lambda)
         stats = ppo_update(actor_critic, optimizer, buffer, cfg, scaler=scaler,
-                           entropy_ctl=entropy_ctl)
+                           entropy_ctl=entropy_ctl, rollout_idx=rollout_idx)
 
         # DRAWDOWN-METRIC FIX: snapshot peak_equity BEFORE either reset
         # branch below can touch it. The periodic branch's

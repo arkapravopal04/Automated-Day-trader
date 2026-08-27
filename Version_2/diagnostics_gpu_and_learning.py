@@ -106,6 +106,8 @@ def build_synthetic_buffer(
         filled_qty=filled_qty,
         reward=advantages.clone(),
         done=done,
+        # No KillSwitch / real env here -- nothing to mask out.
+        attention_mask=torch.zeros(T, n_envs, dtype=torch.bool, device=device),
         initial_hidden=(hidden[0].clone(), hidden[1].clone()),
     )
     buffer.advantages = advantages

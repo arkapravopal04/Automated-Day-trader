@@ -252,7 +252,15 @@ class LiveLoop:
         current_position_notional = self.portfolio.positions[:, 0] * mid_price
 
         with torch.no_grad():
-            trunk, self.hidden = self.actor_critic.forward_features(obs, self.hidden)
+            # Same cross-asset attention mask training uses -- see
+            # training/ppo_hybrid.py's collect_rollout(). A halted stream or
+            # one with no print this bar must not participate in attention,
+            # or live inference sees a different cross-sectional structure
+            # than the policy was trained under.
+            attention_mask = self.kill_switch.is_halted() | self._no_trade_mask(raw_windows)
+            trunk, self.hidden = self.actor_critic.forward_features(
+                obs, self.hidden, ticker_mask=attention_mask
+            )
             action_sample = self.actor_critic.policy_head.act(trunk, deterministic=True)
 
         size_shares = HybridPolicyHead.rescale_size(
@@ -549,6 +557,31 @@ class LiveLoop:
                 f"${account_equity:,.2f}) -- scaled all new orders by {scale:.3f}"
             )
         return final_direction, final_size
+
+    def _no_trade_mask(self, raw_windows: Dict[str, RawBarWindow]) -> torch.Tensor:
+        """
+        [n_tickers] bool, True where the most recent bar reports zero traded
+        volume -- a halt or a gap where the print never arrived.
+
+        Live counterpart to VecTradingEnv._current_bar_no_trade_mask(), which
+        reads the same signal off the offline volume panel. Both feed
+        model/cross_attention.py's ticker_mask so a stream with no real print
+        this bar is excluded from cross-asset attention instead of leaking a
+        stale, flat state into every other stream's cross-sectional view.
+        Training and live MUST derive this the same way or the model sees a
+        different attention structure live than it trained under.
+
+        Empty-window handling is deliberately not duplicated here:
+        _extract_mid_price() already raises on a ticker with no bars, and
+        step_once() calls it before this, so a missing window has aborted the
+        cycle long before this runs. The `not volumes` branch is a belt-and-
+        braces default for any future caller that reorders those two.
+        """
+        flags = []
+        for ticker in self.tickers:
+            volumes = raw_windows[ticker].volume
+            flags.append((not volumes) or volumes[-1] <= 0.0)
+        return torch.tensor(flags, device=self.device, dtype=torch.bool)
 
     def _extract_mid_price(self, raw_windows: Dict[str, RawBarWindow]) -> torch.Tensor:
         prices = []

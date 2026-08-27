@@ -928,6 +928,24 @@ class VecTradingEnv:
         t = self.current_idx + self.window_size - 1
         return self.volumes[t]  # [n_envs]
 
+    def _current_bar_no_trade_mask(self) -> Tensor:
+        """
+        [n_envs] bool, True where this bar's real traded volume is exactly
+        zero -- a halt or missing-bar gap, per load_aligned_volumes()'s
+        deliberate fillna(0) (as opposed to price's ffill). Same time index
+        as _current_prices() / _bar_liquidity_proxy().
+
+        Exists so a caller can exclude a stream with no real print this bar
+        from cross-asset attention (model/cross_attention.py's ticker_mask):
+        its price is a stale ffilled carry-forward, not a genuine read on
+        that asset, and letting it attend/be-attended-to as if it were one
+        leaks a flat artifact into every other stream's cross-sectional
+        state. Distinct from KillSwitch.is_halted(), which flags a stream
+        this project's own risk logic froze -- this flags a stream the
+        EXCHANGE gave no real data for.
+        """
+        return self._bar_liquidity_proxy() <= 0.0
+
     def step(
         self,
         direction: Tensor,      # [n_envs], in {-1, 0, 1}

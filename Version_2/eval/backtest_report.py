@@ -149,7 +149,15 @@ def run_backtest(
                 equity_before = env.portfolio.equity(mid_price.unsqueeze(1))
                 current_position_notional = env.portfolio.positions[:, 0] * mid_price
 
-                trunk, hidden = actor_critic.forward_features(obs, hidden)
+                # Same cross-asset attention mask training uses -- see
+                # training/ppo_hybrid.py's collect_rollout(). Scoring the
+                # policy with a DIFFERENT attention mask than it trained
+                # under is a train/eval mismatch of exactly the kind this
+                # backtest exists to rule out (cf. _apply_flat_intent below).
+                # Unconditional on use_risk_pipeline: is_halted() is simply
+                # all-False in bare-policy mode, since nothing trips it there.
+                attention_mask = kill_switch.is_halted() | env._current_bar_no_trade_mask()  # noqa: SLF001
+                trunk, hidden = actor_critic.forward_features(obs, hidden, ticker_mask=attention_mask)
                 action_sample = actor_critic.policy_head.act(trunk, deterministic=True)
 
                 size_shares = HybridPolicyHead.rescale_size(

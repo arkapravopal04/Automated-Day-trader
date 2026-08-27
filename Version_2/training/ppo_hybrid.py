@@ -128,11 +128,20 @@ class HybridActorCritic(nn.Module):
     def init_hidden(self, batch_size: int, device: torch.device) -> Hidden:
         return self.lstm.init_hidden(batch_size, device)
 
-    def forward_features(self, obs: Tensor, hidden: Hidden) -> Tuple[Tensor, Hidden]:
+    def forward_features(
+        self, obs: Tensor, hidden: Hidden, ticker_mask: Optional[Tensor] = None
+    ) -> Tuple[Tensor, Hidden]:
         """
         obs: [batch, window, n_features] for this single rollout step
              (batch == n_envs == n_tickers, per the project's convention).
         hidden: (h, c) carried in from the previous rollout step.
+        ticker_mask: optional bool [batch], True where that stream should be
+             EXCLUDED from cross-asset attention this step -- a risk halt
+             (KillSwitch.is_halted()) or a real no-bar gap
+             (env._current_bar_no_trade_mask()). See
+             model/cross_attention.py's own docstring for why this matters:
+             without it, a stale/flat stream still attends to and is
+             attended by every other stream as if its state meant something.
 
         Returns (trunk, new_hidden). `trunk` feeds both policy_head and
         critic_head; new_hidden must be threaded to the NEXT call.
@@ -141,7 +150,8 @@ class HybridActorCritic(nn.Module):
         cnn_last = cnn_seq[:, -1, :]                   # [batch, cnn_dim]
         lstm_seq, new_hidden = self.lstm(cnn_seq, hidden)  # [batch, window, lstm_dim]
         lstm_last = lstm_seq[:, -1, :]                 # [batch, lstm_dim]
-        attn_out = self.cross_attn(lstm_last)          # [batch, lstm_dim] -- batch doubles as the ticker axis
+        # batch doubles as the ticker axis
+        attn_out = self.cross_attn(lstm_last, ticker_mask=ticker_mask)  # [batch, lstm_dim]
         trunk = self.fusion(cnn_last, attn_out)         # [batch, trunk_dim]
         return trunk, new_hidden
 
@@ -163,6 +173,10 @@ class RolloutBuffer:
                                # trade-count/turnover metrics -- see vec_trading_env.py's info["filled_qty"]
     reward: Tensor           # [T, n_envs] -- shaped reward actually used for GAE
     done: Tensor              # [T, n_envs] bool
+    attention_mask: Tensor   # [T, n_envs] bool -- True where that stream was excluded from cross-asset
+                               # attention this step (KillSwitch.is_halted() OR env's no-real-bar gap, see
+                               # collect_rollout()). MUST be replayed unchanged during ppo_update() -- see
+                               # _replay_trunk_sequence()'s docstring.
     initial_hidden: Hidden   # (h0, c0) at the START of this rollout -- replayed from fresh each PPO epoch
     advantages: Optional[Tensor] = None  # [T, n_envs], filled in by compute_gae()
     returns: Optional[Tensor] = None     # [T, n_envs], filled in by compute_gae()
@@ -343,6 +357,7 @@ def collect_rollout(
     filled_qty_buf: List[Tensor] = []
     reward_buf: List[Tensor] = []
     done_buf: List[Tensor] = []
+    attention_mask_buf: List[Tensor] = []
 
     initial_hidden = (hidden[0].clone().detach(), hidden[1].clone().detach())
 
@@ -364,7 +379,17 @@ def collect_rollout(
             position_before = torch.sign(env.portfolio.positions[:, 0])
             current_position_notional = env.portfolio.positions[:, 0] * mid_price
 
-            trunk, new_hidden = actor_critic.forward_features(obs, hidden)
+            # Streams to exclude from cross-asset attention this step: a risk
+            # halt (this project's own kill switch) or a real no-bar gap (the
+            # exchange gave no print) -- see forward_features()'s docstring
+            # and model/cross_attention.py's own. Captured BEFORE the action
+            # pipeline runs (kill_switch.apply() below doesn't change
+            # is_halted()'s value, but reading it here keeps the mask
+            # anchored to the same instant as `obs`/`hidden`, not to
+            # whatever kill_switch looks like after this step's env.step()).
+            attention_mask = kill_switch.is_halted() | env._current_bar_no_trade_mask()  # noqa: SLF001
+
+            trunk, new_hidden = actor_critic.forward_features(obs, hidden, ticker_mask=attention_mask)
             action_sample: HybridActionSample = actor_critic.policy_head.act(trunk, deterministic=False)
             values = actor_critic.critic_head(trunk)
             value_selected = DualCriticHead.select(values, position_before)
@@ -433,6 +458,7 @@ def collect_rollout(
             filled_qty_buf.append(step_result.info["filled_qty"])
             reward_buf.append(shaped_reward)
             done_buf.append(step_result.done)
+            attention_mask_buf.append(attention_mask)
 
             if tick_callback is not None:
                 # Fires once per real env-step (a "tick"), not once per
@@ -469,6 +495,7 @@ def collect_rollout(
         filled_qty=torch.stack(filled_qty_buf, dim=0),
         reward=torch.stack(reward_buf, dim=0),
         done=torch.stack(done_buf, dim=0),
+        attention_mask=torch.stack(attention_mask_buf, dim=0),
         initial_hidden=initial_hidden,
     )
 
@@ -476,7 +503,8 @@ def collect_rollout(
     # using the position the portfolio holds AFTER the last step in this
     # rollout (i.e. the position it will be "entering" the next rollout with).
     with torch.no_grad():
-        final_trunk, final_hidden = actor_critic.forward_features(obs, hidden)
+        final_attention_mask = kill_switch.is_halted() | env._current_bar_no_trade_mask()  # noqa: SLF001
+        final_trunk, final_hidden = actor_critic.forward_features(obs, hidden, ticker_mask=final_attention_mask)
         final_values = actor_critic.critic_head(final_trunk)
         final_position = torch.sign(env.portfolio.positions[:, 0])
         final_value = DualCriticHead.select(final_values, final_position)
@@ -525,6 +553,7 @@ def _replay_trunk_sequence(
     hidden: Hidden,
     use_amp: bool,
     use_checkpoint: bool,
+    attention_mask: Optional[Tensor] = None,
 ) -> Tensor:
     """
     Replays the CNN -> (sequential) LSTM -> cross-attention -> fusion trunk
@@ -535,6 +564,14 @@ def _replay_trunk_sequence(
     Batching across t would silently feed every step the same (wrong)
     initial hidden state. See this module's docstring before changing
     anything here.
+
+    attention_mask: optional bool [T, n_envs], buffer.attention_mask from
+    collect_rollout() -- MUST be the exact mask observed at rollout time
+    (see this module's docstring on why the live and replayed forward
+    passes must match exactly). Passing anything recomputed fresh here
+    (e.g. from the CURRENT kill_switch state) would silently break that
+    invariant, since kill_switch's state has moved on since this trajectory
+    was collected.
 
     Returns flat_trunk of shape [T * n_envs, trunk_dim], still under
     autocast dtype if use_amp was True (the caller casts back to float()
@@ -560,7 +597,8 @@ def _replay_trunk_sequence(
             lstm_seq_t, hidden = actor_critic.lstm(cnn_seq_all[t], hidden)
             lstm_last_t = lstm_seq_t[:, -1, :]
             cnn_last_t = cnn_seq_all[t][:, -1, :]
-            attn_out_t = actor_critic.cross_attn(lstm_last_t)
+            mask_t = attention_mask[t] if attention_mask is not None else None
+            attn_out_t = actor_critic.cross_attn(lstm_last_t, ticker_mask=mask_t)
             trunks.append(actor_critic.fusion(cnn_last_t, attn_out_t))
         trunk_all = torch.stack(trunks, dim=0)  # [T, n_envs, trunk_dim]
         return trunk_all.reshape(T * n_envs, -1)
@@ -605,20 +643,41 @@ class AdaptiveEntropyCoef:
     CHECKPOINTED. KellySizer's un-checkpointed state is what made the Session 1
     lock re-arm on every restart; a controller that silently resets to its
     initial coefficient on --resume would repeat that class of bug exactly.
+
+    WARMUP. A freshly-initialized discrete head starts near ln(3), well above
+    the 0.5 target, simply because it hasn't learned anything yet -- the
+    controller has no way to distinguish that from genuine over-exploration
+    and, left alone, starts shrinking the coefficient from rollout 0. On the
+    run analysed in report.md Sec 12 that shrink hit the (then 0.005) floor by
+    rollout 13-14 while entropy_discrete was still >1.0 -- 11+ rollouts before
+    the cost-driven collapse this controller exists to fight even began, and
+    with no headroom left once it did. warmup_rollouts holds the coefficient
+    at its init value until the policy has had a chance to specialize, so
+    early cold-start entropy never gets read as a signal.
     """
 
-    def __init__(self, target, init_coef, lr=0.1, min_coef=0.005, max_coef=2.0):
+    def __init__(self, target, init_coef, lr=0.1, min_coef=0.005, max_coef=2.0,
+                 warmup_rollouts=0):
         self.target = float(target)
         self.lr = float(lr)
         self.min_coef = float(min_coef)
         self.max_coef = float(max_coef)
+        self.warmup_rollouts = int(warmup_rollouts)
         self._log_coef = math.log(max(float(init_coef), 1e-8))
 
     def coef(self):
         return float(min(max(math.exp(self._log_coef), self.min_coef), self.max_coef))
 
-    def observe(self, measured_entropy):
-        """One dual-ascent step. Call once per PPO epoch, after the backward."""
+    def observe(self, measured_entropy, rollout_idx=None):
+        """One dual-ascent step. Call once per PPO epoch, after the backward.
+
+        rollout_idx, when given, is checked against warmup_rollouts and the
+        step is skipped while still in warmup -- see the class docstring's
+        WARMUP section. Pass None (the default) to disable warmup gating for
+        this call, e.g. from a caller that doesn't track rollout index.
+        """
+        if rollout_idx is not None and rollout_idx < self.warmup_rollouts:
+            return
         m = float(measured_entropy)
         if not math.isfinite(m):
             return
@@ -630,17 +689,41 @@ class AdaptiveEntropyCoef:
                              math.log(self.max_coef))
 
     def state_dict(self):
+        # The hyperparameters are written for provenance -- so a checkpoint
+        # records what it was trained under -- but are NOT read back on load;
+        # see load_state_dict().
         return {"log_coef": self._log_coef, "target": self.target, "lr": self.lr,
-                "min_coef": self.min_coef, "max_coef": self.max_coef}
+                "min_coef": self.min_coef, "max_coef": self.max_coef,
+                "warmup_rollouts": self.warmup_rollouts}
 
     def load_state_dict(self, d):
+        """Restores the ADAPTED COEFFICIENT only; hyperparameters come from config.
+
+        log_coef is genuine learned state -- losing it on --resume is the bug
+        this class is checkpointed to avoid (see the CHECKPOINTED note above).
+        target/lr/min_coef/max_coef/warmup_rollouts are NOT state, they are
+        tuning knobs, and restoring them from the checkpoint would mean a
+        retune silently fails to take effect on any resumed run. That is not
+        hypothetical: every checkpoint written before 2026-08-27 carries
+        min_coef = 0.005, so restoring it would reinstate the exact floor
+        whose collapse (report.md Sec 12) motivated raising it to 0.05 --
+        and the run would look correctly configured while behaving as the
+        old one. Config wins; only log_coef is read back.
+
+        Note the deliberate consequence: resuming a run whose coefficient
+        collapsed does NOT inherit that collapse if the band has since
+        moved, because log_coef is clamped into the CURRENT band below.
+        """
         if not d:
             return
         self._log_coef = float(d.get("log_coef", self._log_coef))
-        self.target = float(d.get("target", self.target))
-        self.lr = float(d.get("lr", self.lr))
-        self.min_coef = float(d.get("min_coef", self.min_coef))
-        self.max_coef = float(d.get("max_coef", self.max_coef))
+        # Clamp into the CURRENT band, for the same reason observe() clamps in
+        # log space: a value from outside it leaves coef() pinned at a bound
+        # while the controller spends many epochs walking back into range --
+        # a stale log_coef of log(0.005) against today's 0.05 floor would do
+        # exactly that.
+        self._log_coef = min(max(self._log_coef, math.log(self.min_coef)),
+                             math.log(self.max_coef))
 
 
 
@@ -651,6 +734,7 @@ def ppo_update(
     cfg: TrainingConfig,
     scaler: "Optional[torch.cuda.amp.GradScaler]" = None,
     entropy_ctl=None,
+    rollout_idx: "Optional[int]" = None,
 ) -> Dict[str, float]:
     """
     Replays the stored trajectory through the CURRENT network parameters
@@ -711,6 +795,7 @@ def ppo_update(
             hidden=hidden,
             use_amp=use_amp,
             use_checkpoint=use_checkpoint,
+            attention_mask=buffer.attention_mask,
         )
 
         # --- deliberately outside autocast here: everything below is
@@ -761,7 +846,7 @@ def ppo_update(
             optimizer.step()
 
         if entropy_ctl is not None:
-            entropy_ctl.observe(discrete_entropy.mean().item())
+            entropy_ctl.observe(discrete_entropy.mean().item(), rollout_idx)
 
         with torch.no_grad():
             approx_kl = (flat_log_prob_old - log_prob_new).mean().item()

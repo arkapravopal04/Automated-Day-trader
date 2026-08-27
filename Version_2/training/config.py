@@ -589,8 +589,35 @@ class PPOConfig:
     # behaviour exactly.
     target_entropy_discrete: "Optional[float]" = 0.5   # nats; ln(3)=1.0986 is the max
     entropy_coef_lr: float = 0.1                        # dual-ascent step, per PPO epoch
-    entropy_coef_min: float = 0.005
+
+    # entropy_coef_min raised 0.005 -> 0.05, to equal entropy_coef_discrete's
+    # init value. A fresh discrete head starts near ln(3), well above the 0.5
+    # target, before it has learned anything -- the controller cannot tell
+    # that apart from real over-exploration and immediately starts shrinking
+    # the coefficient. On the run analysed in report.md Sec 12 that shrink hit
+    # the old 0.005 floor by rollout 13-14 while entropy_discrete was still
+    # >1.0, stripped out the entropy bonus for the 11+ rollouts where the
+    # cost-driven collapse actually took hold, and only started recovering
+    # (rollout 25+) after the policy had already committed to always-FLAT.
+    # 0.005 was never validated as sufficient on its own -- 0.05 is the value
+    # the earlier fixed-coefficient run used, and even that still collapsed
+    # eventually (see the docstring above). Letting the controller go 10x
+    # below a floor already known to be too weak served no purpose. Combined
+    # with entropy_coef_warmup_rollouts below.
+    entropy_coef_min: float = 0.05
     entropy_coef_max: float = 2.0
+
+    # Rollouts during which the controller does not move the coefficient at
+    # all -- it stays at entropy_coef_discrete's init value regardless of
+    # measured entropy. Cold-start entropy near ln(3) is not a signal the
+    # controller should react to (see entropy_coef_min's comment above); this
+    # gives the policy room to specialize before the dual-ascent step starts
+    # trusting what it measures. Redundant with entropy_coef_min in the
+    # shrink direction (the floor now equals the init value, so a downward
+    # step during warmup would just get clamped back anyway), but it also
+    # blocks spurious upward moves from early noise and keeps working if
+    # entropy_coef_min is ever retuned below the init value again.
+    entropy_coef_warmup_rollouts: int = 15
 
     # Safety net behind the controller. If the discrete head sits below
     # collapse_entropy_threshold AND the streams place essentially no trades

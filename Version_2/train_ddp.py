@@ -296,6 +296,7 @@ def _worker(
             lr=cfg.ppo.entropy_coef_lr,
             min_coef=cfg.ppo.entropy_coef_min,
             max_coef=cfg.ppo.entropy_coef_max,
+            warmup_rollouts=cfg.ppo.entropy_coef_warmup_rollouts,
         )
         if resume_path is not None and "entropy_ctl" in checkpoint:
             entropy_ctl.load_state_dict(checkpoint["entropy_ctl"])
@@ -330,7 +331,7 @@ def _worker(
         kelly_diag = kelly_sizer.diagnostics() if rank == 0 else None
         compute_gae(buffer, final_value, cfg.ppo.gamma, cfg.ppo.gae_lambda)
         stats = _ddp_ppo_update(ddp_model, optimizer, buffer, cfg, scaler=scaler,
-                                entropy_ctl=entropy_ctl)
+                                entropy_ctl=entropy_ctl, rollout_idx=rollout_idx)
 
         # DRAWDOWN-METRIC FIX: snapshot peak_equity BEFORE any reset below
         # touches it. reset_peak_equity() (periodic branch) overwrites
@@ -482,6 +483,7 @@ def _ddp_ppo_update(
     cfg: TrainingConfig,
     scaler: "Optional[torch.cuda.amp.GradScaler]" = None,
     entropy_ctl=None,
+    rollout_idx: "Optional[int]" = None,
 ) -> dict:
     """
     Same math as training/ppo_hybrid.py's ppo_update(). The DDP-specific
@@ -535,7 +537,9 @@ def _ddp_ppo_update(
                 lstm_seq_t, hidden = actor_critic.lstm(cnn_seq_all[t], hidden)
                 lstm_last_t = lstm_seq_t[:, -1, :]
                 cnn_last_t = cnn_seq_all[t][:, -1, :]
-                attn_out_t = actor_critic.cross_attn(lstm_last_t)
+                # buffer.attention_mask, NOT a freshly-read kill_switch state --
+                # see ppo_hybrid.py's _replay_trunk_sequence() docstring.
+                attn_out_t = actor_critic.cross_attn(lstm_last_t, ticker_mask=buffer.attention_mask[t])
                 trunks.append(actor_critic.fusion(cnn_last_t, attn_out_t))
             trunk_all = torch.stack(trunks, dim=0)
             flat_trunk = trunk_all.reshape(T * n_envs, -1)
@@ -595,7 +599,7 @@ def _ddp_ppo_update(
             if dist.is_available() and dist.is_initialized():
                 dist.all_reduce(_h, op=dist.ReduceOp.SUM)
                 _h = _h / dist.get_world_size()
-            entropy_ctl.observe(_h.item())
+            entropy_ctl.observe(_h.item(), rollout_idx)
 
         with torch.no_grad():
             approx_kl = (flat_log_prob_old - log_prob_new).mean().item()

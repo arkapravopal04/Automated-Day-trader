@@ -66,6 +66,24 @@ class CrossAssetAttention(nn.Module):
             x = x.unsqueeze(0)  # [1, n_tickers, embed_dim]
             if ticker_mask is not None and ticker_mask.dim() == 1:
                 ticker_mask = ticker_mask.unsqueeze(0)
+        if ticker_mask is not None:
+            # Callers assemble this mask from objects with independently
+            # plumbed devices (a KillSwitch OR'd with an env/live volume
+            # read), so normalize rather than fail deep inside MHA on a
+            # device mismatch -- same convention as
+            # LSTMEncoder.reset_hidden()'s env_mask.to(h.device).
+            ticker_mask = ticker_mask.to(device=x.device, dtype=torch.bool)
+            # A batch row with EVERY ticker masked out would leave every
+            # query with zero valid keys -- softmax over an all -inf row is
+            # 0/0, i.e. NaN, which then poisons every other row via this
+            # module's shared downstream computation. Not hypothetical: this
+            # project's caller sets True for both a risk halt and a real
+            # no-bar gap, and a rare bar where every stream reports zero
+            # volume (e.g. an alignment artifact) would trip exactly this.
+            # Excluding everything is meaningless anyway, so such rows fall
+            # back to unmasked attention rather than propagating NaN.
+            all_masked = ticker_mask.all(dim=-1, keepdim=True)
+            ticker_mask = ticker_mask & ~all_masked
         attn_out, _ = self.mha(x, x, x, key_padding_mask=ticker_mask, need_weights=False)
         x = self.norm1(x + self.dropout1(attn_out))
         ffn_out = self.ffn(x)
