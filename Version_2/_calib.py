@@ -33,7 +33,8 @@ env = VecTradingEnv(dataset=ds, initial_cash=cfg.env.initial_cash,
     r_step_scale=cfg.env.r_step_scale, hold_loser_penalty=cfg.env.hold_loser_penalty,
     enable_mirroring=cfg.env.enable_mirroring, mirror_prob=cfg.env.mirror_prob,
     overtrade_window=cfg.env.overtrade_window, overtrade_free_trades=cfg.env.overtrade_free_trades,
-    overtrade_surcharge_bps=cfg.env.overtrade_surcharge_bps,
+    overtrade_penalty_coef=cfg.reward.overtrade_penalty_coef,
+    execution_price_column=cfg.env.execution_price_column,
     bias_window=cfg.env.bias_window, diversity_bonus_coef=cfg.env.diversity_bonus_coef, device="cpu")
 print("n_envs:", env.n_envs, "| tickers:", len(env.tickers))
 ac = HybridActorCritic(n_features=len(ds.feature_names), cfg=cfg).to("cpu")

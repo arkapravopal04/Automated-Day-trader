@@ -132,6 +132,12 @@ def run_diagnostics():
     print(f"\n{Colors.BOLD}[3/6] ExecutionSimulator: Slippage, Snapping, Partial Fills...{Colors.ENDC}")
     try:
         sim = ExecutionSimulator(tick_size=0.01, spread_bps=5, impact_coef=0.05, max_participation=0.1)
+        # Install an ADV calibration so this exercises the real impact path
+        # rather than the bar-volume fallback (which warns, correctly, that it
+        # overstates impact by ~sqrt(bars per session)).
+        sim.set_liquidity_calibration(
+            adv_shares=torch.full((5,), 780_000.0), daily_sigma=torch.full((5,), 0.015)
+        )
 
         direction = torch.tensor([1., -1., 0., 1., -1.])
         size = torch.tensor([100., 100., 0., 1e9, 1e9])   # last two request way more than liquidity
@@ -147,16 +153,55 @@ def run_diagnostics():
         assert res.is_partial[3].item() and res.is_partial[4].item(), "oversized orders must be marked partial"
         assert res.filled_qty[3].item() <= 0.1 * 10_000, "partial fill exceeded max_participation cap"
 
-        # Tick snapping: fill price must be an exact multiple of tick_size
-        remainder = (res.fill_price / sim.tick_size).round() * sim.tick_size - res.fill_price
-        assert torch.allclose(remainder, torch.zeros_like(remainder), atol=1e-6), "fill price not snapped to tick_size"
+        # THE COST MODEL, CHECKED AGAINST ITS OWN CLOSED FORM.
+        #
+        # This replaces an assertion that required fill_price to land on the
+        # tick grid. That check contradicted execution_sim.py's DELIBERATELY
+        # NOT SNAPPED note and had been failing since that note landed: mid is
+        # already a grid-valid close, so adding an analytic half-tick spread
+        # and then rounding away from the trader charges a FULL tick (double
+        # the true half-spread), while rounding to nearest silently refunds up
+        # to half a tick. Either direction double-counts a cost the model has
+        # already priced analytically, so the honest fill price is unsnapped
+        # and this test was asserting a property the simulator is designed not
+        # to have.
+        #
+        # Recomputing the closed form here is a stronger check than any
+        # rounding property: it pins the half-tick spread FLOOR, the
+        # proportional spread that sits on top of it, and the square-root
+        # impact term against DAILY ADV -- so a regression in any of the three
+        # shows up as a number, not as a vague "slipped the right way".
+        half_spread = max((sim.spread_bps / 1e4) * mid[0].item(), sim.tick_size / 2.0)
+        filled = res.filled_qty[0].abs().item()
+        impact = (sim.impact_coef * sim.daily_sigma[0].item()
+                  * (filled / sim.adv_shares[0].item()) ** 0.5 * mid[0].item())
+        expected = half_spread + impact
 
-        print_status("Slippage direction, partial fills, tick snapping", True,
+        buy_slip = res.fill_price[0].item() - mid[0].item()
+        sell_slip = mid[1].item() - res.fill_price[1].item()
+        assert abs(buy_slip - expected) < 1e-6, \
+            f"buy slippage {buy_slip:.8f} != closed form {expected:.8f}"
+        assert abs(sell_slip - expected) < 1e-6, \
+            f"sell slippage {sell_slip:.8f} != closed form {expected:.8f}"
+        assert half_spread >= sim.tick_size / 2.0, "half-spread floor is below half a tick"
+
+        print_status("Slippage matches its closed form (half-tick floor + ADV sqrt-impact)", True,
+                     f"slip={buy_slip:.6f} = spread {half_spread:.6f} + impact {impact:.6f}; "
                      f"fill_price={[round(p,4) for p in res.fill_price.tolist()]}")
 
-        # limit_offset should move price in the agent's favor
-        favorable = sim.simulate_fill(torch.tensor([1.]), torch.tensor([100.]), torch.tensor([50.]), torch.tensor([100.]), torch.tensor([10_000.]))
-        baseline = sim.simulate_fill(torch.tensor([1.]), torch.tensor([100.]), torch.tensor([0.]), torch.tensor([100.]), torch.tensor([10_000.]))
+        # limit_offset should move price in the agent's favor.
+        # A FRESH single-stream simulator, not the 5-wide `sim` above: the ADV
+        # calibration is a per-ticker vector, so reusing a 5-wide simulator for
+        # a 1-element order is exactly the silent broadcast execution_sim.py
+        # now refuses. Building the right-width simulator is the fix; widening
+        # the order to match would test something this harness does not mean.
+        sim1 = ExecutionSimulator(tick_size=0.01, spread_bps=5, impact_coef=0.05,
+                                  max_participation=0.1)
+        sim1.set_liquidity_calibration(
+            adv_shares=torch.full((1,), 780_000.0), daily_sigma=torch.full((1,), 0.015)
+        )
+        favorable = sim1.simulate_fill(torch.tensor([1.]), torch.tensor([100.]), torch.tensor([50.]), torch.tensor([100.]), torch.tensor([10_000.]))
+        baseline = sim1.simulate_fill(torch.tensor([1.]), torch.tensor([100.]), torch.tensor([0.]), torch.tensor([100.]), torch.tensor([10_000.]))
         assert favorable.fill_price.item() < baseline.fill_price.item(), \
             "a favorable (positive, buy-side) limit_offset should REDUCE the effective buy price"
         print_status("limit_offset moves fill price in agent's favor", True,
@@ -173,6 +218,9 @@ def run_diagnostics():
     print("   (This is the check most likely to catch a policy-network integration bug)")
     try:
         sim = ExecutionSimulator(tick_size=0.01, spread_bps=5, impact_coef=0.05, max_participation=0.1)
+        sim.set_liquidity_calibration(
+            adv_shares=torch.full((1,), 780_000.0), daily_sigma=torch.full((1,), 0.015)
+        )
         mid = torch.tensor([100.])
         liq = torch.tensor([10_000.])
 

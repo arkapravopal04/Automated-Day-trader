@@ -122,13 +122,14 @@ def _build_env(cfg: TrainingConfig, device: torch.device) -> VecTradingEnv:
         commission_bps=cfg.env.commission_bps,
         min_commission=cfg.env.min_commission,
         platform_fee_per_trade=cfg.env.platform_fee_per_trade,
+        execution_price_column=cfg.env.execution_price_column,
         r_step_scale=cfg.env.r_step_scale,
         hold_loser_penalty=cfg.env.hold_loser_penalty,
         enable_mirroring=cfg.env.enable_mirroring,
         mirror_prob=cfg.env.mirror_prob,
         overtrade_window=cfg.env.overtrade_window,
         overtrade_free_trades=cfg.env.overtrade_free_trades,
-        overtrade_surcharge_bps=cfg.env.overtrade_surcharge_bps,
+        overtrade_penalty_coef=cfg.reward.overtrade_penalty_coef,
         bias_window=cfg.env.bias_window,
         diversity_bonus_coef=cfg.env.diversity_bonus_coef,
         trade_cooldown_bars=cfg.env.trade_cooldown_bars,
@@ -380,6 +381,15 @@ def _worker(
             drawdown_per_ticker = (peak - equity_per_ticker).clamp(min=0.0) / peak
             net_worth = float(equity_per_ticker.sum().item())
 
+            # alpha_per_turnover / cost_per_turnover -- the pair that replaces
+            # net worth as the number to watch. See train.py's matching block
+            # for why, and VecTradingEnv.pop_turnover_stats() for the
+            # decomposition. RANK 0'S SHARD ONLY, like net_worth beside it:
+            # nothing here is all-reduced, so these describe this rank's
+            # streams rather than the global run. The other ranks'
+            # accumulators simply keep accruing unread.
+            turnover_stats = env.pop_turnover_stats()
+
             metrics_writer.log(
                 step=state.global_tick,
                 rollout=rollout_idx,
@@ -387,6 +397,7 @@ def _worker(
                 record_type="rollout",
                 reward=rollout_reward_mean,
                 reward_ema=ema_reward,
+                **turnover_stats,
                 sharpe=None,
                 drawdown=float(drawdown_per_ticker.mean().item()),
                 drawdown_per_ticker=drawdown_per_ticker.tolist(),

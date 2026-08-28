@@ -9,6 +9,31 @@ exceeds what the simulated available liquidity for that bar can absorb.
 
 This module is stateless per-call (no bookkeeping) — portfolio_state.py
 owns the ledger, vec_trading_env.py wires the two together.
+
+VENUE CALIBRATION (P1). The cost model is calibrated to the venue this
+project actually trades -- Alpaca, US equities -- rather than to a generic
+retail broker:
+
+    commission_bps           0.0   Alpaca is commission-free on US equities.
+    platform_fee_per_trade   0.0   no ticket fee. The $1 ticket previously
+                                   modelled here was 81.5% of ALL measured
+                                   losses over a 305,966-trade run -- an
+                                   IBKR-shaped cost this venue does not charge.
+    half-spread              half a tick, PER TICKER. The minimum quotable US
+                                   equity spread is one tick, so half a tick is
+                                   the floor; expressed in bps that is
+                                   automatically per-ticker, because it is a
+                                   fixed $0.005 against a per-ticker price.
+    impact                   square-root law against DAILY ADV, not bar volume.
+                                   See _compute_fill_price().
+
+The overtrading surcharge that used to live here has been REMOVED, not
+zeroed. It was never a venue cost -- no exchange charges you more per share
+for having traded recently -- it was a shaping term that wanted the policy to
+churn less. Priced as slippage it contaminated every cost measurement (there
+was no real number cost_per_turnover could be compared against), so it now
+lives in training/config.py's RewardConfig.overtrade_penalty_coef and is
+applied in the reward, where a shaping term belongs.
 """
 
 from dataclasses import dataclass
@@ -37,11 +62,16 @@ class ExecutionSimulator:
     Slippage model:
         effective_price = mid
                            + side * half_spread
-                           + side * impact_coef * sqrt(participation_rate) * mid
+                           + side * impact_coef * daily_sigma * sqrt(Q / ADV) * mid
 
-    where participation_rate = requested_size / bar_liquidity_proxy (typically
-    bar volume), clipped to [0, 1]. sqrt-impact is a standard square-root
-    market-impact approximation (impact grows sublinearly with size).
+    where Q is the filled share count and ADV is the ticker's average DAILY
+    volume in shares. This is the standard square-root market-impact law, and
+    the denominator is the part that matters: impact is a property of how much
+    of a name's daily liquidity an order consumes, not of which five-minute
+    bucket it happened to land in. Measured against BAR volume the same order
+    looks ~78x more aggressive (78 RTH bars in a session), and because
+    sqrt(x) >> x for small x that error is largest at exactly the order sizes
+    this project trades.
 
     Partial fills:
         If requested size implies a participation_rate above
@@ -55,37 +85,47 @@ class ExecutionSimulator:
     def __init__(
         self,
         tick_size: float = 0.01,
-        spread_bps: float = 1.0,
-        impact_coef: float = 0.1,
+        spread_bps: float = 0.0,
+        impact_coef: float = 0.5,
         max_participation: float = 0.1,
         commission_per_share: float = 0.0,
         commission_bps: float = 0.0,
         min_commission: float = 0.0,
-        platform_fee_per_trade: float = 1.0,
-        overtrade_surcharge_bps: float = 3.0,
+        platform_fee_per_trade: float = 0.0,
         device: Optional[str] = None,
     ) -> None:
         """
         Args:
-            tick_size: minimum price increment for this instrument (e.g. 0.01 for US equities)
-            spread_bps: assumed half-spread in basis points of mid price, applied against the taker
-            impact_coef: coefficient on the sqrt-participation market impact term
-            max_participation: cap on requested_size / bar_volume before the fill is partial
+            tick_size: minimum price increment (0.01 for US equities). Accepts a float or a
+                per-ticker [n_envs] tensor. It sets the half-tick spread floor below, which
+                is what makes the modelled spread per-ticker once expressed in bps.
+            spread_bps: PROPORTIONAL half-spread in bps of mid, charged to the taker ON TOP
+                OF the half-tick floor. Default 0.0: on liquid US large caps the inside
+                market is one tick wide, so the tick floor alone is the honest model, and
+                any positive value here is an extra assumption you should be able to defend
+                per ticker.
+            impact_coef: the dimensionless Y prefactor of the square-root impact law
+                impact/price = Y * sigma_daily * sqrt(Q/ADV). The literature puts Y in the
+                0.5-1.0 range; it is NOT a free knob to be tuned until a strategy looks
+                good. sigma_daily and ADV are supplied per ticker through
+                set_liquidity_calibration().
+            max_participation: cap on filled_size / BAR volume before the fill goes partial.
+                This one stays on bar volume deliberately -- it is a fill-FEASIBILITY
+                constraint (you cannot buy shares that never traded in that bar), not a cost.
             commission_per_share: flat $ per share commission
             commission_bps: additional commission as bps of notional
             min_commission: minimum $ commission charged on any non-zero fill
-            platform_fee_per_trade: flat $ ticket fee charged by the broker/platform on any
-                non-zero fill, independent of size (separate from commission_* above, which
-                model exchange/broker commission proper). Set to 0.0 to disable.
-            overtrade_surcharge_bps: extra adverse slippage (bps of mid) layered on top of the
-                normal spread+impact cost, scaled by an externally-supplied per-env
-                `overtrading_factor` in [0, 1] passed into simulate_fill(). This models the
-                real cost of churning a position on fast (5-minute) bars: the more frequently
-                a stream has been trading in its recent lookback window, the worse its
-                effective execution gets. Set to 0.0 to disable.
+            platform_fee_per_trade: flat $ ticket fee charged on any non-zero fill,
+                independent of size. 0.0 for Alpaca; 1.0 models an IBKR-shaped venue.
             device: torch device string (e.g. "cpu", "cuda"). Defaults to CUDA if available.
         """
-        self.tick_size = tick_size
+        self.device = torch.device(device) if device is not None else torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        self.tick_size = (
+            tick_size.to(self.device).float() if isinstance(tick_size, torch.Tensor)
+            else float(tick_size)
+        )
         self.spread_bps = spread_bps
         self.impact_coef = impact_coef
         self.max_participation = max_participation
@@ -93,10 +133,30 @@ class ExecutionSimulator:
         self.commission_bps = commission_bps
         self.min_commission = min_commission
         self.platform_fee_per_trade = platform_fee_per_trade
-        self.overtrade_surcharge_bps = overtrade_surcharge_bps
-        self.device = torch.device(device) if device is not None else torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+
+        # Per-ticker impact calibration, installed by set_liquidity_calibration().
+        # Left unset, the impact term falls back to the pre-P1 bar-volume
+        # denominator -- wrong by a factor of ~sqrt(78) -- so the fallback WARNS
+        # once rather than silently mispricing every fill.
+        self.adv_shares: Optional[Tensor] = None
+        self.daily_sigma: Optional[Tensor] = None
+        self._warned_no_adv = False
+
+    def set_liquidity_calibration(self, adv_shares: Tensor, daily_sigma: Tensor) -> None:
+        """
+        Installs the per-ticker constants the square-root impact law needs.
+
+        Args:
+            adv_shares: [n_envs] average DAILY volume in shares, per ticker.
+            daily_sigma: [n_envs] daily return standard deviation, per ticker, as a
+                fraction (e.g. 0.018 for 1.8%/day).
+
+        Both are properties of the instrument over the split being traded rather than
+        of any one episode, so vec_trading_env.py measures them once at construction
+        from the same aligned arrays it marks against.
+        """
+        self.adv_shares = adv_shares.to(self.device).float().clamp(min=1.0)
+        self.daily_sigma = daily_sigma.to(self.device).float().clamp(min=1e-6)
 
     def snap_to_tick(self, price: Tensor) -> Tensor:
         """Round price to the nearest valid tick increment."""
@@ -129,9 +189,8 @@ class ExecutionSimulator:
         direction: Tensor,      # [n_envs], values in {-1, 0, 1}
         size: Tensor,           # [n_envs], requested shares (>= 0, unsigned magnitude)
         limit_offset: Tensor,   # [n_envs], offset from mid in ticks; agent's continuous limit control
-        mid_price: Tensor,      # [n_envs], current bar mid/reference price
-        bar_liquidity_proxy: Tensor,  # [n_envs], e.g. bar volume, used to bound fill size
-        overtrading_factor: Optional[Tensor] = None,  # [n_envs], in [0, 1], see __init__ docstring
+        mid_price: Tensor,      # [n_envs], execution reference price for the fill bar
+        bar_liquidity_proxy: Tensor,  # [n_envs], bar volume, bounds fill SIZE only
     ) -> SimulatedFill:
         """
         Simulates one step's fill for one ticker across all envs.
@@ -142,11 +201,14 @@ class ExecutionSimulator:
         below) — it's treated as a further price adjustment layered on top
         of the spread+impact slippage, in the agent's favor.
 
-        `overtrading_factor` (optional) scales an additional adverse slippage
-        term (`overtrade_surcharge_bps`) meant to represent the real cost of
-        trading too frequently on fast bars — the caller (vec_trading_env.py)
-        is responsible for computing this from its own rolling per-env trade
-        history and passing it in. If omitted, no surcharge is applied.
+        `mid_price` is the price the fill is referenced to. Since P1 that is
+        the EXECUTION price of the bar AFTER the one the observation ends on
+        (bar t+1's open, or its VWAP) rather than bar t's close -- see
+        vec_trading_env.load_aligned_price_frames(). Nothing in this file
+        depends on which of the two it is; it is stated here because
+        `slippage_bps` is measured against it and is therefore slippage
+        against the arrival price, not against a close the agent could not
+        have traded on.
 
         Direction == 0 means "no order this step" -> filled_qty is 0.
 
@@ -193,7 +255,6 @@ class ExecutionSimulator:
         raw_liquidity = bar_liquidity_proxy.to(self.device).float()
         no_liquidity = raw_liquidity <= 0
         bar_liquidity_proxy = raw_liquidity.clamp(min=1e-6)
-        overtrading_factor = self._prepare_overtrading_factor(overtrading_factor, mid_price)
 
         no_order = (direction == 0) | (size == 0) | no_liquidity
 
@@ -211,7 +272,6 @@ class ExecutionSimulator:
             limit_offset=limit_offset,
             filled_size=filled_size,
             bar_liquidity_proxy=bar_liquidity_proxy,
-            overtrading_factor=overtrading_factor,
         )
         fill_price = torch.where(no_order, mid_price, fill_price)
 
@@ -244,12 +304,6 @@ class ExecutionSimulator:
             )
         return direction
 
-    def _prepare_overtrading_factor(self, overtrading_factor: Optional[Tensor], mid_price: Tensor) -> Tensor:
-        """Default to zero (no surcharge) when not supplied; otherwise cast and clip to [0, 1]."""
-        if overtrading_factor is None:
-            return torch.zeros_like(mid_price)
-        return overtrading_factor.to(self.device).float().clamp(0.0, 1.0)
-
     def _apply_participation_cap(
         self, size: Tensor, bar_liquidity_proxy: Tensor, no_order: Tensor
     ) -> tuple[Tensor, Tensor]:
@@ -259,6 +313,59 @@ class ExecutionSimulator:
         is_partial = (filled_size < size) & ~no_order
         return filled_size, is_partial
 
+    def _impact_cost(self, filled_size: Tensor, mid_price: Tensor, bar_liquidity_proxy: Tensor) -> Tensor:
+        """
+        Square-root market impact, priced against DAILY ADV.
+
+            impact / price = Y * sigma_daily * sqrt(Q / ADV)
+
+        Q/ADV is the fraction of a normal day's liquidity the order consumes,
+        which is the quantity the square-root law is stated in and fitted on.
+        The previous version divided by the 5-minute BAR's volume, which
+        overstates participation by roughly the number of bars in a session
+        (78) and therefore overstates impact by ~sqrt(78) ~ 8.8x. At the order
+        sizes this project trades that was the difference between "moves the
+        market not at all", which is the truth for a four-figure order in a
+        large cap, and a charge several times the half-spread.
+
+        The fill-SIZE cap in _apply_participation_cap() still runs off bar
+        volume, and correctly so: how much you can buy in one bar is a
+        feasibility question, how much you move the price is a cost question,
+        and they do not share a denominator.
+
+        Falls back to the bar-volume denominator (with a one-time warning)
+        when set_liquidity_calibration() was never called, e.g. in the unit
+        harnesses in env_digonastics.py that construct a bare simulator.
+        """
+        if self.adv_shares is not None and self.adv_shares.shape != filled_size.shape:
+            # SILENT BROADCAST GUARD. adv_shares/daily_sigma are per-TICKER
+            # vectors of width n_envs, so a call with a different batch width
+            # does not fail -- it BROADCASTS, pairing every order with every
+            # ticker's liquidity and returning an [n_envs] fill price for a
+            # 1-element order. Downstream that surfaces as "a Tensor with N
+            # elements cannot be converted to Scalar" somewhere unrelated, or
+            # worse, as a silently wrong impact charge where the widths happen
+            # to be compatible. Fail here, where the cause is still legible.
+            raise ValueError(
+                f"ExecutionSimulator: liquidity calibration is for "
+                f"{self.adv_shares.numel()} ticker(s) but simulate_fill() was called with "
+                f"{filled_size.numel()}. Call set_liquidity_calibration() with vectors matching "
+                f"this batch, or construct a separate simulator for a different-width harness."
+            )
+        if self.adv_shares is None or self.daily_sigma is None:
+            if not self._warned_no_adv:
+                print(
+                    "[execution_sim] WARNING: no ADV calibration installed -- falling back to "
+                    "the bar-volume impact denominator, which overstates impact by ~sqrt(bars "
+                    "per session). Call set_liquidity_calibration() for the calibrated model."
+                )
+                self._warned_no_adv = True
+            participation = (filled_size / bar_liquidity_proxy).clamp(0.0, 1.0)
+            return self.impact_coef * torch.sqrt(participation) * mid_price
+
+        adv_participation = (filled_size / self.adv_shares).clamp(0.0, 1.0)
+        return self.impact_coef * self.daily_sigma * torch.sqrt(adv_participation) * mid_price
+
     def _compute_fill_price(
         self,
         direction: Tensor,
@@ -266,31 +373,36 @@ class ExecutionSimulator:
         limit_offset: Tensor,
         filled_size: Tensor,
         bar_liquidity_proxy: Tensor,
-        overtrading_factor: Tensor,
     ) -> Tensor:
         """
-        effective_price = mid + side*(half_spread + sqrt-impact + overtrade_surcharge) - side*limit_offset_price
+        effective_price = mid + side*(half_spread + sqrt-impact) - side*limit_offset_price
 
         A favorable limit_offset (requesting a better price) reduces the
         effective adverse move; ticks are converted to price via tick_size.
         The result is tick-snapped and floored at one tick to avoid a
         non-positive price.
         """
-        participation = (filled_size / bar_liquidity_proxy).clamp(0.0, 1.0)
-        # MINIMUM-TICK SPREAD. A proportional spread alone is unphysical at
-        # low prices: spread_bps=1.0 implies a half-spread of $0.00048 on a
-        # $9.66 stock, i.e. quoting INSIDE the $0.01 tick grid, which no
-        # venue permits. The true minimum quotable spread is one tick, so the
-        # half-spread floor is half a tick -- 5.2 bps on a $9.66 name, which
-        # is what actually makes cheap stocks expensive to trade rather than
-        # free. Without this floor the modelled cost fell below the rounding
-        # granularity and vanished, reproducing the same 1/price subsidy as
-        # the limit_offset bug in _compute_fill_price().
-        half_spread_cost = torch.clamp(
-            (self.spread_bps / 1e4) * mid_price, min=self.tick_size / 2.0
+        # PER-TICKER HALF-TICK SPREAD. A proportional spread alone is
+        # unphysical at low prices: spread_bps=1.0 implies a half-spread of
+        # $0.00048 on a $9.66 stock, i.e. quoting INSIDE the $0.01 tick grid,
+        # which no venue permits. The minimum quotable US equity spread is one
+        # tick, so the half-spread is half a tick -- and because that is a
+        # fixed $0.005 against a per-ticker price, the resulting cost in bps is
+        # per-ticker by construction: 5.2 bps on a $9.66 name against 0.09 bps
+        # on a $557 one. That, not a flat bps number, is what actually makes
+        # cheap stocks expensive to trade.
+        #
+        # With spread_bps at its P1 default of 0.0 this IS the spread model.
+        # A positive spread_bps layers a proportional component on top, for a
+        # ticker whose inside market is genuinely wider than one tick.
+        # torch.as_tensor: tick_size may be a per-ticker [n_envs] tensor.
+        half_tick = torch.as_tensor(
+            self.tick_size, device=mid_price.device, dtype=mid_price.dtype
+        ) / 2.0
+        half_spread_cost = torch.maximum(
+            (self.spread_bps / 1e4) * mid_price, half_tick.expand_as(mid_price)
         )
-        impact_cost = self.impact_coef * torch.sqrt(participation) * mid_price
-        overtrade_cost = (self.overtrade_surcharge_bps / 1e4) * overtrading_factor * mid_price
+        impact_cost = self._impact_cost(filled_size, mid_price, bar_liquidity_proxy)
 
         # FREE-MONEY FIX. limit_offset used to be subtracted from the adverse
         # move with NO CAP and no fill rejection, so a positive offset was an
@@ -316,12 +428,20 @@ class ExecutionSimulator:
         #
         # STILL OPTIMISTIC, and deliberately flagged rather than silently
         # accepted: a real passive order may not fill at all. Modelling that
-        # properly needs the bar's high/low (both are in the parquet, only
-        # `close` is loaded today) to fill only when the bar actually trades
-        # through the limit price. Until then a passive order here always
-        # fills at mid, which still favours the agent.
-        adverse_cost = half_spread_cost + impact_cost + overtrade_cost
-        limit_offset_price = (limit_offset * self.tick_size).clamp(max=adverse_cost)
+        # properly means filling only when the bar actually trades through the
+        # limit price. As of P1 the inputs for that exist -- vec_trading_env's
+        # load_aligned_price_frames() loads the fill bar's high and low and the
+        # env carries them as `bar_high`/`bar_low` -- but the fill rule itself
+        # is NOT implemented here, so a passive order still always fills at
+        # mid. That remains in the agent's favour, and it is now a wiring job
+        # rather than a data-availability one.
+        adverse_cost = half_spread_cost + impact_cost
+        limit_offset_price = torch.minimum(
+            limit_offset * torch.as_tensor(
+                self.tick_size, device=mid_price.device, dtype=mid_price.dtype
+            ),
+            adverse_cost,
+        )
         raw_price = (
             mid_price
             + direction * adverse_cost
@@ -338,7 +458,10 @@ class ExecutionSimulator:
         # double-counting in one direction or the other; leaving the price
         # unsnapped is the only unbiased choice. snap_to_tick/
         # snap_to_tick_adverse remain for callers that need a grid-valid quote.
-        return torch.clamp(raw_price, min=self.tick_size)
+        min_price = torch.as_tensor(
+            self.tick_size, device=mid_price.device, dtype=mid_price.dtype
+        ).expand_as(raw_price)
+        return torch.maximum(raw_price, min_price)
 
     # ------------------------------------------------------------------
     # Costs

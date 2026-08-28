@@ -20,28 +20,64 @@ Note on prices: dataset.py's tensor is fully normalized (log returns, vol
 z-score, etc.) and intentionally has no raw price column (that's correct for
 model inputs — you don't want to feed absolute price levels into the net).
 But execution and PnL marking need actual prices, so this env independently
-loads raw close prices from RAW_DIR and aligns them to the same dates the
+loads raw OHLC + VWAP bars from RAW_DIR and aligns them to the same dates the
 dataset uses.
+
+THE EXECUTION FRAME (P1). The observation ends at bar t. The order that
+observation produces is filled AND MARKED at bar t+1 -- at its open by
+default, or at its VWAP for a size-aware variant (`execution_price_column`).
+It is not filled at bar t's close.
+
+This is the difference between a return series that can be traded and one
+that cannot. Marking close[t] -> close[t+1] books the bid-ask bounce: a close
+print is a trade at either the bid or the offer, and the sign of that error is
+serially anti-correlated, so a close-to-close series carries a mean-reverting
+component -- measured on this universe at ~0.47 bps/bar -- that no order can
+capture, because you cannot systematically buy at the bid print and sell at
+the offer print. Optimising against it means optimising against an artifact of
+how the data is recorded. Bar t+1's open is a price the order could actually
+have been sent to; its VWAP is the price a size-aware order would average into.
+
+Mechanically this is a one-bar left shift of every execution-frame array, done
+once in _load_market_data(): the price marked at decision index t is
+exec[t+1], the liquidity that absorbs the fill is volume[t+1], and the session
+masks are shifted with them so "flatten at the close" means the FILL lands on
+the closing bar rather than on the next session's open. The observation window
+is untouched -- it still ends at bar t, and nothing from t+1 reaches the
+policy.
 
 Directional bias mitigation:
 The historical window for these tickers is not directionally neutral (some
 tickers are net-bullish over the sampled years, some net-bearish), which lets
 a PPO agent learn a static long/short bias instead of a context-dependent
-policy. Two env-side mitigations are applied here (mirroring + a diversity
-reward bonus); the remaining mitigations from the project's directional-bias
-writeup (adaptive symmetry penalty, tanh-squashed action head, discrete
-direction head, dual critics) live in the policy/loss code, not here.
+policy. The remaining mitigations from the project's directional-bias writeup
+(adaptive symmetry penalty, tanh-squashed action head, discrete direction
+head, dual critics) live in the policy/loss code, not here. What is left here
+is the diversity bonus: a rolling window of realized trade directions per
+stream is tracked, and `|mean(direction)|` over that window is penalized in
+the reward, discouraging a policy that always fires the same sign regardless
+of context.
 
-1. Return mirroring: each stream (ticker) independently has a `mirror_prob`
-   chance, decided once per full pass through the dataset, of having its
-   price path reflected (log-returns negated, same start price) and its
-   return-type obs features sign-flipped to match. A mirrored bull ticker
-   becomes a synthetic bear ticker (and vice versa) for that pass, so the
-   agent can't just learn "this ticker always goes up."
-2. Diversity reward shaping: a rolling window of realized trade directions
-   per stream is tracked, and `|mean(direction)|` over that window is
-   penalized in the reward, discouraging a policy that always fires the same
-   sign regardless of context.
+RETURN MIRRORING IS OFF (mirror_prob = 0.0, P1) and the machinery below is
+kept only so the decision stays inspectable and reversible. Mirroring
+independently reflected each stream's price path (log-returns negated, same
+start price) with probability `mirror_prob`, sign-flipping its return-type obs
+features to match, so a bull ticker became a synthetic bear one for that pass.
+
+It was retired because it fabricates a cross-section that does not exist.
+Negating each stream's returns independently destroys the co-movement between
+them: measured in-sim pairwise correlation across streams came out at 0.001
+against a true 0.256 on the real panel. That is the difference between 100
+tickers and 100 unrelated random walks. Everything downstream of this point --
+cross-sectional residuals, cross-asset attention, any relative-value signal --
+is a statement about the cross-section, so training them on a universe with
+none is not a mitigation, it is a different problem. Its own docstring already
+recorded that mirrored streams cannot carry a coherent cross-sectional feature
+at all (see _apply_mirror_to_obs, where they are zeroed); that was the same
+defect showing up one channel at a time.
+
+Directional bias is real and still needs answering -- by the policy-side
+mitigations and the diversity bonus, not by inventing data.
 """
 
 import os
@@ -62,7 +98,7 @@ from paths import (  # noqa: E402
     DIVERSITY_COEF,
     OVERTRADE_WINDOW,
     OVERTRADE_FREE_TRADES,
-    OVERTRADE_SURCHARGE_BPS,
+    OVERTRADE_PENALTY_COEF,
     PLATFORM_FEE_PER_TRADE,
     VOLUME_SCALE,
 )
@@ -148,12 +184,71 @@ def _warn_on_dead_streams(tickers: Sequence[str], prices: np.ndarray) -> None:
         )
 
 
+#: Every price column the execution path can mark or fill against. `open` and
+#: `vwap` are the two candidate EXECUTION references (see EXECUTION_PRICE_
+#: COLUMNS); `high`/`low` bound the fill bar and exist for the passive-fill
+#: rule execution_sim.py's limit_offset note still owes; `close` is retained
+#: because it is what every pre-P1 measurement and every external benchmark is
+#: quoted against.
+PRICE_COLUMNS: Tuple[str, ...] = ("open", "high", "low", "close", "vwap")
+
+#: Columns that may be used as the execution/marking reference.
+#:   "open" -- bar t+1's opening print. The price an order sent on the bar
+#:             boundary is referenced to. Default.
+#:   "vwap" -- bar t+1's volume-weighted average price. The size-aware
+#:             variant: what an order worked across the bar would average
+#:             into, rather than what a single print at the boundary got.
+#:             More favourable than `open` for a large order and less
+#:             favourable for a small one, so it is a genuine modelling
+#:             choice, not a strict improvement.
+EXECUTION_PRICE_COLUMNS: Tuple[str, ...] = ("open", "vwap")
+
+
+def load_aligned_price_frames(
+    tickers: Sequence[str],
+    aligned_dates: pd.DatetimeIndex,
+    columns: Sequence[str] = PRICE_COLUMNS,
+) -> Dict[str, np.ndarray]:
+    """
+    Loads the requested raw price columns per ticker from RAW_DIR and
+    reindexes each onto `aligned_dates` (the same timestamp index
+    MultiTickerRolloutDataset produced), forward-filling gaps the same way
+    dataset.py's feature alignment does, so observation windows and price
+    marks line up 1:1.
+
+    Every column gets the SAME non-positive mask and fill policy as `close`
+    (see load_aligned_close_prices below for why zeros are corrupt data rather
+    than quotes). Applying it per column rather than only to close matters:
+    the same 15 corrupt bars carry 0.00 in `open` and `vwap` too, and since
+    P1 those are the columns orders actually fill against.
+
+    Returns: {column: np.ndarray of shape [T, n_tickers], float32}.
+    """
+    unknown = [c for c in columns if c not in PRICE_COLUMNS]
+    if unknown:
+        raise ValueError(
+            f"Unknown price column(s) {unknown}; known columns are {list(PRICE_COLUMNS)}."
+        )
+    return {
+        column: _load_aligned_column(
+            tickers, aligned_dates, column, lambda df: df.mask(df <= 0).ffill().bfill()
+        )
+        for column in columns
+    }
+
+
 def load_aligned_close_prices(tickers: Sequence[str], aligned_dates: pd.DatetimeIndex) -> np.ndarray:
     """
-    Loads raw close prices per ticker from RAW_DIR and reindexes them onto
-    `aligned_dates` (the same timestamp index MultiTickerRolloutDataset
-    produced), forward-filling gaps the same way dataset.py's feature
-    alignment does, so observation windows and price marks line up 1:1.
+    The close column of load_aligned_price_frames(), as a bare [T, n_tickers]
+    array. Kept as its own entry point because most callers outside the
+    execution path (benchmarks, eval, diagnostics) want exactly this and
+    nothing else.
+
+    NOTE for anything that marks a POSITION: close is no longer what this env
+    marks against -- see the module docstring's execution-frame note. Use
+    VecTradingEnv.prices (already shifted into the execution frame) rather
+    than re-deriving marks from this function, or the bid-ask bounce comes
+    straight back in.
 
     Returns: np.ndarray of shape [T, n_tickers], float32.
     """
@@ -172,9 +267,30 @@ def load_aligned_close_prices(tickers: Sequence[str], aligned_dates: pd.Datetime
     # are still baked into data/processed/*_features.parquet as extreme
     # log-return outliers (z-scores of -15.8 and +57.9 vs a typical +/-5);
     # clearing those needs preprocess.py re-run, which is a separate step.
-    return _load_aligned_column(
-        tickers, aligned_dates, "close", lambda df: df.mask(df <= 0).ffill().bfill()
-    )
+    return load_aligned_price_frames(tickers, aligned_dates, columns=("close",))["close"]
+
+
+def _to_execution_frame(arr: np.ndarray) -> np.ndarray:
+    """
+    Shifts a bar-indexed array one bar left, so index t carries bar t+1's
+    value: `out[t] = arr[t+1]`, with the final row repeated.
+
+    This is the whole mechanism of the P1 execution frame. A decision taken
+    after observing bar t is filled and marked at bar t+1, so every array the
+    EXECUTION path reads -- price, the volume that absorbs the fill, the
+    session masks that decide when a flatten is forced -- is shifted by one
+    and then indexed by the decision index exactly as before. The observation
+    window is deliberately NOT shifted: it still ends at bar t.
+
+    The repeated final row is the one degenerate cell. At the last decision
+    index there is no t+1, so the fill is referenced to its own bar and the
+    forward return over that step is zero. One bar out of ~100k per split, and
+    zero rather than a lookahead, which is the right direction for it to be
+    wrong in.
+    """
+    if arr.shape[0] == 0:
+        return arr
+    return np.concatenate([arr[1:], arr[-1:]], axis=0)
 
 
 def load_aligned_volumes(tickers: Sequence[str], aligned_dates: pd.DatetimeIndex) -> np.ndarray:
@@ -182,7 +298,14 @@ def load_aligned_volumes(tickers: Sequence[str], aligned_dates: pd.DatetimeIndex
     Same alignment as load_aligned_close_prices(), but for raw bar volume --
     used as the real liquidity proxy for execution_sim.py's partial-fill
     sizing (see _bar_liquidity_proxy() below), replacing the earlier fixed
-    1e6 placeholder.
+    1e6 placeholder, and as the input to the per-ticker ADV the square-root
+    impact law is now fitted against.
+
+    Returned in the RAW bar frame. _load_market_data() shifts it into the
+    execution frame for the fill-size cap -- the liquidity that absorbs an
+    order is the volume of the bar it fills in, t+1, not of the last bar the
+    policy observed -- while ADV is computed from these unshifted bars, since
+    a daily average does not care about the one-bar offset.
 
     Deliberately fillna(0), NOT ffill like price: a missing/halted bar
     genuinely traded zero shares in that window, it did not trade "the same
@@ -230,13 +353,14 @@ class VecTradingEnv:
         initial_cash: float = 100_000.0,
         max_position_frac: float = 1.0,   # max notional as a fraction of initial_cash per stream
         tick_size: float = 0.01,
-        spread_bps: float = 1.0,
-        impact_coef: float = 0.1,
+        spread_bps: float = 0.0,
+        impact_coef: float = 0.5,
         max_participation: float = 0.1,
         commission_per_share: float = 0.0,
-        commission_bps: float = 0.5,
+        commission_bps: float = 0.0,
         min_commission: float = 0.0,
         platform_fee_per_trade: float = PLATFORM_FEE_PER_TRADE,
+        execution_price_column: str = "open",
         r_step_scale: float = 0.5,
         hold_loser_penalty: float = 0.0005,
         enable_mirroring: bool = True,
@@ -244,8 +368,8 @@ class VecTradingEnv:
         return_feature_keywords: Tuple[str, ...] = ("ret", "mom", "vwap", "pres", "resid"),
         cross_sectional_feature_keywords: Tuple[str, ...] = ("resid",),
         overtrade_window: int = OVERTRADE_WINDOW,       # ~1hr of 5-min bars by default
-        overtrade_free_trades: int = OVERTRADE_FREE_TRADES,   # trades allowed in the window before surcharge kicks in
-        overtrade_surcharge_bps: float = OVERTRADE_SURCHARGE_BPS,
+        overtrade_free_trades: int = OVERTRADE_FREE_TRADES,   # trades allowed in the window before the penalty kicks in
+        overtrade_penalty_coef: float = OVERTRADE_PENALTY_COEF,  # REWARD term, not a cost -- see _compute_reward()
         bias_window: int = DIVERSITY_WINDOW,
         diversity_bonus_coef: float = DIVERSITY_COEF,
         trade_cooldown_bars: int = 0,   # see _apply_trade_cooldown()
@@ -276,10 +400,24 @@ class VecTradingEnv:
         self.r_step_scale = r_step_scale
         self.hold_loser_penalty = hold_loser_penalty
 
-        self.enable_mirroring = enable_mirroring
+        # `and mirror_prob > 0` so the P1 default (mirror_prob=0.0) makes the
+        # whole mirroring path inert rather than merely drawing an all-False
+        # mask every reset -- and so `enable_mirroring` survives as the switch
+        # that turns it back on if the decision is ever revisited. See the
+        # module docstring for why it is off.
+        self.enable_mirroring = bool(enable_mirroring) and mirror_prob > 0.0
         self.mirror_prob = mirror_prob
         self.overtrade_window = overtrade_window
         self.overtrade_free_trades = overtrade_free_trades
+        self.overtrade_penalty_coef = float(overtrade_penalty_coef)
+
+        if execution_price_column not in EXECUTION_PRICE_COLUMNS:
+            raise ValueError(
+                f"execution_price_column={execution_price_column!r} is not one of "
+                f"{list(EXECUTION_PRICE_COLUMNS)}. Marking against 'close' is what the P1 "
+                "execution frame exists to stop -- see this module's docstring."
+            )
+        self.execution_price_column = execution_price_column
         self.bias_window = bias_window
         self.trade_cooldown_bars = int(trade_cooldown_bars)
         self.min_hold_bars = max(0, int(min_hold_bars))
@@ -329,13 +467,18 @@ class VecTradingEnv:
             if any(kw in name.lower() for kw in cross_sectional_feature_keywords)
         ]
 
-        if self._return_feature_idx:
+        if not self.enable_mirroring:
+            print(
+                f"[env] mirroring OFF (mirror_prob={mirror_prob}) -- all {self.n_envs} streams "
+                "trade their real price path. See this module's docstring for why."
+            )
+        elif self._return_feature_idx:
             flipped = [
                 self.feature_names[i] for i in self._return_feature_idx
                 if i not in self._cross_sectional_feature_idx
             ]
             print(f"[env] mirroring will sign-flip direction-sensitive features: {flipped}")
-        if self._cross_sectional_feature_idx:
+        if self.enable_mirroring and self._cross_sectional_feature_idx:
             zeroed = [self.feature_names[i] for i in self._cross_sectional_feature_idx]
             print(f"[env] mirroring will ZERO cross-sectional features (cannot be mirrored): {zeroed}")
         elif self.enable_mirroring:
@@ -350,7 +493,10 @@ class VecTradingEnv:
             n_envs=self.n_envs, n_tickers=1, initial_cash=initial_cash, device=str(self.device)
         )
 
-        # --- Execution simulator, shared config across all streams
+        # --- Execution simulator, shared config across all streams.
+        # The overtrading surcharge is gone from here entirely: it was a
+        # shaping term priced as slippage, which made cost_per_turnover
+        # unreadable. It now lives in the reward (see _compute_reward).
         self.execution = ExecutionSimulator(
             tick_size=tick_size,
             spread_bps=spread_bps,
@@ -360,9 +506,31 @@ class VecTradingEnv:
             commission_bps=commission_bps,
             min_commission=min_commission,
             platform_fee_per_trade=platform_fee_per_trade,
-            overtrade_surcharge_bps=overtrade_surcharge_bps,
             device=str(self.device),
         )
+        # Per-ticker ADV and daily sigma, measured in _load_market_data() from
+        # the same aligned bars this env marks against. Without these the
+        # sqrt-impact term falls back to a per-BAR participation denominator,
+        # which overstates impact by ~sqrt(78).
+        self.execution.set_liquidity_calibration(
+            adv_shares=self.adv_shares, daily_sigma=self.daily_sigma
+        )
+
+        # --- Per-rollout execution accounting (see pop_turnover_stats()).
+        # Accumulated on-device and only synced when a caller pops them, so
+        # the per-step cost is one add rather than a GPU->CPU stall.
+        #
+        # float64 DELIBERATELY, against float32 everywhere else. These are
+        # running sums over a whole rollout -- 256 steps x n_envs -- of
+        # quantities several orders of magnitude smaller than the equity
+        # levels they are derived from, which is the shape that accumulates
+        # error fastest. The reductions below also pass dtype=torch.float64 so
+        # the per-step sum is done in double rather than being rounded to
+        # float32 first and then widened, which would defeat the point.
+        self._acc_turnover = torch.zeros((), device=self.device, dtype=torch.float64)
+        self._acc_gross_pnl = torch.zeros((), device=self.device, dtype=torch.float64)
+        self._acc_cost = torch.zeros((), device=self.device, dtype=torch.float64)
+        self._acc_fills = torch.zeros((), device=self.device, dtype=torch.float64)
 
         # rolling ATR-style volatility proxy for step-reward normalization,
         # reuses the dataset's own 'rv' feature if present (already computed
@@ -410,6 +578,17 @@ class VecTradingEnv:
         # ticker missing a bar, a half-day session, or a holiday would all
         # break a modulo-78 assumption, and dataset.aligned_dates is already
         # sliced to this split.
+        #
+        # EXECUTION FRAME. Every mask below is shifted one bar left, exactly
+        # like price and volume, because each answers a question about the bar
+        # the order FILLS in rather than the last bar it observed. Getting this
+        # wrong is not cosmetic: "flatten on the session's last bar" indexed in
+        # the observation frame would issue the closing order after observing
+        # the last bar, which fills at t+1 -- the NEXT session's open, on the
+        # far side of the overnight gap. That is the precise exposure
+        # flatten_at_session_close exists to prevent, and it would have been
+        # reintroduced silently by the price shift alone. Shifted, the mask
+        # fires one decision earlier and the close fills on the closing bar.
         dates = getattr(dataset, "aligned_dates", None)
         if dates is not None and len(dates):
             ny = dates.tz_convert("America/New_York") if dates.tz is not None else dates
@@ -420,7 +599,6 @@ class VecTradingEnv:
             first = np.empty(len(sess), dtype=bool)
             first[0] = True
             first[1:] = sess[1:] != sess[:-1]
-            self._is_session_first = torch.as_tensor(first, device=self.device)
             self._n_sessions = int(first.sum())
             # Bar-of-day index (0 == 09:30) from the clock, not a row counter,
             # for the same reason the session masks are: a missing bar, a
@@ -428,22 +606,28 @@ class VecTradingEnv:
             bod = np.asarray(
                 ((ny.hour * 60 + ny.minute) - (9 * 60 + 30)) // 5, dtype=np.int16
             )
-            self._bar_of_day = torch.as_tensor(bod.astype(np.int64), device=self.device)
+
+            last_x = _to_execution_frame(last)
+            first_x = _to_execution_frame(first)
+            bod_x = _to_execution_frame(bod)
+
+            self._is_session_first = torch.as_tensor(first_x, device=self.device)
+            self._bar_of_day = torch.as_tensor(bod_x.astype(np.int64), device=self.device)
             if trading_window is None:
                 self._is_tradable_bar = None
             else:
                 lo, hi = int(trading_window[0]), int(trading_window[1])
                 self._is_tradable_bar = torch.as_tensor(
-                    (bod >= lo) & (bod < hi), device=self.device
+                    (bod_x >= lo) & (bod_x < hi), device=self.device
                 )
             # Widen the force-flat window to the trailing N bars of each
             # session, so an oversized position gets more than one
             # attempt at the participation cap.
-            wide = last.copy()
+            wide = last_x.copy()
             for _s in range(1, max(1, int(flatten_close_bars))):
-                wide[:-_s] |= last[_s:]
+                wide[:-_s] |= last_x[_s:]
             self._is_session_last = torch.as_tensor(wide, device=self.device)
-            self._session_last_only = torch.as_tensor(last, device=self.device)
+            self._session_last_only = torch.as_tensor(last_x, device=self.device)
         else:
             self._is_session_last = None
             self._session_last_only = None
@@ -526,23 +710,125 @@ class VecTradingEnv:
         self.active_prices = self.prices
 
     def _load_market_data(self) -> None:
-        """Loads and aligns raw close prices and bar volume onto the dataset's date index."""
-        prices_np = load_aligned_close_prices(self.tickers, self.dataset.aligned_dates)
-        _warn_on_dead_streams(self.tickers, prices_np)
-        if not np.isfinite(prices_np).all():
-            bad = [self.tickers[i] for i in np.nonzero(~np.isfinite(prices_np).all(axis=0))[0]]
-            raise ValueError(
-                f"Non-finite aligned close prices for {bad}. Equity is cash + positions*price and "
-                f"0 * NaN = NaN, so a single such column makes the summed portfolio net worth NaN "
-                f"and every downstream metric meaningless -- see _load_aligned_column()'s "
-                f"NaN-POISONING FIX note. Refusing to build the env."
-            )
-        self.prices = torch.tensor(prices_np, device=self.device, dtype=torch.float32)  # [T, n_envs]
+        """
+        Loads and aligns the raw OHLC + VWAP bars and bar volume onto the
+        dataset's date index, then shifts everything the execution path reads
+        into the execution frame (see _to_execution_frame).
 
-        # Real liquidity proxy for execution_sim.py's partial-fill sizing
-        # (see _bar_liquidity_proxy()), replacing the earlier fixed placeholder.
+        Sets, all [T, n_envs] and all in the EXECUTION frame -- index t is the
+        decision taken after observing bar t, carrying bar t+1's values:
+
+            prices      the execution/marking reference (open or vwap)
+            volumes     the liquidity that absorbs the fill
+            bar_high    the fill bar's high  } for the passive-fill rule
+            bar_low     the fill bar's low   } execution_sim.py still owes
+
+        and, in the RAW bar frame, `close_prices` -- retained because
+        benchmarks and every pre-P1 measurement are quoted against close.
+
+        Also measures the two per-ticker constants the square-root impact law
+        needs, `adv_shares` and `daily_sigma`, over this split.
+        """
+        frames = load_aligned_price_frames(self.tickers, self.dataset.aligned_dates)
+        close_np = frames["close"]
+        exec_np = frames[self.execution_price_column]
+
+        _warn_on_dead_streams(self.tickers, close_np)
+        for name, arr in (("close", close_np), (self.execution_price_column, exec_np)):
+            if np.isfinite(arr).all():
+                continue
+            bad = [self.tickers[i] for i in np.nonzero(~np.isfinite(arr).all(axis=0))[0]]
+            raise ValueError(
+                f"Non-finite aligned {name} prices for {bad}. Equity is cash + positions*price "
+                f"and 0 * NaN = NaN, so a single such column makes the summed portfolio net "
+                f"worth NaN and every downstream metric meaningless -- see "
+                f"_load_aligned_column()'s NaN-POISONING FIX note. Refusing to build the env."
+            )
+
         volumes_np = load_aligned_volumes(self.tickers, self.dataset.aligned_dates)
-        self.volumes = torch.tensor(volumes_np, device=self.device, dtype=torch.float32)  # [T, n_envs]
+
+        def _t(arr: np.ndarray) -> Tensor:
+            return torch.tensor(arr, device=self.device, dtype=torch.float32)
+
+        # Raw bar frame: what the bar actually printed, for benchmarking.
+        self.close_prices = _t(close_np)
+        # Execution frame: what a decision at index t fills and marks against.
+        self.prices = _t(_to_execution_frame(exec_np))
+        self.volumes = _t(_to_execution_frame(volumes_np))
+        self.bar_high = _t(_to_execution_frame(frames["high"]))
+        self.bar_low = _t(_to_execution_frame(frames["low"]))
+
+        self.adv_shares, self.daily_sigma = self._measure_liquidity_constants(
+            close_np, volumes_np
+        )
+
+        print(
+            f"[env] execution frame: fills and marks at bar t+1 '{self.execution_price_column}'"
+            f"; observations still end at bar t"
+        )
+
+    def _measure_liquidity_constants(
+        self, close_np: np.ndarray, volumes_np: np.ndarray
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Per-ticker ADV (average DAILY volume, shares) and daily return sigma,
+        measured over this split -- the two inputs the square-root impact law
+        needs, `impact/price = Y * sigma_daily * sqrt(Q/ADV)`.
+
+        Both are deliberately measured here rather than configured. They are
+        facts about the instruments over the window being traded, and a
+        hand-set constant would be one more number nobody could defend; the
+        only free parameter left is Y (`impact_coef`), which the literature
+        pins to 0.5-1.0.
+
+        Sessions come from the timestamps, not a bar counter, for the same
+        reason the session masks do: a missing bar, a half day or a holiday
+        would all break a modulo-78 assumption.
+
+        Falls back to a flat 2%/day sigma and a 1-share ADV floor on a split
+        too short to contain two sessions -- which no real split is, but the
+        unit harnesses build tiny ones.
+        """
+        dates = getattr(self.dataset, "aligned_dates", None)
+        n = len(self.tickers)
+        if dates is None or len(dates) == 0:
+            return (
+                torch.full((n,), 1e6, device=self.device),
+                torch.full((n,), 0.02, device=self.device),
+            )
+
+        ny = dates.tz_convert("America/New_York") if dates.tz is not None else dates
+        day = np.asarray(ny.normalize().view("int64"))
+        # np.unique gives the session boundaries; add.reduceat sums each run.
+        # `day` is monotone non-decreasing on an aligned index, so run starts
+        # are simply the positions where it changes.
+        starts = np.flatnonzero(np.r_[True, day[1:] != day[:-1]])
+        n_sessions = len(starts)
+
+        daily_volume = np.add.reduceat(volumes_np, starts, axis=0)   # [n_sessions, n]
+        adv = daily_volume.mean(axis=0)
+
+        if n_sessions >= 2:
+            # Session-closing print per day = the bar immediately before the
+            # next session's first bar.
+            ends = np.r_[starts[1:] - 1, len(day) - 1]
+            daily_close = close_np[ends]                              # [n_sessions, n]
+            daily_logret = np.diff(np.log(np.clip(daily_close, 1e-6, None)), axis=0)
+            sigma = daily_logret.std(axis=0)
+        else:
+            sigma = np.full(n, 0.02, dtype=np.float64)
+
+        sigma = np.where(np.isfinite(sigma) & (sigma > 0), sigma, 0.02)
+        adv = np.where(np.isfinite(adv) & (adv > 0), adv, 1.0)
+
+        print(
+            f"[env] impact calibrated on {n_sessions} session(s): median ADV "
+            f"{np.median(adv):,.0f} shares, median daily sigma {np.median(sigma) * 100:.2f}%"
+        )
+        return (
+            torch.tensor(adv, device=self.device, dtype=torch.float32),
+            torch.tensor(sigma, device=self.device, dtype=torch.float32),
+        )
 
     def _precompute_mirrored_prices(self) -> None:
         """
@@ -551,7 +837,15 @@ class VecTradingEnv:
         behaves like a bear ticker (and vice versa) for the whole pass.
         Precomputed once since it only depends on the raw price series, not
         on the episode.
+
+        Skipped entirely when mirroring is off (the P1 default), which is not
+        just a saved allocation of a second [T, n_envs] price tensor: it also
+        means a run with mirroring off cannot accidentally mark against a
+        mirrored path, because there is no mirrored path to mark against.
         """
+        if not self.enable_mirroring:
+            self.mirrored_prices = None
+            return
         log_prices = torch.log(self.prices.clamp(min=1e-6))
         log_returns = torch.diff(log_prices, dim=0, prepend=log_prices[:1])
         mirrored_log_prices = torch.cumsum(-log_returns, dim=0) + log_prices[0]
@@ -566,9 +860,12 @@ class VecTradingEnv:
         # the dataset (see module docstring). Independent per stream/ticker.
         if self.enable_mirroring:
             self.mirror_mask = torch.rand(self.n_envs, device=self.device) < self.mirror_prob
+            self.active_prices = torch.where(
+                self.mirror_mask.unsqueeze(0), self.mirrored_prices, self.prices
+            )
         else:
             self.mirror_mask = torch.zeros(self.n_envs, dtype=torch.bool, device=self.device)
-        self.active_prices = torch.where(self.mirror_mask.unsqueeze(0), self.mirrored_prices, self.prices)
+            self.active_prices = self.prices
 
         self._bars_since_open.fill_(float(self.trade_cooldown_bars + 1))
         self._bars_since_entry.fill_(float(self.min_hold_bars + 1))
@@ -742,6 +1039,20 @@ class VecTradingEnv:
         penalty: the previous two runs showed the policy optimizing the reward
         well while still churning, so this removes the option instead of
         pricing it.
+
+        P1 VOIDED THE ECONOMICS ABOVE. The ~17 bps round trip quoted here was
+        measured against a cost model that charged a flat $1 ticket, 0.5 bps
+        commission and sqrt-impact against BAR volume; recalibrated to the
+        venue actually traded it is ~2 bps (1.02 bps each way, measured on the
+        val split). Against a ~5.6-9.8 bps median 5-minute move, a short hold
+        now clears its own cost comfortably -- which is precisely the
+        condition this constraint was built to deny.
+
+        THE CONSTRAINT IS DELIBERATELY LEFT ON ANYWAY, for now. P1 changed the
+        measuring apparatus; changing the constraints in the same step would
+        make the next run unattributable. Relax this only after a run under
+        the honest cost model has produced an alpha_per_turnover reading to
+        justify it -- and then as its own change, measured on its own.
         """
         if self.trade_cooldown_bars <= 0:
             return direction, size
@@ -912,25 +1223,38 @@ class VecTradingEnv:
         return obs
 
     def _current_prices(self) -> Tensor:
-        """Mark/mid price for 'now' = last bar of the current window."""
+        """
+        The execution/marking reference for the decision being taken now.
+
+        `t` is the last bar of the current observation window, and
+        `active_prices` is in the execution frame, so this returns bar t+1's
+        open (or VWAP) -- the price this step's order fills at and the price
+        the position is marked at, both. Marking at the fill price is what
+        makes the step's PnL the return between two prices an order could
+        actually have been sent to.
+        """
         t = self.current_idx + self.window_size - 1
         return self.active_prices[t]  # [n_envs]
 
     def _bar_liquidity_proxy(self) -> Tensor:
         """
-        Real per-bar liquidity proxy: this stream's actual traded volume for
-        the current bar (same time index _current_prices() uses), fed into
-        execution_sim.py's max_participation cap for genuine volume-based
-        partial fills. A zero-volume bar (halt/gap -- see
-        load_aligned_volumes()) correctly yields zero fillable shares that
+        Real per-bar liquidity proxy: the volume of the bar this step's order
+        FILLS in (bar t+1 -- `volumes` is in the execution frame, same index as
+        _current_prices()), fed into execution_sim.py's max_participation cap
+        for genuine volume-based partial fills. A zero-volume bar (halt/gap --
+        see load_aligned_volumes()) correctly yields zero fillable shares that
         step via execution_sim's max_fillable = max_participation * proxy.
+
+        This bounds fill SIZE only. Since P1 the sqrt-impact COST is priced
+        against daily ADV instead -- see ExecutionSimulator._impact_cost() for
+        why the two do not share a denominator.
         """
         t = self.current_idx + self.window_size - 1
         return self.volumes[t]  # [n_envs]
 
     def _current_bar_no_trade_mask(self) -> Tensor:
         """
-        [n_envs] bool, True where this bar's real traded volume is exactly
+        [n_envs] bool, True where the FILL bar's real traded volume is exactly
         zero -- a halt or missing-bar gap, per load_aligned_volumes()'s
         deliberate fillna(0) (as opposed to price's ffill). Same time index
         as _current_prices() / _bar_liquidity_proxy().
@@ -996,7 +1320,6 @@ class VecTradingEnv:
             limit_offset=limit_offset,
             mid_price=mid_price,
             bar_liquidity_proxy=liquidity_proxy,
-            overtrading_factor=overtrading_factor,
         )
         commission = self.execution.compute_commission(sim_fill.filled_qty, sim_fill.fill_price)
         platform_fee = self.execution.compute_platform_fee(sim_fill.filled_qty)
@@ -1044,11 +1367,35 @@ class VecTradingEnv:
         equity_after = self.portfolio.equity(next_mid_price.unsqueeze(1))
         drawdown = self.portfolio.update_drawdown_tracking(next_mid_price.unsqueeze(1))
 
+        # --- Execution accounting, exact rather than estimated ------------
+        # The ledger marks with the same price the fill is referenced to, so
+        # the decomposition closes identically rather than approximately:
+        #
+        #   step_pnl = position_after * (mark_next - mark_now)   <- the alpha
+        #              - qty * (fill_price - mark_now)           <- slippage
+        #              - fees
+        #
+        # so gross = step_pnl + slippage + fees, with no residual to explain.
+        # Slippage is taken SIGNED, not as an absolute value: a fill better
+        # than the reference price would be negative cost, and if that ever
+        # shows up in the log it is a bug in the fill model (limit_offset is
+        # capped at the adverse cost precisely so it cannot), which an abs()
+        # would hide.
+        step_pnl_now = equity_after - equity_before
+        slippage_cost = sim_fill.filled_qty * (sim_fill.fill_price - mid_price)
+        trade_cost = total_fees + slippage_cost
+        turnover_notional = sim_fill.filled_qty.abs() * sim_fill.fill_price
+        self._acc_turnover += turnover_notional.sum(dtype=torch.float64)
+        self._acc_cost += trade_cost.sum(dtype=torch.float64)
+        self._acc_gross_pnl += (step_pnl_now + trade_cost).sum(dtype=torch.float64)
+        self._acc_fills += (sim_fill.filled_qty != 0).sum(dtype=torch.float64)
+
         next_obs = self.dataset[min(self.current_idx, self.max_idx)].to(self.device)
         next_obs = self._apply_mirror_to_obs(next_obs)
 
         reward, reward_info = self._compute_reward(
-            equity_before, equity_after, mid_price, next_mid_price, done_time, next_obs
+            equity_before, equity_after, mid_price, next_mid_price, done_time, next_obs,
+            overtrading_factor,
         )
 
         # Portfolio channels are appended AFTER _compute_reward, which indexes
@@ -1075,10 +1422,81 @@ class VecTradingEnv:
             "platform_fee": platform_fee,
             "overtrading_factor": overtrading_factor,
             "closed_trade": closed_trade,
+            # Per-step execution accounting. Aggregated over the rollout by
+            # pop_turnover_stats(); exposed per step so a tick log can show
+            # which stream is paying for the turnover.
+            "slippage_cost": slippage_cost,
+            "trade_cost": trade_cost,
+            "turnover_notional": turnover_notional,
             **reward_info,
         }
 
         return StepResult(obs=next_obs, reward=reward, done=done, info=info)
+
+    def pop_turnover_stats(self) -> Dict[str, float]:
+        """
+        The rollout's execution economics, per unit of turnover, and resets
+        the accumulators.
+
+            alpha_per_turnover   gross PnL (before any execution cost) per
+                                 dollar traded, in bps
+            cost_per_turnover    spread + impact + fees per dollar traded, in
+                                 bps
+            net_per_turnover     the difference. Positive is the only state
+                                 in which trading is worth doing.
+
+        WHY THIS REPLACES NET WORTH AS THE NUMBER TO WATCH. Net worth is a
+        product of edge, size and trade count, so it moves for reasons that
+        have nothing to do with whether the policy knows anything -- a larger
+        account, a longer rollout or a higher trade rate all move it, and a
+        policy with negative edge can post a rising equity curve for a long
+        time on a directional tape. These two numbers separate the only
+        question that matters into its two independent halves: is there edge,
+        and does the edge exceed what it costs to collect it. They are
+        denominated per dollar traded, so they are invariant to account size
+        and trade count, and they are directly comparable against each other.
+
+        Both are measured against the EXECUTION reference price, so
+        alpha_per_turnover is the edge available to an order rather than the
+        edge visible in a close-to-close series -- those differ by the bid-ask
+        bounce, which is the whole reason for the P1 price-frame change.
+
+        Returns zeros for the ratios when nothing traded, which is a real
+        state (a fully-flat rollout) and not a division to guard against.
+
+        PRECISION FLOOR, so nobody chases it later. `gross_pnl` is built from
+        step_pnl = equity_after - equity_before, and PortfolioState carries
+        equity in float32 at a level of ~1e4 per stream, where the float32
+        quantum is ~1.2e-3. That cancellation happens before this method sees
+        anything and cannot be fixed by accumulating in double: over a
+        300-step x 100-stream drive it leaves a residual of order $0.05
+        against the true equity change. `cost` is unaffected -- it is built
+        from fees and qty*(fill-mark), with no large-number cancellation.
+        For scale, $0.05 on $11M of turnover is 0.00005 bps against readings
+        of order 1 bps, so it is four orders of magnitude below anything you
+        would act on. It is a floor, not a leak; if a residual ever shows up
+        that is LARGE relative to turnover, that is a real bug and not this.
+        """
+        turnover = float(self._acc_turnover.item())
+        gross = float(self._acc_gross_pnl.item())
+        cost = float(self._acc_cost.item())
+        fills = int(self._acc_fills.item())
+
+        self._acc_turnover = torch.zeros((), device=self.device, dtype=torch.float64)
+        self._acc_gross_pnl = torch.zeros((), device=self.device, dtype=torch.float64)
+        self._acc_cost = torch.zeros((), device=self.device, dtype=torch.float64)
+        self._acc_fills = torch.zeros((), device=self.device, dtype=torch.float64)
+
+        scale = 1e4 / turnover if turnover > 0 else 0.0
+        return {
+            "alpha_per_turnover": gross * scale,
+            "cost_per_turnover": cost * scale,
+            "net_per_turnover": (gross - cost) * scale,
+            "turnover_notional": turnover,
+            "gross_pnl": gross,
+            "execution_cost": cost,
+            "fills": fills,
+        }
 
     def _record_trade_direction(self, filled_qty: Tensor) -> None:
         """Pushes this step's realized trade sign into both rolling circular buffers."""
@@ -1094,7 +1512,14 @@ class VecTradingEnv:
         budget within the rolling `overtrade_window` (in bars — 5-minute bars
         by default, so overtrade_window=12 is roughly the last hour). 0 means
         at or under the free-trade allowance, 1 means trading every bar.
-        Fed into execution_sim's overtrading slippage surcharge.
+
+        Fed into the REWARD (see _compute_reward's overtrade penalty), not
+        into execution_sim. It used to be priced as extra adverse slippage,
+        which put a shaping term inside the cost accounting -- so
+        cost_per_turnover measured partly what the venue charges and partly
+        what this project wishes the policy would do, and could not be
+        compared against a real execution report. Nothing about the number
+        itself changed; only where it is spent.
         """
         recent_trade_count = (self._trade_hist != 0).float().sum(dim=1)
         denom = max(self.overtrade_window - self.overtrade_free_trades, 1)
@@ -1109,14 +1534,26 @@ class VecTradingEnv:
         mid_price_after: Tensor,
         is_terminal: bool,
         next_obs: Tensor,
+        overtrading_factor: Tensor,
     ) -> Tuple[Tensor, Dict[str, Tensor]]:
         """
         Vol-normalized step reward + terminal alpha-vs-buy-and-hold reward +
-        a hold-loser penalty + a directional-diversity bonus, matching the
-        reward shape described in project notes: position_bar_return /
-        current_atr, benchmarked terminal PnL, a small drag on holding an
-        underwater position, and a penalty on persistent one-sided direction
-        (see module docstring on directional bias mitigation).
+        a hold-loser penalty + a directional-diversity bonus + an overtrading
+        penalty, matching the reward shape described in project notes:
+        position_bar_return / current_atr, benchmarked terminal PnL, a small
+        drag on holding an underwater position, a penalty on persistent
+        one-sided direction (see module docstring on directional bias
+        mitigation), and a penalty on churn.
+
+        THE OVERTRADING PENALTY IS A SHAPING TERM AND LIVES HERE. It used to
+        be charged as extra adverse slippage inside execution_sim.py, which
+        made it indistinguishable from a venue cost: every measured
+        cost-per-trade number was partly the spread and partly this
+        project's opinion about churn, so none of them could be checked
+        against a broker's execution report or a real fill. The coefficient
+        comes from RewardConfig.overtrade_penalty_coef and is denominated in
+        REWARD units, not bps -- see that field for how it was sized, and
+        note that its old bps value does not transfer.
 
         `next_obs` is the already-fetched, already-mirror-adjusted observation
         for `self.current_idx` (passed in from step() so we don't redundantly
@@ -1126,8 +1563,9 @@ class VecTradingEnv:
         step_reward = self._vol_normalized_step_reward(step_pnl, equity_before, next_obs)
         hold_penalty = self._hold_loser_penalty(mid_price_after)
         diversity_bonus = self._diversity_bonus()
+        overtrade_penalty = self.overtrade_penalty_coef * overtrading_factor
 
-        reward = step_reward - hold_penalty + diversity_bonus
+        reward = step_reward - hold_penalty + diversity_bonus - overtrade_penalty
 
         terminal_alpha = torch.zeros_like(step_pnl)
         if is_terminal and self.benchmark_start_price is not None:
@@ -1141,6 +1579,7 @@ class VecTradingEnv:
             "terminal_alpha": terminal_alpha,
             "hold_penalty": hold_penalty,
             "diversity_bonus": diversity_bonus,
+            "overtrade_penalty": overtrade_penalty,
         }
 
     def _vol_normalized_step_reward(self, step_pnl: Tensor, equity_before: Tensor, next_obs: Tensor) -> Tensor:

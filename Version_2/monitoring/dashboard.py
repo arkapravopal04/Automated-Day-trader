@@ -1387,6 +1387,26 @@ class TrainingDashboard:
             components.append(
                 Text.from_markup(f"[{_C_MUTE}]TREND  [/][{ema_color}]{reward_spark}[/]")
             )
+
+        # EDGE, beside the reward and deliberately not beside net worth.
+        # alpha_per_turnover is gross PnL per dollar traded; cost_per_turnover
+        # is what collecting it costs. Both in bps, both invariant to account
+        # size and trade count, and the second must be smaller than the first
+        # for any of this to be worth doing. See VecTradingEnv.
+        # pop_turnover_stats().
+        alpha_pt = _number(rollout.get("alpha_per_turnover"))
+        cost_pt = _number(rollout.get("cost_per_turnover"))
+        net_pt = _number(rollout.get("net_per_turnover"))
+        if alpha_pt is not None or cost_pt is not None:
+            net_color = _C_MUTE if net_pt is None else _C_UP if net_pt >= 0 else _C_DOWN
+            components.append(
+                Text.from_markup(
+                    f"[{_C_MUTE}]EDGE  bps per $ turnover[/]\n"
+                    f"[{_C_MUTE}]alpha[/] [bold {_C_TEXT}]{_fmt_signed(alpha_pt, 3)}[/]   "
+                    f"[{_C_MUTE}]cost[/] [bold {_C_TEXT}]{_fmt_signed(cost_pt, 3)}[/]   "
+                    f"[{_C_MUTE}]net[/] [bold {net_color}]{_fmt_signed(net_pt, 3)}[/]"
+                )
+            )
         components.append(Text(""))
 
         # Bounded-ish quantities get a gauge against a nominal ceiling; the

@@ -415,13 +415,14 @@ def main(argv: Optional[List[str]] = None) -> None:
         commission_bps=cfg.env.commission_bps,
         min_commission=cfg.env.min_commission,
         platform_fee_per_trade=cfg.env.platform_fee_per_trade,
+        execution_price_column=cfg.env.execution_price_column,
         r_step_scale=cfg.env.r_step_scale,
         hold_loser_penalty=cfg.env.hold_loser_penalty,
         enable_mirroring=cfg.env.enable_mirroring,
         mirror_prob=cfg.env.mirror_prob,
         overtrade_window=cfg.env.overtrade_window,
         overtrade_free_trades=cfg.env.overtrade_free_trades,
-        overtrade_surcharge_bps=cfg.env.overtrade_surcharge_bps,
+        overtrade_penalty_coef=cfg.reward.overtrade_penalty_coef,
         bias_window=cfg.env.bias_window,
         diversity_bonus_coef=cfg.env.diversity_bonus_coef,
         trade_cooldown_bars=cfg.env.trade_cooldown_bars,
@@ -608,6 +609,25 @@ def main(argv: Optional[List[str]] = None) -> None:
         net_worth = float(equity_per_ticker.sum().item())
 
         if rollout_idx % cfg.run.log_every_n_rollouts == 0:
+            # THE NUMBERS TO WATCH, and they are deliberately logged beside
+            # reward_ema rather than beside net_worth.
+            #
+            # Net worth is a product of edge, size and trade count, so it
+            # moves for reasons that say nothing about whether the policy
+            # knows anything: a bigger account, a longer rollout or a higher
+            # trade rate all move it, and a policy with negative edge can post
+            # a rising curve for a long time on a directional tape. These two
+            # split the only question that matters into its independent
+            # halves -- is there edge (alpha_per_turnover), and does it exceed
+            # what collecting it costs (cost_per_turnover) -- denominated per
+            # dollar traded, so they are invariant to account size and trade
+            # count and directly comparable against each other.
+            #
+            # Popped inside the log block, not outside it: the accumulators
+            # then cover exactly the interval since the previous record, so
+            # raising log_every_n_rollouts widens the window rather than
+            # discarding the rollouts in between.
+            turnover_stats = env.pop_turnover_stats()
             metrics_writer.log(
                 step=state.global_tick,
                 rollout=rollout_idx,
@@ -615,6 +635,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 record_type="rollout",
                 reward=rollout_reward_mean,
                 reward_ema=ema_reward,
+                **turnover_stats,
                 sharpe=None,  # per-rollout Sharpe isn't meaningful over 256 steps; see eval/metrics.py for the real thing at eval time
                 drawdown=float(drawdown_per_ticker.mean().item()),
                 drawdown_per_ticker=drawdown_per_ticker.tolist(),

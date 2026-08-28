@@ -14,7 +14,7 @@ etc. Add a file-based loader later if you actually need one; not building
 that speculatively.
 
 Single-source-of-truth note: MIRROR_PROB, DIVERSITY_WINDOW, DIVERSITY_COEF,
-OVERTRADE_WINDOW, OVERTRADE_FREE_TRADES, OVERTRADE_SURCHARGE_BPS, and
+OVERTRADE_WINDOW, OVERTRADE_FREE_TRADES, OVERTRADE_PENALTY_COEF, and
 PLATFORM_FEE_PER_TRADE all previously existed as BOTH paths.py's
 .env-driven constants AND separately hardcoded EnvConfig field defaults --
 two places that happened to agree today but had no mechanism keeping them
@@ -44,7 +44,7 @@ from paths import (  # noqa: E402
     DIVERSITY_COEF,
     OVERTRADE_WINDOW,
     OVERTRADE_FREE_TRADES,
-    OVERTRADE_SURCHARGE_BPS,
+    OVERTRADE_PENALTY_COEF,
     PLATFORM_FEE_PER_TRADE,
 )
 
@@ -85,9 +85,11 @@ DEFAULT_TICKERS: List[str] = [
 # --------------------------------------------------------------------------
 # Friction presets -- toggle how expensive/realistic execution is without
 # hand-editing every cost field. Only the fields that actually represent
-# "friction" (spread, impact, participation cap, commissions, platform fee,
-# overtrading surcharge) are touched; everything else in EnvConfig (tickers,
-# window_size, mirroring, reward shaping, etc.) is untouched by this.
+# "friction" (spread, impact, participation cap, commissions, platform fee)
+# are touched; everything else in EnvConfig (tickers, window_size, mirroring,
+# reward shaping, etc.) is untouched by this. The overtrading penalty is NOT
+# a friction any more -- it is reward shaping and lives in RewardConfig -- so
+# only its free-trade allowance appears here, as a churn-window definition.
 #
 #   low        -- near-frictionless: tight spread, minimal impact, high
 #                 participation allowance, zero commissions/fees. Useful for
@@ -98,8 +100,8 @@ DEFAULT_TICKERS: List[str] = [
 #                 costs on 5-min US equity bars). This is what go/no-go
 #                 backtests and live trading should use.
 #   high       -- stress test: wide spread, heavy impact, tight participation
-#                 cap, real commissions + platform fee, aggressive
-#                 overtrading surcharge. If the policy is still profitable
+#                 cap, real commissions + platform fee, a near-zero free-trade
+#                 allowance. If the policy is still profitable
 #                 here, realistic-mode profitability has real margin of
 #                 safety; if it collapses, you've found how fragile the
 #                 edge is to execution assumptions before deploying capital
@@ -113,49 +115,48 @@ DEFAULT_TICKERS: List[str] = [
 
 FRICTION_PRESETS: Dict[str, Dict[str, Any]] = {
     "low": dict(
-        spread_bps=0.1,
-        impact_coef=0.01,
+        spread_bps=0.0,
+        impact_coef=0.25,             # Y prefactor of the sqrt law -- see EnvConfig.impact_coef
         max_participation=0.5,
         commission_per_share=0.0,
         commission_bps=0.0,
         min_commission=0.0,
         platform_fee_per_trade=0.0,
-        overtrade_surcharge_bps=0.0,
         overtrade_free_trades=9999,   # effectively disables the overtrading penalty
     ),
     "realistic": dict(
-        spread_bps=1.0,
-        # 0.1 -> 0.015: recalibrated to the standard square-root impact law,
-        # impact ~= Y * sigma_daily * sqrt(Q/V) with Y ~ 0.5-1 and
-        # sigma_daily ~ 1.5%, i.e. a coefficient near 0.015 -- NOT 0.1, which
-        # is ~7x the literature value and was never calibrated against
-        # anything. It matters most at SMALL order sizes, because sqrt(x) >> x
-        # for small x: at the ~1.3-share orders this project actually trades
-        # (participation ~2e-5 of a consolidated bar) the old 0.1 charged
-        # 0.047% one-way -- roughly 5x the half-spread for an order that in
-        # reality moves the market not at all. Combined with the separate
-        # IEX-volume bug (see paths.py's VOLUME_SCALE) this produced a 0.55%
-        # round-trip cost against a 0.056% median 5-minute move. At 0.015 a
-        # micro order pays ~0.005% one-way (negligible, correct) while a
-        # genuine 10%-of-bar order still pays ~0.24%.
-        impact_coef=0.015,
+        # 1.0 -> 0.0. The half-tick floor IS the spread model now (see
+        # EnvConfig.spread_bps); a proportional term on top would be an extra
+        # assumption with nothing behind it.
+        spread_bps=0.0,
+        # 0.015 -> 0.5. NOT a 33x increase in charged impact -- the units
+        # changed. impact_coef is now the dimensionless Y of
+        # impact/price = Y * sigma_daily * sqrt(Q/ADV), with sigma_daily
+        # measured per ticker instead of folded into the constant, and ADV
+        # replacing bar volume in the denominator. 0.015 was Y * sigma_daily
+        # collapsed into one number against a per-BAR denominator; 0.5 is Y
+        # alone, at the low end of the literature's 0.5-1.0. Net effect on a
+        # small order is a LARGE reduction, because the denominator grew by
+        # ~78x and sqrt(x) >> x for small x.
+        impact_coef=0.5,
         max_participation=0.1,
+        # 0.5 -> 0.0. Alpaca, the venue live/broker_client.py actually
+        # targets, is commission-free on US equities. 0.5 bps was a
+        # placeholder for a broker this project does not use.
         commission_per_share=0.0,
-        commission_bps=0.5,
+        commission_bps=0.0,
         min_commission=0.0,
         platform_fee_per_trade=PLATFORM_FEE_PER_TRADE,
-        overtrade_surcharge_bps=OVERTRADE_SURCHARGE_BPS,
         overtrade_free_trades=OVERTRADE_FREE_TRADES,
     ),
     "high": dict(
         spread_bps=5.0,
-        impact_coef=0.35,
+        impact_coef=1.5,              # above the literature's Y range, deliberately
         max_participation=0.03,
         commission_per_share=0.005,
         commission_bps=1.5,
         min_commission=1.0,
         platform_fee_per_trade=1.0,
-        overtrade_surcharge_bps=10.0,
         overtrade_free_trades=1,
     ),
 }
@@ -190,23 +191,81 @@ class EnvConfig:
     # x $100k (max order $10,000, viable). That means shrinking the ticker
     # universe (n_envs is one stream per ticker), which needs metadata
     # regeneration and a model reshape -- see the notes in Version_2/AGENTS.md.
+
+    # ---------------------------------------------------------------------
+    # P1 VOIDED THE ARITHMETIC ABOVE. Do not act on it without re-deriving.
+    # Every cost number in this block was measured against a model charging a
+    # flat $1 ticket, 0.5 bps commission, a 1.0 bps proportional spread, and
+    # sqrt-impact against 5-MINUTE BAR volume. The venue actually traded
+    # (Alpaca) charges none of the first two, the spread is a half-tick, and
+    # impact belongs against daily ADV. Measured on the val split with the
+    # same fixed policy in both arms: cost_per_turnover 21.704 -> 1.024 bps,
+    # an overstatement of 21.2x.
+    #
+    # So "one-way cost ~29.8 bps vs gross edge ~7.06 bps" is now roughly
+    # "~1.0 bps vs an edge that has not been measured honestly yet", and the
+    # conclusion that followed from it -- that $10k/stream is structurally
+    # unprofitable and only CONCENTRATION can fix it -- no longer follows from
+    # its own premise. The flat ticket was 81.5% of all measured losses and it
+    # is gone; a flat fee is what made order size binding, and there is no
+    # flat fee any more.
+    #
+    # The value is LEFT AT 10_000 regardless, because it still mirrors the
+    # capital this system would deploy, which was always the primary reason.
+    # What is retracted is the claim that this number is a structural blocker.
+    # Re-measure alpha_per_turnover against cost_per_turnover before treating
+    # account size as a constraint again.
+    # ---------------------------------------------------------------------
     initial_cash: float = 10_000.0
     max_position_frac: float = 1.0
     tick_size: float = 0.01
     friction_level: str = "realistic"   # "low" | "realistic" | "high" -- see FRICTION_PRESETS above.
                                           # Informational once set via for_friction(); the fields below
                                           # are what VecTradingEnv actually reads.
-    spread_bps: float = 1.0
-    impact_coef: float = 0.015   # 0.1 -> 0.015, kept in sync with FRICTION_PRESETS["realistic"] --
-                                  # see that entry for the square-root-law calibration rationale.
-                                  # These dataclass defaults (not the preset) are what training
-                                  # actually reads, since train.py builds TrainingConfig() directly
-                                  # rather than going through EnvConfig.for_friction().
+    # PROPORTIONAL half-spread in bps, charged ON TOP OF the half-tick floor
+    # that execution_sim.py applies unconditionally. 1.0 -> 0.0: the minimum
+    # quotable US equity spread is one tick, so half a tick is the floor and
+    # also, on the liquid large caps in this universe, a fair estimate of the
+    # whole thing. Because it is a fixed $0.005 against a per-ticker price,
+    # that floor is already per-ticker in bps -- 5.2 bps on a $9.66 name
+    # against 0.09 bps on a $557 one. Raise this only for a ticker whose
+    # inside market is demonstrably wider than a tick.
+    spread_bps: float = 0.0
+    # The dimensionless Y prefactor of the square-root impact law,
+    # impact/price = Y * sigma_daily * sqrt(Q/ADV). sigma_daily and ADV are
+    # measured per ticker by the env from the split being traded, so this is
+    # the only free number, and the literature pins it to 0.5-1.0 -- it is not
+    # a knob to tune until a strategy looks good.
+    #
+    # 0.015 -> 0.5 is a UNIT change, not a 33x cost increase. The old value
+    # was Y * sigma_daily collapsed into one constant, multiplied by
+    # sqrt(order / 5-MINUTE BAR volume). Dividing by a bar rather than by a
+    # day overstates participation by roughly the 78 bars in a session, and
+    # sqrt(78) ~ 8.8, so the charged impact on a small order FALLS
+    # substantially under the new formulation. Kept in sync with
+    # FRICTION_PRESETS["realistic"] -- these dataclass defaults (not the
+    # preset) are what training actually reads, since train.py builds
+    # TrainingConfig() directly rather than going through
+    # EnvConfig.for_friction().
+    impact_coef: float = 0.5
     max_participation: float = 0.1
     commission_per_share: float = 0.0
-    commission_bps: float = 0.5
+    # 0.5 -> 0.0. Alpaca is commission-free on US equities and is the venue
+    # live/broker_client.py targets. Charging 0.5 bps modelled a broker this
+    # project does not trade through.
+    commission_bps: float = 0.0
     min_commission: float = 0.0
     platform_fee_per_trade: float = PLATFORM_FEE_PER_TRADE
+
+    # Which bar-t+1 price the env fills and marks against: "open" (the
+    # opening print, default) or "vwap" (the size-aware variant -- what an
+    # order worked across the bar would average into). "close" is not an
+    # option: marking close[t] -> close[t+1] books the bid-ask bounce, a
+    # mean-reverting ~0.47 bps/bar component of the return series that no
+    # order can capture, and optimising against it is optimising against an
+    # artifact of how the data is recorded. The observation still ends at
+    # bar t either way. See vec_trading_env.py's module docstring.
+    execution_price_column: str = "open"
     # 0.5 -> 2.0. Scales the vol-normalized step-PnL term, which is the only
     # DIRECTLY PnL-aligned signal in the whole reward. Measured over 200 steps
     # x 100 streams it was the SMALLEST component of the env reward
@@ -215,17 +274,28 @@ class EnvConfig:
     # inside StepResult.reward, which is the point of switching raw_weight on.
     r_step_scale: float = 2.0
     hold_loser_penalty: float = 0.0005
+    # mirror_prob defaults to 0.0 as of P1 -- mirroring fabricates a
+    # cross-section that does not exist (in-sim pairwise rho 0.001 against a
+    # true 0.256). enable_mirroring is left True as the switch that would turn
+    # it back on, but the env treats prob 0 as off outright. See paths.py's
+    # MIRROR_PROB for the full reasoning before changing either.
     enable_mirroring: bool = True
     mirror_prob: float = MIRROR_PROB
     overtrade_window: int = OVERTRADE_WINDOW
     overtrade_free_trades: int = OVERTRADE_FREE_TRADES
-    overtrade_surcharge_bps: float = OVERTRADE_SURCHARGE_BPS
+    # NOTE: the overtrading penalty's COEFFICIENT lives in RewardConfig, not
+    # here -- it is reward shaping, not a venue cost. The two fields above are
+    # what DEFINES the churn window, which is an env property, so they stay.
     bias_window: int = DIVERSITY_WINDOW
     diversity_bonus_coef: float = DIVERSITY_COEF
     # Bars a stream must wait after INCREASING exposure before it may increase
     # again (closes/reduces are never blocked). 12 bars = 1 hour of 5-min bars,
     # matching overtrade_window. 0 disables. See
-    # VecTradingEnv._apply_trade_cooldown() for the measurements behind this.
+    # VecTradingEnv._apply_trade_cooldown() for the measurements behind this --
+    # INCLUDING the P1 note that the cost arithmetic justifying 12 no longer
+    # holds (round trip ~2 bps, not ~17). Left at 12 so the first run under the
+    # honest cost model stays comparable to the runs before it; it is the
+    # leading candidate to relax once that run has an alpha reading.
     trade_cooldown_bars: int = 12
 
     # Minimum bars a position must be held before the policy may reduce it.
@@ -556,6 +626,30 @@ class RewardConfig:
     dsr_enable_checkpoint_bonus: bool = True
     dsr_checkpoint_step: float = 0.025          # 2.5% cumulative-return milestone spacing
     dsr_checkpoint_bonus_frac: float = 0.10     # +/- 10% of |D_t| per new milestone crossed
+
+    # --- Overtrading penalty (moved here from the cost model, P1) --------
+    # Subtracted from vec_trading_env.py's StepResult.reward as
+    #     overtrade_penalty_coef * overtrading_factor
+    # where overtrading_factor is 0 for a stream inside its free-trade
+    # allowance (EnvConfig.overtrade_free_trades within
+    # EnvConfig.overtrade_window bars) and 1 for one trading every bar.
+    #
+    # It used to be EnvConfig.overtrade_surcharge_bps, charged as extra
+    # adverse slippage inside execution_sim.py. That made it a fake venue
+    # cost, and the damage was to measurement rather than to behaviour: the
+    # fill price carried it, so both the measured cost AND the measured edge
+    # (which is PnL against that same fill price) were contaminated, and
+    # neither could be compared against a broker execution report. Penalising
+    # churn is a legitimate thing to want; pricing it as slippage meant the
+    # instrument could not be read.
+    #
+    # THE OLD VALUE OF 3.0 DOES NOT TRANSFER -- that was bps of notional per
+    # fill, this is reward units per step. See paths.py's
+    # OVERTRADE_PENALTY_COEF for how 0.002 was sized against the measured
+    # magnitudes of the reward terms it sits beside. Note it is scaled by
+    # RewardConfig.raw_weight along with everything else in StepResult.reward.
+    # 0.0 disables it.
+    overtrade_penalty_coef: float = OVERTRADE_PENALTY_COEF
 
 
 @dataclass

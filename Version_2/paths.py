@@ -223,8 +223,26 @@ os.makedirs(PROCESSED_DIR, exist_ok=True)
 # equity dataset. Decided INDEPENDENTLY per ticker/stream each episode (not
 # one global flag for the whole batch), so a single episode can have some
 # tickers mirrored and others not. 0.5 = each stream has a 50/50 chance.
-# Set to 0.0 to disable entirely.
-MIRROR_PROB = float(os.environ.get("TRADING_MIRROR_PROB", "0.5"))
+#
+# 0.5 -> 0.0 (P1). OFF, and this is a decision rather than a default worth
+# tuning. Mirroring negates each stream's returns INDEPENDENTLY, which
+# destroys the co-movement between them: measured in-sim pairwise correlation
+# across streams came out at 0.001 against a true 0.256 on the real panel. It
+# was not simulating a bear market, it was simulating 100 unrelated random
+# walks. Every cross-sectional thing this project is built on -- xs_resid,
+# cross-asset attention, any relative-value signal -- is a claim about a
+# cross-section that mirroring deletes, so training them under it is not a
+# bias mitigation but a different and easier problem.
+#
+# The signature was already in the codebase before it was named: mirrored
+# streams cannot carry a coherent cross-sectional feature at all, so
+# vec_trading_env._apply_mirror_to_obs() zeroes those channels for them. That
+# was this same defect, visible one channel at a time.
+#
+# Directional bias is still real. It is answered by the policy-side
+# mitigations (adaptive symmetry penalty, discrete direction head, dual
+# critics) and the diversity bonus below -- not by fabricating data.
+MIRROR_PROB = float(os.environ.get("TRADING_MIRROR_PROB", "0.0"))
 
 # Rolling-window opponent-aware diversity bonus: penalizes a persistently
 # one-sided direction history over the last DIVERSITY_WINDOW steps.
@@ -232,15 +250,32 @@ MIRROR_PROB = float(os.environ.get("TRADING_MIRROR_PROB", "0.5"))
 DIVERSITY_WINDOW = int(os.environ.get("TRADING_DIVERSITY_WINDOW", "50"))
 DIVERSITY_COEF = float(os.environ.get("TRADING_DIVERSITY_COEF", "0.015"))
 
-# --- Overtrading surcharge & platform fee ---
-# Extra adverse slippage applied once a stream has traded more than
-# OVERTRADE_FREE_TRADES times within the last OVERTRADE_WINDOW bars (5-min
-# bars by default, so 12 bars ~= 1 hour). Discourages churning the position
-# every step just to farm the vol-normalized step reward. Set
-# OVERTRADE_SURCHARGE_BPS=0.0 to disable.
+# --- Overtrading penalty & platform fee ---
+# Penalty applied once a stream has traded more than OVERTRADE_FREE_TRADES
+# times within the last OVERTRADE_WINDOW bars (5-min bars by default, so 12
+# bars ~= 1 hour). Discourages churning the position every step just to farm
+# the vol-normalized step reward. Set OVERTRADE_PENALTY_COEF=0.0 to disable.
+#
+# THIS IS A REWARD TERM, NOT A COST (P1). It used to be
+# OVERTRADE_SURCHARGE_BPS, charged as extra adverse slippage inside
+# execution_sim.py. That made every cost number this project produced a blend
+# of what a venue charges and what this project wishes the policy would do --
+# so cost_per_turnover could not be checked against a broker execution report,
+# and neither could any measured edge, since both come out of the same fill
+# price. It now enters the reward in vec_trading_env._compute_reward(), where
+# a shaping term belongs, and the cost path measures only real costs.
+#
+# THE OLD 3.0 DOES NOT TRANSFER, because the units are not the same: it was
+# bps of notional on a fill, this is reward units per step. 0.002 is sized
+# against the measured magnitudes of the terms it sits beside (mean|x| over
+# 200 steps x 100 streams): step-PnL 0.00102 at r_step_scale=2.0,
+# diversity_bonus 0.00118, hold_loser_penalty 0.000404. The factor it
+# multiplies is 0 for a stream inside its free-trade allowance and 1 for one
+# trading every bar, so at saturation this is roughly 2x the step-PnL term --
+# a real drag on a churning stream, exactly nothing on a well-behaved one.
 OVERTRADE_WINDOW = int(os.environ.get("TRADING_OVERTRADE_WINDOW", "12"))
 OVERTRADE_FREE_TRADES = int(os.environ.get("TRADING_OVERTRADE_FREE_TRADES", "3"))
-OVERTRADE_SURCHARGE_BPS = float(os.environ.get("TRADING_OVERTRADE_SURCHARGE_BPS", "3.0"))
+OVERTRADE_PENALTY_COEF = float(os.environ.get("TRADING_OVERTRADE_PENALTY_COEF", "0.002"))
 
 # Flat $ ticket fee charged by the broker/platform on any non-zero fill,
 # independent of size (separate from commission_bps/commission_per_share,

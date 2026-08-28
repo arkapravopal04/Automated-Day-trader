@@ -178,7 +178,9 @@ def print_summary(trained: bool = True) -> None:
         if rollouts:
             last = rollouts[-1]
             print(f"[metrics] {len(rollouts)} rollout record(s); latest:")
-            for key in ("rollout", "reward", "reward_ema", "policy_loss", "value_loss",
+            for key in ("rollout", "reward", "reward_ema",
+                        "alpha_per_turnover", "cost_per_turnover", "net_per_turnover",
+                        "policy_loss", "value_loss",
                         "entropy_discrete", "approx_kl", "total_trades", "net_worth"):
                 if key in last:
                     print(f"    {key:<18} {last[key]}")
@@ -204,8 +206,20 @@ EXPECTED ON A HEALTHY QUICK RUN (100 rollouts):
     (not 0 -- that note predated the measured 79x scale gap between the
     DSR term and the env's own StepResult.reward) puts the mix near
     DSR 50% / step-PnL 28% / hold-penalty 11% / diversity 10%
-  * net_worth is the SUM across ~100 streams, each with $10k -> baseline ~$1M;
-    watch its DIRECTION per rollout, not the absolute number
+  * alpha_per_turnover / cost_per_turnover ARE THE NUMBERS TO WATCH, in bps
+    per dollar traded. cost_per_turnover should sit near 1 bps and be almost
+    flat -- it is the venue, not the policy, and a drifting one means the
+    policy is churning into thinner bars. alpha_per_turnover is the actual
+    question: it starts near 0 and only progress moves it. net_per_turnover
+    is their difference and must be positive for any of this to be worth
+    doing. All three are invariant to account size and trade count, which is
+    exactly what net_worth is not.
+  * net_worth is the SUM across ~100 streams, each with $10k -> baseline ~$1M.
+    It is now a secondary number: it is a product of edge, size and trade
+    count, so it moves for reasons unrelated to whether the policy knows
+    anything, and a negative-edge policy can post a rising curve for a long
+    time on a directional tape. Watch its DIRECTION, not the absolute number,
+    and believe the per-turnover pair over it when they disagree
   * checkpoints: checkpoint_0.pt ... checkpoint_75.pt (every 25) +
     checkpoint_best.pt once EMA reward beats the warmup baseline
   * the live-path fixes (H1-H6) don't change training behavior -- they only
