@@ -293,41 +293,42 @@ class EnvConfig:
     # matching overtrade_window. 0 disables. See
     # VecTradingEnv._apply_trade_cooldown() for the original measurements.
     #
-    # 12 -> 0. THE ONLY JUSTIFICATION THIS CONSTRAINT EVER HAD WAS COST
-    # ARITHMETIC, AND P1 VOIDED IT. The docstring's case was explicit: "at
-    # ~$800 orders a round trip costs ~17 bps against a ~5.6 bps median 5-min
-    # move, so a position must be held on the order of tens of bars before its
-    # expected move can clear its own ticket." Measured on the 150-rollout
-    # Kaggle run under the recalibrated cost model, a round trip is ~1.6 bps
-    # (cost_per_turnover 0.776 bps each way, turnover-weighted over $165.6M and
-    # 253,913 fills). Against the same 5.6-9.8 bps median move, a ONE-bar hold
-    # now clears its own cost several times over. The premise is not merely
-    # weaker; it has inverted.
+    # TRIED 0, REVERTED TO 12 ON MEASURED EVIDENCE. Keep it at 12.
     #
-    # ZERO, not some smaller positive number. Any intermediate value would be a
-    # fresh arbitrary constant with no derivation behind it -- exactly what the
-    # min_hold_bars comment below refuses to do ("enabling it blind would just
-    # be a different arbitrary constraint"), and what this project's own
-    # working agreements warn against. The honest move is to remove a
-    # constraint whose stated basis no longer holds, not to re-tune it by feel.
+    # The argument for removing it was that its only stated justification was
+    # cost arithmetic and P1 had voided that: the original case was "a round
+    # trip costs ~17 bps against a ~5.6 bps median 5-min move, so hold tens of
+    # bars", and under the recalibrated cost model a round trip is ~1.6 bps, so
+    # a one-bar hold clears its own cost several times over. That reasoning was
+    # correct as far as it went, and it was still the wrong call, because the
+    # cooldown was doing a second job nobody was pricing.
     #
-    # WHAT THIS GIVES UP, stated plainly: the cooldown was also the only HARD
-    # brake on churn. It was made a hard constraint precisely because two runs
-    # "optimised the reward well while still churning", i.e. the soft penalty
-    # was not sufficient on its own. That soft penalty still exists and now
-    # lives in RewardConfig.overtrade_penalty_coef -- but it has never been
-    # shown to hold the line unaided, and on the 150-rollout run it contributed
-    # ~0.2% of the reward because the policy never churned enough to trigger
-    # it. So this change is a genuine test of an untested mechanism, not a
-    # free win.
+    # MEASURED, cooldown=0 vs cooldown=12, matched at 93 rollouts:
     #
-    # WATCH, on the next run: fills and turnover_notional per rollout against
-    # the 4,379 / $2.93M that run started from. If churn returns, the evidence
-    # will be cost_per_turnover climbing off its ~0.78 bps floor while
-    # alpha_per_turnover does not follow -- that is paying more spread for the
-    # same edge. The answer would then be to raise overtrade_penalty_coef
-    # first, and only restore a hard cooldown if the soft term again fails.
-    trade_cooldown_bars: int = 0
+    #                        cd=12         cd=0
+    #     turnover      $159,799,003  $368,718,253   (2.3x)
+    #     fills              240,043       523,958   (2.2x)
+    #     cost_per_turnover    0.781         0.840   (off the floor)
+    #     alpha_per_turnover  +0.015        -0.033   (did NOT follow)
+    #     net worth           -1.20%        -3.12%
+    #
+    # That is exactly the predicted failure signature: cost climbing off its
+    # ~0.78 bps floor while alpha does not follow, i.e. paying more spread for
+    # the same (absent) edge. Churn returned the moment the hard brake came
+    # off.
+    #
+    # THE REAL LESSON, worth more than the number: the cooldown was never only
+    # a cost constraint. It is the only HARD brake on churn, and it was made
+    # hard in the first place precisely because two earlier runs "optimised the
+    # reward well while still churning" -- the soft penalty had already failed
+    # once. RewardConfig.overtrade_penalty_coef is that soft penalty, and this
+    # run is its second failure: it contributed ~0.2% of the reward and did not
+    # bind. Retiring a constraint because ONE of its justifications expired,
+    # without checking what else it was holding up, is the mistake here.
+    #
+    # If this is revisited: raise overtrade_penalty_coef until it demonstrably
+    # binds BEFORE touching this, and change one of the two at a time.
+    trade_cooldown_bars: int = 12
 
     # Minimum bars a position must be held before the policy may reduce it.
     #
