@@ -75,6 +75,7 @@ from env.vec_trading_env import VecTradingEnv  # noqa: E402
 from training.config import TrainingConfig  # noqa: E402
 from training.ppo_hybrid import (  # noqa: E402
     AdaptiveEntropyCoef, HybridActorCritic, collect_rollout, compute_gae,
+    load_actor_critic_state,
 )
 from training.reward import DifferentialSharpeReward  # noqa: E402
 
@@ -152,6 +153,7 @@ def _worker(
     checkpoint_every_n_rollouts: Optional[int] = None,
     log_every_n_rollouts: Optional[int] = None,
     tick_log_every_n_ticks: Optional[int] = None,
+    pretrained_trunk: Optional[str] = None,
 ) -> None:
     _setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
@@ -201,6 +203,44 @@ def _worker(
     env = _build_env(cfg, device)
     actor_critic = HybridActorCritic(n_features=len(env.feature_names), cfg=cfg).to(device)
 
+    if resume_path is None and pretrained_trunk:
+        # P2 bullet 3, mirroring train.py's block. EVERY rank loads the same
+        # file onto its own device: DDP requires byte-identical starting
+        # weights, and loading on rank 0 alone would leave rank 1 with a
+        # randomly-initialised trunk that DDP would then average into it.
+        blob = torch.load(pretrained_trunk, map_location=device, weights_only=True)
+        trunk_sd = dict(blob.get("trunk", blob))
+        missing, unexpected = actor_critic.load_state_dict(trunk_sd, strict=False)
+        fresh_keys = ("policy_head.", "critic_head.", "edge_head.", "edge_scale_bps")
+        unloaded = [k for k in missing if not k.startswith(fresh_keys)]
+        if unexpected or unloaded:
+            raise SystemExit(
+                f"[train_ddp] --pretrained-trunk {pretrained_trunk} does not match this "
+                f"model -- missing {sorted(unloaded)[:6]}, unexpected {sorted(unexpected)[:6]}"
+            )
+        have_edge_head = "edge_head" in blob and "target_sd_bps" in blob
+        if have_edge_head:
+            actor_critic.edge_head.load_state_dict(blob["edge_head"])
+            actor_critic.edge_scale_bps.fill_(float(blob["target_sd_bps"]))
+        if rank == 0:
+            print(f"[train_ddp] loaded pre-trained trunk from {pretrained_trunk}: "
+                  f"{len(trunk_sd)} tensors (hold {blob.get('hold', '?')} bars, "
+                  f"val IC {blob.get('val_ic', float('nan')):+.5f}); policy and critic "
+                  f"heads are fresh"
+                  + (f"; edge head loaded, scale {float(actor_critic.edge_scale_bps):.2f} bps"
+                     if have_edge_head else "; NO edge head in this checkpoint"))
+        if cfg.risk.kelly_edge_source == "model" and not have_edge_head:
+            raise SystemExit(
+                "[train_ddp] risk.kelly_edge_source == 'model' but the checkpoint carries "
+                "no edge head. Re-run training/pretrain_trunk.py, or set "
+                "kelly_edge_source back to 'realized'."
+            )
+    elif resume_path is None and cfg.risk.kelly_edge_source == "model":
+        raise SystemExit(
+            "[train_ddp] risk.kelly_edge_source == 'model' needs a supervised edge head. "
+            "Pass --pretrained-trunk <checkpoint from training/pretrain_trunk.py>."
+        )
+
     start_rollout = 0
     best_metric = float("-inf")
     ema_reward = None
@@ -218,7 +258,7 @@ def _worker(
         # weights_only=True -- see main.py's matching comment (checkpoints
         # are pickle files; arbitrary-object unpickling is RCE).
         checkpoint = torch.load(resume_path, map_location=device, weights_only=True)
-        actor_critic.load_state_dict(checkpoint["actor_critic"])
+        load_actor_critic_state(actor_critic, checkpoint["actor_critic"], resume_path)
         start_rollout = checkpoint["rollout_idx"] + 1
         best_metric = checkpoint.get("best_metric", float("-inf"))
         ema_reward = checkpoint.get("ema_reward", None)
@@ -639,6 +679,7 @@ def launch_ddp_training(
     checkpoint_every_n_rollouts: Optional[int] = None,
     log_every_n_rollouts: Optional[int] = None,
     tick_log_every_n_ticks: Optional[int] = None,
+    pretrained_trunk: Optional[str] = None,
 ) -> None:
     """
     Meant to be called from `python train_ddp.py ...` (a real subprocess),
@@ -666,6 +707,8 @@ def launch_ddp_training(
             argv += ["--fresh"]
         if tick_log_every_n_ticks is not None:
             argv += ["--tick-log-every-n-ticks", str(tick_log_every_n_ticks)]
+        if pretrained_trunk is not None:
+            argv += ["--pretrained-trunk", pretrained_trunk]
         # train.py's own argparse doesn't expose checkpoint_dir/metrics_path
         # overrides -- if you need those on the single-GPU fallback path
         # too, set cfg.run.checkpoint_dir / cfg.run.metrics_path directly in
@@ -678,7 +721,8 @@ def launch_ddp_training(
     mp.spawn(
         _worker,
         args=(world_size, total_rollouts, resume, fresh, checkpoint_dir, metrics_path,
-              checkpoint_every_n_rollouts, log_every_n_rollouts, tick_log_every_n_ticks),
+              checkpoint_every_n_rollouts, log_every_n_rollouts, tick_log_every_n_ticks,
+              pretrained_trunk),
         nprocs=world_size,
         join=True,
     )
@@ -699,6 +743,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
              "nor --fresh is given and checkpoints exist, training refuses to start rather "
              "than guess (pass --resume latest to continue, or --fresh to reset).",
     )
+    parser.add_argument(
+        "--pretrained-trunk", type=str, default=None,
+        help="Checkpoint from training/pretrain_trunk.py. Loads the shared trunk on "
+             "every rank and leaves the policy and critic heads fresh. Ignored with --resume.")
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--metrics-path", type=str, default=None)
     parser.add_argument("--checkpoint-every-n-rollouts", type=int, default=None)
@@ -721,4 +769,5 @@ if __name__ == "__main__":
         checkpoint_every_n_rollouts=args.checkpoint_every_n_rollouts,
         log_every_n_rollouts=args.log_every_n_rollouts,
         tick_log_every_n_ticks=args.tick_log_every_n_ticks,
+        pretrained_trunk=args.pretrained_trunk,
     )

@@ -290,7 +290,12 @@ def load_panel(max_tickers=None):
 
     return dict(X=X, P=P, features=features, tickers=names,
                 day_id=day_id, bar_of_day=bar_of_day,
-                session_last_idx=session_last_idx)
+                session_last_idx=session_last_idx,
+                # The aligned timeline itself. Nothing in this script needs it,
+                # but eval/xsec_book.py reindexes raw volume onto it to measure
+                # per-ticker ADV, and reconstructing it from day_id/bar_of_day
+                # would not survive a missing bar.
+                index=index)
 
 
 def exit_index(T, h, session_last_idx=None):

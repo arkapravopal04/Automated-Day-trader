@@ -124,9 +124,36 @@ class HybridActorCritic(nn.Module):
             hidden_dim=m.critic_hidden_dim,
             dropout=m.critic_dropout,
         )
+        # P2 bullets 3 and 4. A scalar head predicting this name's edge, in bps,
+        # over the pre-training horizon. PPO never trains it -- it carries the
+        # supervised fit from `training/pretrain_trunk.py` and exists so
+        # KellySizer can be driven by a forward-looking estimate instead of by
+        # closed-trade history that a low-turnover book never accumulates.
+        #
+        # Always constructed, so one state_dict shape serves both paths.
+        # Checkpoints written before this existed lack these two entries, which
+        # is why train.py's resume load tolerates exactly them and nothing else.
+        self.edge_head = nn.Linear(self.fusion.output_dim, 1)
+        # The sd the supervised target was standardised by, in bps. A buffer and
+        # not a constant: it is a property of the horizon the head was fitted
+        # at, and reading it off anything other than the checkpoint that wrote
+        # the head silently rescales every edge the governor sees.
+        self.register_buffer("edge_scale_bps", torch.tensor(1.0))
 
     def init_hidden(self, batch_size: int, device: torch.device) -> Hidden:
         return self.lstm.init_hidden(batch_size, device)
+
+    def edge_bps(self, trunk: Tensor) -> Tensor:
+        """[batch] predicted edge in bps, cross-sectionally demeaned.
+
+        Demeaned across the batch because the batch IS the cross-section here
+        and the head was fitted against a demeaned target. Undoing the
+        standardisation with `edge_scale_bps` is what puts the output back in
+        bps, which is the only unit in which comparing it against a round-trip
+        cost means anything.
+        """
+        raw = self.edge_head(trunk).squeeze(-1)
+        return (raw - raw.mean()) * self.edge_scale_bps
 
     def forward_features(
         self, obs: Tensor, hidden: Hidden, ticker_mask: Optional[Tensor] = None
@@ -154,6 +181,35 @@ class HybridActorCritic(nn.Module):
         attn_out = self.cross_attn(lstm_last, ticker_mask=ticker_mask)  # [batch, lstm_dim]
         trunk = self.fusion(cnn_last, attn_out)         # [batch, trunk_dim]
         return trunk, new_hidden
+
+
+# Keys added to HybridActorCritic by P2 (the supervised edge head and the scale
+# it was standardised by). Every checkpoint written before P2 lacks them, and
+# they are the ONLY keys a load is allowed to be missing.
+_P2_ADDED_KEYS = ("edge_head.", "edge_scale_bps")
+
+
+def load_actor_critic_state(actor_critic, state_dict, source: str) -> bool:
+    """Load a checkpoint's weights, tolerating exactly the P2 additions.
+
+    Returns True when the checkpoint carried an edge head, False when it
+    predates one. Anything else missing or unexpected raises -- a shape or
+    naming mismatch anywhere else means the checkpoint was written by a
+    different model, and loading it partially would produce a network that runs
+    and is silently half-random.
+    """
+    missing, unexpected = actor_critic.load_state_dict(state_dict, strict=False)
+    hard = [k for k in missing if not k.startswith(_P2_ADDED_KEYS)]
+    if hard or unexpected:
+        raise SystemExit(
+            f"[load] {source} does not match this model -- "
+            f"missing {sorted(hard)[:6]}, unexpected {sorted(unexpected)[:6]}"
+        )
+    if missing:
+        print(f"[load] {source} predates the supervised edge head; it is randomly "
+              "initialised and PPO does not train it. Do not size Kelly from it.")
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -390,6 +446,21 @@ def collect_rollout(
             attention_mask = kill_switch.is_halted() | env._current_bar_no_trade_mask()  # noqa: SLF001
 
             trunk, new_hidden = actor_critic.forward_features(obs, hidden, ticker_mask=attention_mask)
+
+            if kelly_sizer.edge_source == "model":
+                # Round trip from the TICK terms only -- half-spread floor plus
+                # the adverse snap, both 1/price, doubled for the round trip.
+                # Impact is deliberately excluded: it is a function of the order
+                # size this call is about to help decide, and folding it in here
+                # would make the cap depend on its own output.
+                tick = float(env.execution.tick_size)
+                rt_cost_bps = 2.0 * (2.0 * 1e4 * (tick / 2.0) / mid_price.clamp(min=1e-6))
+                kelly_sizer.set_model_edge(
+                    edge_bps=actor_critic.edge_bps(trunk).detach(),
+                    sigma_bps=actor_critic.edge_scale_bps.expand_as(mid_price),
+                    cost_bps=rt_cost_bps,
+                )
+
             action_sample: HybridActionSample = actor_critic.policy_head.act(trunk, deterministic=False)
             values = actor_critic.critic_head(trunk)
             value_selected = DualCriticHead.select(values, position_before)

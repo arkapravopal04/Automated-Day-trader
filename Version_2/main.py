@@ -42,7 +42,7 @@ from training.config import TrainingConfig
 
 
 def _load_actor_critic(checkpoint_path: str, cfg: TrainingConfig, n_features: int, device: torch.device):
-    from training.ppo_hybrid import HybridActorCritic
+    from training.ppo_hybrid import HybridActorCritic, load_actor_critic_state
 
     actor_critic = HybridActorCritic(n_features=n_features, cfg=cfg).to(device)
     # weights_only=True: checkpoints are pickle files -- loading one from an
@@ -50,7 +50,7 @@ def _load_actor_critic(checkpoint_path: str, cfg: TrainingConfig, n_features: in
     # checkpoints only ever contain tensors + plain Python types, which
     # weights_only loads fine.
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    actor_critic.load_state_dict(checkpoint["actor_critic"])
+    load_actor_critic_state(actor_critic, checkpoint["actor_critic"], checkpoint_path)
     actor_critic.eval()
     return actor_critic
 

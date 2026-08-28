@@ -64,6 +64,8 @@ class KellySizer:
         kelly_cap: float = 1.0,             # never let raw f* exceed this before the multiplier
         default_fraction: float = 0.02,     # conservative fallback while warming up / no history
         min_fraction: float = 0.0,          # floor on the POST-multiplier fraction -- see below
+        edge_source: str = "realized",      # "realized" | "model" -- see set_model_edge()
+        enabled: bool = True,               # False = pass sizes through untouched
         device: Optional[str] = None,
     ) -> None:
         """
@@ -93,6 +95,14 @@ class KellySizer:
         self.n_envs = n_envs
         self.lookback_trades = lookback_trades
         self.min_trades_for_estimate = min_trades_for_estimate
+        if edge_source not in ("realized", "model"):
+            raise ValueError(f"edge_source must be 'realized' or 'model', got {edge_source!r}")
+        self.edge_source = edge_source
+        # P2 bullet 4's second option: keep the governor for live and take it
+        # out of training. Diagnostics are still computed when disabled, so the
+        # metrics log keeps showing what the cap WOULD have been -- that is the
+        # only way to tell later whether it was worth reinstating.
+        self.enabled = bool(enabled)
         self.kelly_multiplier = kelly_multiplier
         self.kelly_cap = kelly_cap
         self.default_fraction = default_fraction
@@ -110,8 +120,19 @@ class KellySizer:
         self._ptr: List[int] = [0] * self.n_envs
         self._count = torch.zeros(self.n_envs, dtype=torch.long, device=self.device)
 
+        # Model-edge state, populated only by set_model_edge(). None means
+        # "never fed", which _edge_estimate() reports as cold rather than as a
+        # zero edge -- the two are different and only one of them is a fact.
+        self._model_kelly: Optional[Tensor] = None
+        self._model_edge_bps: Optional[Tensor] = None
+
     def reset(self, env_mask: Optional[Tensor] = None) -> None:
-        """Clears trade history for all envs, or only those selected by env_mask."""
+        """Clears trade history for all envs, or only those selected by env_mask.
+
+        The model edge is NOT cleared: it is a property of the current bar's
+        observation, not of an episode's accumulated outcomes, and the caller
+        overwrites it every step anyway.
+        """
         if env_mask is None:
             self._pnl_hist.fill_(float("nan"))
             self._ptr = [0] * self.n_envs
@@ -153,6 +174,52 @@ class KellySizer:
             self._ptr[i] += 1
             self._count[i] = min(self._count[i].item() + 1, self.lookback_trades)
 
+    def set_model_edge(
+        self,
+        edge_bps: Tensor,                    # [n_envs], SIGNED expected return over the hold
+        sigma_bps: Tensor,                   # [n_envs], sd of that same return
+        cost_bps: Optional[Tensor] = None,   # [n_envs], round trip; subtracted from |edge|
+    ) -> None:
+        """Size from the model's own edge estimate instead of realized trades.
+
+        WHY THIS EXISTS. The realized-trade estimator needs
+        `min_trades_for_estimate` CLOSED round trips per stream before
+        `is_warm` goes true, and until then every stream sizes at
+        `default_fraction` -- a constant, i.e. not Kelly at all. A
+        cost-aware cross-sectional book turns over ~0.036 of gross per bar and
+        holds ~5 names at a time; most streams close single-digit round trips
+        across an entire rollout, so the estimator spends the whole run cold and
+        the "Kelly governor" is a fixed fraction wearing its name. Feeding it
+        the model's forward-looking edge makes it warm on the first bar,
+        because the estimate no longer has to be accumulated from outcomes.
+
+        THE MAPPING. Continuous Kelly for a return with mean mu and standard
+        deviation sigma is f* = mu / sigma^2, both in RETURN units -- hence the
+        1e-4 conversions off bps. Net of cost, because an edge that does not
+        clear its own round trip is not edge:
+
+            f* = max(|edge| - cost, 0) / sigma^2
+
+        The sign is deliberately dropped: this class caps SIZE and never picks
+        direction, and it is handed a direction separately by apply(). It also
+        never grows an order, so a large f* is permissive rather than
+        instructive.
+
+        Call once per step, before apply(). Values persist until replaced, so a
+        stale call sizes the next bar on the last bar's edge -- pass the current
+        bar's estimate every step or leave `edge_source="realized"`.
+        """
+        to = lambda x: torch.as_tensor(x, device=self.device).float().reshape(-1)
+        edge = to(edge_bps).abs()
+        sigma = to(sigma_bps).abs().clamp(min=1e-6)
+        if cost_bps is not None:
+            edge = (edge - to(cost_bps).abs()).clamp(min=0.0)
+        # bps -> return units, then f* = mu / sigma^2.
+        mu = edge * 1e-4
+        var = (sigma * 1e-4) ** 2
+        self._model_kelly = (mu / var.clamp(min=1e-12)).clamp(min=0.0, max=self.kelly_cap)
+        self._model_edge_bps = edge
+
     def _edge_estimate(self) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Computes the rolling win rate, payoff ratio, and clamped raw Kelly
@@ -160,6 +227,22 @@ class KellySizer:
 
         Returns (win_rate, payoff_ratio, raw_kelly, is_warm), each [n_envs].
         """
+        if self.edge_source == "model":
+            if self._model_kelly is None:
+                # Never fed. Report cold rather than inventing an edge, so
+                # _fractional_kelly falls back to default_fraction exactly as it
+                # does for a realized estimator with no closed trades.
+                zeros = torch.zeros(self.n_envs, device=self.device)
+                return (zeros, zeros, zeros,
+                        torch.zeros(self.n_envs, dtype=torch.bool, device=self.device))
+            # win_rate / payoff_ratio are not defined for a model edge and are
+            # reported as NaN rather than as a plausible-looking number that
+            # nothing computed. Only raw_kelly and is_warm are meaningful here,
+            # and the dashboard reads them by name.
+            nan = torch.full((self.n_envs,), float("nan"), device=self.device)
+            return (nan, nan, self._model_kelly,
+                    torch.ones(self.n_envs, dtype=torch.bool, device=self.device))
+
         valid = ~torch.isnan(self._pnl_hist)                       # [n_envs, lookback]
         n_valid = valid.sum(dim=1).float().clamp(min=1.0)
 
@@ -209,7 +292,7 @@ class KellySizer:
         win_rate, payoff_ratio, raw_kelly, is_warm = self._edge_estimate()
         fractional_kelly = self._fractional_kelly(raw_kelly, is_warm)
 
-        adjusted_size = self._cap_growing_size(
+        adjusted_size = size if not self.enabled else self._cap_growing_size(
             size=size,
             direction=direction,
             mid_price=mid_price,

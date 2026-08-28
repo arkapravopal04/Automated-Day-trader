@@ -12,7 +12,9 @@ or stage-by-stage (each flag is independent and re-runnable):
     !python Version_2/run_kaggle.py --fetch             # 1. download 5-min bars
     !python Version_2/run_kaggle.py --preprocess       # 2. features + metadata.json
     !python Version_2/run_kaggle.py --diagnostics      # 3. data/env/GPU sanity checks
-    !python Version_2/run_kaggle.py --train --total-rollouts 200   # 4. PPO training
+    !python Version_2/run_kaggle.py --book             # 4. P2 book + lambda sweep (minutes)
+    !python Version_2/run_kaggle.py --pretrain         # 5. supervised trunk (GPU)
+    !python Version_2/run_kaggle.py --train --total-rollouts 200   # 6. PPO training
 
 Secrets (Add-ons -> Secrets): reads ALPACA_API_KEY / ALPACA_SECRET_KEY and
 exports them as env vars, plus TRADING_ALPACA_PAPER_KEY/SECRET if you
@@ -26,6 +28,9 @@ Outputs (attach /kaggle/working as a Dataset output to persist them):
     /kaggle/working/logs/metrics.jsonl          rollout metrics
     /kaggle/working/logs/metrics.jsonl.ticks.jsonl   per-tick metrics
     /kaggle/working/checkpoints/checkpoint_*.pt + checkpoint_best.pt
+    /kaggle/working/pretrained/trunk_pretrained.pt   supervised trunk (--pretrain)
+    /kaggle/working/logs/xsec_book.json              the P2 book sweep (--book)
+    /kaggle/working/logs/trunk_edge.npz              the learned edge, timestamped
 """
 
 import argparse
@@ -99,6 +104,23 @@ def ensure_deps(no_install: bool) -> None:
     )
 
 
+def out_dir(kind: str) -> str:
+    """Where a stage's artefacts go: "logs" or "checkpoints".
+
+    Matches train.py's rule exactly (`--kaggle` / is_kaggle() -> /kaggle/working
+    /...). This is not cosmetic. SCRIPT_DIR on Kaggle is the CLONED REPO, so
+    writing there puts the book's JSON and the pre-trained trunk somewhere the
+    training run does not look, somewhere the notebook's own metrics path does
+    not point, and somewhere a re-clone silently discards.
+    """
+    sys.path.insert(0, SCRIPT_DIR)
+    from paths import is_kaggle  # noqa: E402
+
+    path = f"/kaggle/working/{kind}" if is_kaggle() else os.path.join(SCRIPT_DIR, kind)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def cache_ready() -> bool:
     sys.path.insert(0, SCRIPT_DIR)
     from paths import is_cache_ready  # noqa: E402
@@ -126,7 +148,66 @@ def stage_diagnostics() -> None:
     run_python("diagnostics_gpu_and_learning.py", check=False)
 
 
-def stage_train(total_rollouts: int, resume: str, fresh: bool, force_single: bool) -> None:
+def stage_book(holds, lams, variant) -> None:
+    """P2's analytic baseline on the CORRECTED panel.
+
+    It has to run here rather than locally: the local parquet cache is stale
+    and split-contaminated, and `eval/xsec_book.py` reads raw closes and volume
+    directly, so a contaminated cache fabricates both the returns it scores and
+    the ADV it prices impact against.
+
+    Costs minutes, not GPU-hours, and it decides whether a training run is
+    worth starting -- so run it before --train, not after.
+    """
+    args = ["--json", os.path.join(out_dir("logs"), "xsec_book.json"),
+            "--variant", variant]
+    for h in holds:
+        args += ["--hold", str(h)]
+    for l in lams:
+        args += ["--lam", str(l)]
+    run_python(os.path.join("eval", "xsec_book.py"), *args, check=False)
+
+
+def stage_pretrain(hold: int, epochs: int, dump_edge: bool) -> None:
+    """P2 bullet 3: fit the shared trunk against the tradeable forward return.
+
+    Runs before --train, not instead of it. It answers "can these features
+    predict the return the env can actually capture" in a form a regression can
+    be held to, and writes pretrained/trunk_pretrained.pt for
+    `--train --pretrained-trunk`. With --book-after-pretrain the resulting edge
+    is fed straight back through eval/xsec_book.py, which is the only test that
+    matters: an IC that does not clear the cost hurdle is not tradeable however
+    significant it is.
+    """
+    logs = out_dir("logs")
+    # Its OWN directory, not the checkpoint dir. The trunk is an INPUT to a
+    # training run, and `--fresh` resets that run's outputs -- keeping the two
+    # apart is what makes `--fresh --pretrained-trunk` a coherent thing to ask
+    # for. (`_clean_checkpoint_dir` is also narrowed to `checkpoint_*.pt` now,
+    # so this is belt and braces rather than the only guard.)
+    out = os.path.join(out_dir("pretrained"), "trunk_pretrained.pt")
+    npz = os.path.join(logs, "trunk_edge.npz")
+    args = ["--hold", str(hold), "--epochs", str(epochs), "--out", out]
+    if dump_edge:
+        args += ["--dump-edge", npz]
+    run_python(os.path.join("training", "pretrain_trunk.py"), *args, check=False)
+
+    if dump_edge and os.path.exists(npz):
+        run_python(
+            os.path.join("eval", "xsec_book.py"),
+            "--edge", "npz", "--edge-npz", npz, "--hold", str(hold),
+            "--json", os.path.join(logs, "xsec_book_trunk.json"),
+            check=False,
+        )
+    print()
+    print(f"[pretrain] trunk -> {out}")
+    print(f"[pretrain] feed it to training with:  "
+          f"python run_kaggle.py --train --total-rollouts 151 --fresh "
+          f"--pretrained-trunk {out}")
+
+
+def stage_train(total_rollouts: int, resume: str, fresh: bool, force_single: bool,
+                pretrained_trunk: str = None) -> None:
     import torch
 
     use_ddp = (not force_single) and torch.cuda.is_available() and torch.cuda.device_count() >= 2
@@ -136,6 +217,18 @@ def stage_train(total_rollouts: int, resume: str, fresh: bool, force_single: boo
         args += ["--resume", resume]
     if fresh:
         args += ["--fresh"]
+    if pretrained_trunk:
+        if resume:
+            # Both entrypoints ignore the trunk when resuming; say so here
+            # rather than letting the flag look like it took effect.
+            print("[run_kaggle] --resume given, so --pretrained-trunk is IGNORED: "
+                  "the checkpoint already carries a trunk PPO has been updating.")
+        elif not os.path.exists(pretrained_trunk):
+            raise SystemExit(
+                f"[run_kaggle] --pretrained-trunk {pretrained_trunk} does not exist. "
+                "Run `python run_kaggle.py --pretrain` first."
+            )
+        args += ["--pretrained-trunk", pretrained_trunk]
     run_python(script, *args)
 
 
@@ -242,6 +335,26 @@ def parse_args(argv=None):
     p.add_argument("--preprocess", action="store_true", help="preprocess.py (features + metadata)")
     p.add_argument("--diagnostics", action="store_true", help="run data/env/GPU diagnostics")
     p.add_argument("--train", action="store_true", help="run train.py (or train_ddp.py on 2+ GPUs)")
+    p.add_argument("--book", action="store_true",
+                   help="eval/xsec_book.py -- the P2 cost-aware cross-sectional "
+                        "book and its lambda sweep, on the corrected panel")
+    p.add_argument("--book-holds", type=int, nargs="+", default=[12, 24, 48],
+                   help="holds in bars for --book (default 12 24 48)")
+    p.add_argument("--book-lams", type=float, nargs="+", default=None,
+                   help="lambdas for --book (default: the script's own grid)")
+    p.add_argument("--book-variant", choices=("full", "nosize"), default="full",
+                   help="'nosize' ablates the / cost sizing term")
+    p.add_argument("--pretrain", action="store_true",
+                   help="training/pretrain_trunk.py -- supervised fit of the "
+                        "shared trunk against the tradeable forward return")
+    p.add_argument("--pretrain-hold", type=int, default=24)
+    p.add_argument("--pretrain-epochs", type=int, default=3)
+    p.add_argument("--pretrained-trunk", type=str, default=None,
+                   help="with --train: start PPO from this supervised trunk "
+                        "(written by --pretrain). Ignored with --resume.")
+    p.add_argument("--no-book-after-pretrain", dest="book_after_pretrain",
+                   action="store_false", default=True,
+                   help="skip scoring the pre-trained edge through the book")
     p.add_argument("--quick", action="store_true",
                    help="diagnostics + train with --total-rollouts 100 (data must already exist)")
     p.add_argument("--total-rollouts", type=int, default=100)
@@ -276,7 +389,8 @@ def main(argv=None):
         args.diagnostics = True
         args.train = True
 
-    any_stage = any([args.fetch, args.preprocess, args.diagnostics, args.train])
+    any_stage = any([args.fetch, args.preprocess, args.diagnostics, args.train,
+                     args.book, args.pretrain])
     if not any_stage:
         print(__doc__)
         return
@@ -289,8 +403,14 @@ def main(argv=None):
         stage_preprocess()
     if args.diagnostics:
         stage_diagnostics()
+    if args.book:
+        stage_book(args.book_holds, args.book_lams or [], args.book_variant)
+    if args.pretrain:
+        stage_pretrain(args.pretrain_hold, args.pretrain_epochs,
+                       args.book_after_pretrain)
     if args.train:
-        stage_train(args.total_rollouts, args.resume, args.fresh, args.no_ddp)
+        stage_train(args.total_rollouts, args.resume, args.fresh, args.no_ddp,
+                    args.pretrained_trunk)
 
     print_summary(trained=bool(args.train))
 

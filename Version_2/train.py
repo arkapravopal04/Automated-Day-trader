@@ -55,7 +55,8 @@ from env.vec_trading_env import VecTradingEnv, StepResult  # noqa: E402
 
 from training.config import TrainingConfig  # noqa: E402
 from training.ppo_hybrid import (  # noqa: E402
-    AdaptiveEntropyCoef, HybridActorCritic, collect_rollout, compute_gae, ppo_update,
+    AdaptiveEntropyCoef, HybridActorCritic, collect_rollout, compute_gae,
+    load_actor_critic_state, ppo_update,
 )
 from training.reward import DifferentialSharpeReward  # noqa: E402
 
@@ -91,6 +92,8 @@ def build_risk_pipeline(cfg: TrainingConfig, n_envs: int, device: torch.device):
         # eval/backtest_report.py and live/live_loop.py construct their own
         # KellySizer without it and keep the strict zero-floor behavior.
         min_fraction=cfg.risk.kelly_min_fraction,
+        edge_source=cfg.risk.kelly_edge_source,
+        enabled=cfg.risk.kelly_enabled_in_training,
         device=str(device),
     )
     risk_manager = RiskManager(
@@ -264,6 +267,11 @@ def make_tick_callback(
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the hybrid PPO trading policy.")
+    parser.add_argument(
+        "--pretrained-trunk", type=str, default=None,
+        help="Checkpoint from training/pretrain_trunk.py. Loads the shared "
+             "cnn/lstm/cross_attn/fusion stack and leaves the policy and critic "
+             "heads randomly initialised. Ignored when --resume is given.")
     parser.add_argument("--kaggle", action="store_true", help="Force Kaggle-safe paths/checkpointing.")
     parser.add_argument("--local", action="store_true", help="Force local paths/checkpointing.")
     parser.add_argument("--total-rollouts", type=int, default=None, help="Override cfg.run.total_rollouts.")
@@ -312,9 +320,21 @@ def _resolve_checkpoint_alias(alias: str, checkpoint_dir: str) -> Optional[str]:
 
 
 def _clean_checkpoint_dir(checkpoint_dir: str) -> None:
-    """Delete every *.pt in checkpoint_dir -- used ONLY by an explicit --fresh."""
+    """Delete this run's own checkpoints -- used ONLY by an explicit --fresh.
+
+    NARROWED to `checkpoint_*.pt`, which is every file train.py and
+    train_ddp.py write (`checkpoint_<N>.pt` and `checkpoint_best.pt`) and
+    nothing else. It used to delete every `*.pt` in the directory, which was
+    fine while this run was the only thing that put a .pt there and became a
+    trap the moment `training/pretrain_trunk.py` existed: a
+    `--fresh --pretrained-trunk` invocation deleted the trunk during startup
+    and then failed to load the file it had just removed. Artefacts that are
+    INPUTS to a run must survive a reset of that run's own outputs.
+    """
     removed = []
     for fname in _list_checkpoints(checkpoint_dir):
+        if not fname.startswith("checkpoint_"):
+            continue
         os.remove(os.path.join(checkpoint_dir, fname))
         removed.append(fname)
     if removed:
@@ -444,11 +464,82 @@ def main(argv: Optional[List[str]] = None) -> None:
     ema_reward = None
     state = _TickState(n_envs=env.n_envs)
 
+    if resume_path is None and args.pretrained_trunk:
+        # P2 bullet 3: attach a freshly-initialised policy and critic to a trunk
+        # that was already fitted, supervised, against the tradeable forward
+        # return (`training/pretrain_trunk.py`). Only the shared feature stack
+        # is loaded -- the policy and critic heads stay random on purpose, and
+        # the edge head does not exist in this model at all.
+        #
+        # Deliberately mutually exclusive with --resume: a resumed checkpoint
+        # already contains a trunk that PPO has been updating, and overwriting
+        # it mid-run with the supervised one would silently discard however many
+        # rollouts of learning while leaving the optimizer state that was fitted
+        # to it in place.
+        blob = torch.load(args.pretrained_trunk, map_location=device, weights_only=True)
+        trunk_sd = dict(blob.get("trunk", blob))
+        missing, unexpected = actor_critic.load_state_dict(trunk_sd, strict=False)
+        if unexpected:
+            raise SystemExit(
+                f"[train] --pretrained-trunk {args.pretrained_trunk} carries keys this "
+                f"model does not have: {sorted(unexpected)[:6]}. Was it written by a "
+                "different model config?"
+            )
+        # Everything except the trunk is SUPPOSED to be missing: the policy and
+        # critic are attached fresh, and the edge head is loaded separately
+        # below because it is optional.
+        fresh = ("policy_head.", "critic_head.", "edge_head.", "edge_scale_bps")
+        unloaded = [k for k in missing if not k.startswith(fresh)]
+        if unloaded:
+            raise SystemExit(
+                f"[train] --pretrained-trunk {args.pretrained_trunk} is missing trunk "
+                f"weights this model needs: {sorted(unloaded)[:6]}"
+            )
+
+        # The edge head and its scale travel together or not at all -- a head
+        # loaded without the sd it was standardised against emits a number in
+        # arbitrary units that KellySizer would read as bps.
+        if "edge_head" in blob and "target_sd_bps" in blob:
+            actor_critic.edge_head.load_state_dict(blob["edge_head"])
+            actor_critic.edge_scale_bps.fill_(float(blob["target_sd_bps"]))
+            have_edge_head = True
+        else:
+            have_edge_head = False
+
+        print(f"[train] loaded pre-trained trunk from {args.pretrained_trunk}: "
+              f"{len(trunk_sd)} tensors (hold {blob.get('hold', '?')} bars, "
+              f"val IC {blob.get('val_ic', float('nan')):+.5f}); "
+              f"policy and critic heads are fresh"
+              + ("; edge head loaded, scale "
+                 f"{float(actor_critic.edge_scale_bps):.2f} bps" if have_edge_head
+                 else "; NO edge head in this checkpoint"))
+        if cfg.risk.kelly_edge_source == "model" and not have_edge_head:
+            raise SystemExit(
+                "[train] risk.kelly_edge_source == 'model' but the checkpoint carries "
+                "no edge head. Sizing would fall back to a constant fraction while "
+                "reporting itself as Kelly. Re-run training/pretrain_trunk.py, or set "
+                "kelly_edge_source back to 'realized'."
+            )
+    elif cfg.risk.kelly_edge_source == "model" and resume_path is None:
+        raise SystemExit(
+            "[train] risk.kelly_edge_source == 'model' needs a supervised edge head. "
+            "Pass --pretrained-trunk <checkpoint from training/pretrain_trunk.py>."
+        )
+
     if resume_path is not None:
         # weights_only=True -- see main.py's matching comment (checkpoints
         # are pickle files; arbitrary-object unpickling is RCE).
         checkpoint = torch.load(resume_path, map_location=device, weights_only=True)
-        actor_critic.load_state_dict(checkpoint["actor_critic"])
+        resumed_edge_head = load_actor_critic_state(
+            actor_critic, checkpoint["actor_critic"], resume_path
+        )
+        if cfg.risk.kelly_edge_source == "model" and not resumed_edge_head:
+            raise SystemExit(
+                "[train] risk.kelly_edge_source == 'model' but the resumed checkpoint "
+                "carries no edge head, so the governor would size on a randomly "
+                "initialised one. Set kelly_edge_source to 'realized', or start from "
+                "--pretrained-trunk instead of --resume."
+            )
         optimizer.load_state_dict(checkpoint["optimizer"])
         start_rollout = checkpoint["rollout_idx"] + 1
         best_metric = checkpoint.get("best_metric", float("-inf"))

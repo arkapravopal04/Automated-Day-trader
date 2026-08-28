@@ -541,6 +541,33 @@ class RiskConfig:
     # min_order_notional / initial_cash or the deadlock returns.
     kelly_min_fraction: float = 0.08
 
+    # P2 bullet 4. "realized" is the historical behaviour: f* is accumulated
+    # from CLOSED round trips, and a stream needs kelly_min_trades_for_estimate
+    # of them before is_warm goes true. That estimator cannot warm inside a
+    # cost-aware cross-sectional book -- at ~0.036 gross turnover per bar with
+    # ~5 names held at a time, most streams close single-digit round trips per
+    # rollout, so the governor sits at kelly_default_fraction for the whole run
+    # and is a constant wearing Kelly's name.
+    #
+    # "model" sizes from the network's own forward-looking edge instead
+    # (KellySizer.set_model_edge), which is warm on the first bar. It requires
+    # a caller that actually feeds it every step; train.py does this only when
+    # the actor-critic carries a pre-trained edge head, and refuses to start
+    # otherwise rather than silently sizing on a stale estimate.
+    #
+    # NOTE, measured: at a per-name edge of a few bps against a ~55 bps
+    # 24-bar return sd, continuous Kelly f* = mu/sigma^2 comes out in the tens
+    # and saturates kelly_cap. The model source is therefore close to a binary
+    # -- cap when the edge clears its cost, zero when it does not -- and its
+    # value is the ZERO, not the sizing.
+    kelly_edge_source: str = "realized"
+
+    # Skip the Kelly governor entirely during training and keep it for live
+    # only (the brief's second option). The cap still exists in
+    # live/live_loop.py and eval/backtest_report.py, which build their own
+    # sizer; this switch only affects the training pipeline.
+    kelly_enabled_in_training: bool = True
+
     # kill_switch.py -- KillSwitch
     daily_loss_limit_frac: float = 0.03
     broker_error_streak_limit: int = 3
