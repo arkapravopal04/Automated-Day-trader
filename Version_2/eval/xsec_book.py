@@ -184,6 +184,30 @@ def side_cost_bps(price, shares, adv, sigma_daily, k):
     return half_spread + half_tick_bps + k["commission_bps"] + impact_bps
 
 
+# The convention table's rows. Every entry other than "close" fills and marks
+# somewhere inside bar t+1; "close" scores close-to-close, which the env
+# cannot trade and which is carried only as the comparison that shows how much
+# of a result is convention rather than signal.
+#
+# The `x_*` rows require a raw directory built by intrabar.py from a 1-minute
+# cache. They are the reason 1-minute bars were bought: at 5-minute resolution
+# `open[t+1]` is the only price inside the fill bar that exists, so the
+# execution frame had no alternative to accept. With the minutes present, the
+# decision at t can be filled at the first minute's close or VWAP, or worked
+# across the first two minutes, and the difference between those rows is a
+# direct measurement of how much of the edge is being handed to whoever is on
+# the other side of the opening print.
+FRAME_COLUMNS = {
+    "exec":     ("open",        "fills and marks at bar t+1 open (P1's frame)"),
+    "close":    (None,          "close-to-close -- the env cannot trade this; comparison only"),
+    "m1_close": ("x_close_m1",  "fills at the close of t+1's FIRST MINUTE"),
+    "m1_vwap":  ("x_vwap_m1",   "fills at the VWAP of t+1's first minute"),
+    "m12_vwap": ("x_vwap_m12",  "fills at the VWAP of t+1's first TWO minutes"),
+    "bar_vwap": ("x_vwap_full", "fills at t+1's full-bar VWAP (an upper bound on "
+                                "patient execution, not reachable in real time)"),
+}
+
+
 def execution_frame(index, tickers, session_last_idx, column="open"):
     """(exec_price [T, N], exec_session_last [T]) -- the P1 execution frame.
 
@@ -212,7 +236,15 @@ def execution_frame(index, tickers, session_last_idx, column="open"):
         rp = os.path.join(RAW_DIR, f"{t}.parquet")
         if not os.path.exists(rp):
             continue
-        col = _pd.read_parquet(rp)[column]
+        raw = _pd.read_parquet(rp)
+        if column not in raw.columns:
+            raise KeyError(
+                f"{t}: raw parquet has no '{column}' column. The intra-window "
+                f"execution marks (x_*) exist only in an intrabar.py output "
+                f"directory; point TRADING_RAW_DIR at one (e.g. data/parquet_agg5) "
+                f"or use --frame exec. Present: {sorted(raw.columns)[:12]}"
+            )
+        col = raw[column]
         col = col.mask(col <= 0).reindex(index).ffill().bfill()
         Px[:, j] = col.to_numpy(dtype=np.float32)
 
@@ -693,6 +725,12 @@ def print_detail(hold, lam, res):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Cost-aware cross-sectional book.")
     ap.add_argument("--tickers", type=int, default=None, help="cap universe size")
+    ap.add_argument("--tick-max-bps", type=float, default=None,
+                    help="keep only names whose tick is below this many bps of "
+                         "price, measured as the median over TRAIN. The liquid "
+                         "tier: a $0.01 tick is 0.04 bps on the dearest name in "
+                         "the panel and 2.5 bps on the cheapest, so this selects "
+                         "on the dominant term of the cost model")
     ap.add_argument("--hold", type=int, action="append", default=None,
                     help="hold in bars; repeatable (default 24)")
     ap.add_argument("--lam", type=float, action="append", default=None,
@@ -701,10 +739,12 @@ def main(argv=None):
     ap.add_argument("--edge-npz", type=str, default=None,
                     help="with --edge npz: the file written by "
                          "training/pretrain_trunk.py --dump-edge")
-    ap.add_argument("--frame", choices=("exec", "close"), default="exec",
-                    help="'exec' scores the book on the prices the env fills at "
-                         "(bar t+1 open, P1's execution frame); 'close' scores "
-                         "close-to-close, which the env cannot trade")
+    ap.add_argument("--frame", choices=tuple(FRAME_COLUMNS), default="exec",
+                    help="execution convention the book is filled and marked on; "
+                         "see FRAME_COLUMNS. 'exec' is P1's frame (bar t+1 open); "
+                         "'close' is close-to-close, which the env cannot trade; "
+                         "the m1_*/m12_*/bar_vwap rows fill inside bar t+1 and "
+                         "need an intrabar.py raw directory")
     ap.add_argument("--capital", type=float, default=DEFAULT_CAPITAL,
                     help="dollars the book runs at gross 1 (default 1e6, the "
                          "100 x initial_cash the env models)")
@@ -744,15 +784,33 @@ def main(argv=None):
     i_val = int(T * (TRAIN_FRAC + VAL_FRAC))
     print(f"[split] train 0:{i_train}  val {i_train}:{i_val}  test {i_val}:{T} (untouched)")
 
+    # Tier the universe on tick-in-bps, measured on TRAIN only -- selecting on
+    # a median that includes validation prices would be one bit of lookahead
+    # per name, and a name that got dearer over the sample would be admitted
+    # on information the book does not have at decision time.
+    if args.tick_max_bps is not None:
+        tick = env_cost_constants()["tick"]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            tick_bps = 1e4 * tick / np.nanmedian(np.where(P[:i_train] > 0, P[:i_train], np.nan), axis=0)
+        keep = np.isfinite(tick_bps) & (tick_bps < args.tick_max_bps)
+        if keep.sum() < 2:
+            raise SystemExit(f"--tick-max-bps {args.tick_max_bps} leaves {int(keep.sum())} "
+                             "name(s); a dollar-neutral book needs at least 2")
+        X, P = X[:, keep, :], P[:, keep]
+        tickers = [t for t, k in zip(tickers, keep) if k]
+        N = P.shape[1]
+        print(f"[tier] tick < {args.tick_max_bps} bps on train: {N} of {len(keep)} names "
+              f"(median tick {np.nanmedian(tick_bps[keep]):.3f} bps)")
+
     # THE PRICES THE BOOK IS SCORED AND FILLED ON. `P` (close) still feeds the
     # liquidity measurement and the panel's own guards; `Px` is what returns and
     # costs are computed against.
-    if args.frame == "exec":
-        Px, sli_x = execution_frame(panel["index"], tickers, sli)
-        print("[frame] execution frame: fills and marks at bar t+1 open (P1)")
-    else:
+    frame_col, frame_desc = FRAME_COLUMNS[args.frame]
+    if frame_col is None:
         Px, sli_x = P, sli
-        print("[frame] CLOSE frame -- the env cannot trade this; comparison only")
+    else:
+        Px, sli_x = execution_frame(panel["index"], tickers, sli, column=frame_col)
+    print(f"[frame] {args.frame}: {frame_desc}")
 
     adv, sigma = measure_liquidity(panel["index"], tickers, day_id, i_train, P)
     print(f"[liq] train-measured: median ADV {np.median(adv):,.0f} shares, "

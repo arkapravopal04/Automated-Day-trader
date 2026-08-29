@@ -85,6 +85,26 @@ FEATURE_COLUMNS = (
     + ['vwap_dev', 'intrabar_pres', 'xs_resid']
 )
 
+# Intrabar features, appended when TRADING_INTRABAR=1 and RAW_DIR points at a
+# directory built by intrabar.py from a 1-minute cache. They are computed at
+# aggregation time rather than here: this file only ever sees the 5-minute
+# row, and the whole point of the group is what the 5-minute row threw away.
+#
+# Inserted BEFORE 'xs_resid' so that placeholder stays last -- pass 2 of
+# generate_features_and_metadata() fills it after every ticker exists, and
+# the finite-check exclusions address it by name, so its position is
+# cosmetic, but keeping it at the end matches how the tuple reads.
+#
+# The names are mirror-safe by construction; see intrabar.py's
+# "NAMING IS MIRROR-SENSITIVE" section before adding to that list.
+INTRABAR_FEATURES = os.getenv("TRADING_INTRABAR", "0") == "1"
+IB_COLUMNS: list = []
+if INTRABAR_FEATURES:
+    from intrabar import IB_COLUMNS as _IB
+    IB_COLUMNS = list(_IB)
+    _resid_at = FEATURE_COLUMNS.index('xs_resid')
+    FEATURE_COLUMNS = FEATURE_COLUMNS[:_resid_at] + IB_COLUMNS + FEATURE_COLUMNS[_resid_at:]
+
 if set(REVERSAL_HORIZONS) & {f'log_ret_{h}' for h in HORIZONS}:
     raise ValueError("REVERSAL_HORIZONS collides with a HORIZONS column name")
 
@@ -174,6 +194,15 @@ def process_ticker(ticker: str) -> pd.DataFrame:
     missing_cols = REQUIRED_RAW_COLUMNS - set(df.columns)
     if missing_cols:
         raise ValueError(f"{ticker}: raw data missing required columns {sorted(missing_cols)}")
+
+    if INTRABAR_FEATURES:
+        missing_ib = [c for c in IB_COLUMNS if c not in df.columns]
+        if missing_ib:
+            raise ValueError(
+                f"{ticker}: TRADING_INTRABAR=1 but raw data is missing {missing_ib}. "
+                f"RAW_DIR ({RAW_DIR}) must point at an intrabar.py output directory "
+                "(e.g. data/parquet_agg5), not at a plain bar cache."
+            )
 
     if len(df) < MIN_ROWS_REQUIRED:
         raise ValueError(
