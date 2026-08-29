@@ -561,6 +561,32 @@ def summarise(ledger, h):
     sd = float(net.std(ddof=1)) if n_per > 1 else 0.0
     sharpe = (float(net.mean()) / sd) * math.sqrt(per_year) if sd > 0 else float("nan")
 
+    # THE ERROR BAR ON THAT SHARPE. Lo's standard error for an annualised
+    # Sharpe over `years` of data: se ~ sqrt((1 + SR^2/2) / years). On a val
+    # split under a year this lands near 1.1, which is larger than any Sharpe
+    # this book has produced -- so the number is reported WITH it, because
+    # quoting 0.62 without the +/-1.1 beside it is the single easiest way to
+    # mistake a noise draw for a result.
+    se = (math.sqrt((1.0 + 0.5 * sharpe ** 2) / years)
+          if years > 0 and np.isfinite(sharpe) else float("nan"))
+
+    # CONCENTRATION. A book whose whole year comes from five bars has not found
+    # an edge, it has found five bars, and the distinction is invisible in
+    # Sharpe, ratio and annual return alike. `top5_share` is those five periods'
+    # contribution as a fraction of total net PnL; `sharpe_ex_top5` re-scores
+    # the series with them removed. If the second number collapses, so does the
+    # claim.
+    top5_share, sharpe_ex5 = float("nan"), float("nan")
+    if n_per > 5:
+        order = np.argsort(net)[::-1]
+        top5 = float(net[order[:5]].sum())
+        total = float(net.sum())
+        top5_share = top5 / total if abs(total) > 1e-12 else float("nan")
+        rest = np.delete(net, order[:5])
+        sd_r = float(rest.std(ddof=1))
+        if sd_r > 0:
+            sharpe_ex5 = (float(rest.mean()) / sd_r) * math.sqrt(per_year)
+
     alpha_pt = float(g.sum()) / turn if turn > 0 else float("nan")
     cost_pt = float(c.sum()) / turn if turn > 0 else float("nan")
 
@@ -571,6 +597,11 @@ def summarise(ledger, h):
         cost_bps=float(c.mean()),
         net_bps=float(net.mean()),
         sharpe=sharpe,
+        sharpe_se=se,
+        sharpe_t=(sharpe / se) if (se and np.isfinite(se) and se > 0) else float("nan"),
+        sharpe_ex_top5=sharpe_ex5,
+        top5_share=top5_share,
+        years=years,
         annual_return=float(net.mean()) * per_year / 1e4,
         alpha_per_turnover=alpha_pt,
         cost_per_turnover=cost_pt,
@@ -640,6 +671,11 @@ def print_detail(hold, lam, res):
         ("cost_per_turnover bps", "cost_per_turnover", ".3f"),
         ("ratio", "ratio", ".2f"),
         ("net Sharpe (annual)", "sharpe", ".2f"),
+        ("  +/- standard error", "sharpe_se", ".2f"),
+        ("  t (sharpe / se)", "sharpe_t", ".2f"),
+        ("  Sharpe ex top-5 periods", "sharpe_ex_top5", ".2f"),
+        ("  top-5 share of net PnL", "top5_share", ".2f"),
+        ("years of data", "years", ".2f"),
         ("annual return @ gross 1", "annual_return", ".4f"),
         ("turnover / bar", "turnover_per_bar", ".4f"),
         ("names in book (all)", "mean_names", ".1f"),
