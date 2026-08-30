@@ -83,6 +83,7 @@ from eval.alpha_lab import (  # noqa: E402
     block_ic,
     cross_sectional_demean,
     load_panel,
+    overnight_decision_bars,
 )
 from eval.xsec_book import ridge_fit_chunked  # noqa: E402
 
@@ -230,8 +231,75 @@ def convention_return_bps(P_entry, P_exit, entry_off, exit_off, session_last_idx
     return out
 
 
+# ---------------------------------------------------------------------------
+# THE OVERNIGHT ROW
+# ---------------------------------------------------------------------------
+# Every convention above is capped at `session_last_idx` because
+# EnvConfig.flatten_at_session_close liquidates on the last bar of each
+# session. THAT CAP IS A CHOICE THIS PROJECT MADE, and it is the one regime the
+# system has never priced: median |move| is 75.8 bps overnight against 9.6
+# midday, so against a ~2.2 bps round trip the move-to-cost ratio is 34:1
+# overnight and 4.4:1 midday. The book spends its entire cost budget in the
+# cheapest regime by construction, and every negative result this project has
+# recorded was measured under that constraint.
+#
+# THE TEST IS NOT "IS THE MOVE BIG". That is settled and it is not evidence.
+# The test is whether anything in the panel PREDICTS ITS DIRECTION. A 75.8 bps
+# move with zero IC is a 75.8 bps loss half the time; the 34:1 figure is a
+# reason to look, not a result.
+#
+# Cross-sectional demeaning carries real weight in this row, and it is the
+# right thing. The overnight gap has a large common component -- the index
+# gapped, so everything gapped -- and a dollar-neutral book cannot collect it.
+# Demeaning strips the market gap and the equity risk premium riding on it,
+# leaving only which names gap up RELATIVE to the rest, which is the only part
+# this book can trade. A row scoring the raw gap would be measuring the equity
+# risk premium and reporting it as alpha.
+#
+# The panel is RTH-only and contiguous, so the bar after the last bar of
+# session d IS the first bar of session d+1: the overnight hold is the single
+# transition L -> L+1. Entry is on bar L, exit on bar L+1, and the DECISION bar
+# is L-1 -- the same one-bar lag P1's execution frame imposes, so that no entry
+# ordinal can read a price its own signal already saw. Close-to-close is never
+# offered here: the table above shows that convention INVERTS under execution,
+# so scoring the gap that way would manufacture the result.
+OVERNIGHT_CONVENTIONS = [
+    ("ON open[L] -> open[L+1]",      "open",      "open",      "the plan's row: market orders both legs"),
+    ("ON m1vwap[L] -> m1vwap[L+1]",  "x_vwap_m1", "x_vwap_m1", "first-minute VWAP both legs"),
+    ("ON m12vwap[L] -> m12vwap[L+1]","x_vwap_m12","x_vwap_m12","worked across two minutes both legs"),
+    ("ON close[L] -> open[L+1]",     "close",     "open",      "MOC in, market out -- the purest gap"),
+    ("ON close[L] -> m1vwap[L+1]",   "close",     "x_vwap_m1", "MOC in, worked out"),
+]
+
+
+def overnight_return_bps(P_entry, P_exit, day_id, session_last_idx, present=None):
+    """log(exit / entry) in bps for the overnight hold, one row per session.
+
+    The value is written at the DECISION bar L-1, so the row lines up with a
+    signal that has seen information only through that bar. Everything else is
+    NaN: an overnight book places one bet per name per session, and padding the
+    other 77 bars with the same number would multiply the apparent sample by 78
+    while adding no independent information.
+    """
+    T, N = P_entry.shape
+    out = np.full((T, N), np.nan, dtype=np.float32)
+    L = overnight_decision_bars(day_id, session_last_idx, T)
+    if L.size == 0:
+        return out
+    a, b = P_entry[L], P_exit[L + 1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.log(np.where((a > 0) & (b > 0), b / np.where(a > 0, a, np.nan), np.nan)) * 1e4
+    if present is not None:
+        # Both legs must be real prints. A forward-filled leg here is worse
+        # than intraday: it reports a gap of exactly zero for a name that did
+        # not trade, which is a confident wrong answer rather than a missing one.
+        r = np.where(present[L] & present[L + 1], r, np.nan)
+    out[L - 1] = r.astype(np.float32)
+    return out
+
+
 def build_signal(kind, X, P, features, i_train, lookback, session_last_idx,
-                 day_id=None, present=None):
+                 day_id=None, present=None, target=None, target_desc=None):
     """[T, N] cross-sectionally demeaned signal, identical across every row.
 
     'reversal' is target-free: the negated trailing return over `lookback`
@@ -279,7 +347,17 @@ def build_signal(kind, X, P, features, i_train, lookback, session_last_idx,
         )
 
     from eval.alpha_lab import forward_return_bps
-    tgt = cross_sectional_demean(forward_return_bps(P, 1, session_last_idx))
+    # The fit target is a CHOICE and it is stated in the output. Default is
+    # close[t]->close[t+1], for comparability with the published table. The
+    # overnight mode overrides it: a 5-minute conditional mean is not the
+    # overnight one, and reusing it would score a 17-hour horizon with an
+    # edge fitted on a 5-minute one.
+    if target is None:
+        tgt = cross_sectional_demean(forward_return_bps(P, 1, session_last_idx))
+        tdesc = "the close[t]->close[t+1] target"
+    else:
+        tgt = cross_sectional_demean(target)
+        tdesc = target_desc or "a caller-supplied target"
     T, N, F = X.shape
 
     # Features are cross-sectionally demeaned before the fit, matching
@@ -304,9 +382,116 @@ def build_signal(kind, X, P, features, i_train, lookback, session_last_idx,
     if present is not None:
         sig = np.where(present, sig, np.nan)
     return cross_sectional_demean(sig), (
-        f"ridge over {F} features on {n_used:,} train rows, fit against the "
-        "close[t]->close[t+1] target, then frozen across every row"
+        f"ridge over {F} features on {n_used:,} train rows, fit against "
+        f"{tdesc}, then frozen across every row"
     )
+
+
+def _overnight_table(args, panel, i_train, i_val):
+    """Step 1 of the P3 close plan: does anything predict the DIRECTION of the gap.
+
+    Run as its own table rather than extra rows on the intraday one. The two
+    are not comparable line by line -- an overnight row carries one observation
+    per name per session against 78, its blocks are sessions rather than
+    multi-bar windows, and under `--signal ridge` it is fitted on a different
+    target. Printing them together would invite exactly the comparison that
+    is not valid.
+    """
+    X, P = panel["X"], panel["P"]
+    features, tickers = panel["features"], panel["tickers"]
+    sli, day_id = panel["session_last_idx"], panel["day_id"]
+    T, N = P.shape
+
+    needed = sorted({c for _, ec, xc, _ in OVERNIGHT_CONVENTIONS for c in (ec, xc)})
+    prices, missing, present = load_price_columns(panel["index"], tickers, needed)
+    print(f"[cells] {present.mean():.1%} of panel cells are real prints; "
+          "the rest are forward-filled and are excluded from every row")
+    if missing:
+        print(f"[cols] absent from {RAW_DIR}: {sorted(missing)}")
+        print("[cols] the worked-fill rows need an intrabar.py output directory.")
+
+    L = overnight_decision_bars(day_id, sli, T)
+    n_tr = int(((L - 1) < i_train).sum())
+    n_va = int((((L - 1) >= i_train) & ((L - 1) < i_val)).sum())
+    print(f"[overnight] {L.size:,} sessions carry a gap trade ({n_tr:,} train, "
+          f"{n_va:,} val) -- one bet per name per session, not per bar")
+
+    # The fit target is the headline row, stated and frozen across every row --
+    # the same discipline the intraday table holds to, and the same caveat: the
+    # row sharing the fit target is the flattered one, so read the SPREAD
+    # between rows rather than any row's level.
+    hl_label, hl_e, hl_x, _ = OVERNIGHT_CONVENTIONS[0]
+    fit_tgt = None
+    if args.signal == "ridge":
+        if hl_e in missing or hl_x in missing:
+            raise SystemExit(f"cannot fit: {hl_e}/{hl_x} absent from {RAW_DIR}")
+        fit_tgt = overnight_return_bps(prices[hl_e], prices[hl_x], day_id, sli, present)
+
+    sig, sig_desc = build_signal(args.signal, X, P, features, i_train, args.lookback,
+                                 sli, day_id=day_id, present=present, target=fit_tgt,
+                                 target_desc=f"the OVERNIGHT target ({hl_label})")
+    print(f"[signal] {args.signal}: {sig_desc}")
+    if args.signal == "reversal" and args.lookback > 1:
+        print("[signal] note: the session-gap mask drops the first `lookback` bars of "
+              "each session, so a lookback past ~76 erases the decision bar itself.")
+    print()
+
+    hdr = (f"{'Overnight convention':<34}{'IC train':>10}{'IC val':>9}{'t (val)':>9}"
+           f"{'Edge':>9}{'sd xs':>9}{'sd raw':>9}{'n val':>9}")
+    print(hdr)
+    print("-" * len(hdr))
+
+    rows = []
+    for label, ec, xc, note in OVERNIGHT_CONVENTIONS:
+        if ec in missing or xc in missing:
+            continue
+        fwd = overnight_return_bps(prices[ec], prices[xc], day_id, sli, present)
+        tgt = cross_sectional_demean(fwd)
+
+        # One block per session. Overnight trades do not overlap -- session d's
+        # hold is closed before session d+1's is decided -- so the multi-bar
+        # block widening the intraday table needs would only throw away blocks.
+        bl = np.repeat(day_id[:, None], N, axis=1)
+
+        ic_tr, _, _, _ = block_ic(sig[:i_train].ravel(), tgt[:i_train].ravel(),
+                                  bl[:i_train].ravel())
+        ic_v, t_v, nb_v, n_v = block_ic(sig[i_train:i_val].ravel(), tgt[i_train:i_val].ravel(),
+                                        bl[i_train:i_val].ravel())
+        seg, raw = tgt[i_train:i_val], fwd[i_train:i_val]
+        sd = float(np.nanstd(seg)) if np.isfinite(seg).any() else float("nan")
+        sd_raw = float(np.nanstd(raw)) if np.isfinite(raw).any() else float("nan")
+        edge = ic_v * sd if np.isfinite(ic_v) else np.nan
+
+        print(f"{label:<34}{ic_tr:>10.4f}{ic_v:>9.4f}{t_v:>9.1f}{edge:>9.3f}"
+              f"{sd:>9.1f}{sd_raw:>9.1f}{n_v:>9,}" + (f"   {note}" if note else ""))
+        rows.append({"convention": label, "entry": ec, "exit": xc,
+                     "ic_train": ic_tr, "ic_val": ic_v, "t_val": t_v,
+                     "n_blocks_val": nb_v, "edge_bps": edge, "sd_xs_bps": sd,
+                     "sd_raw_bps": sd_raw, "n_val": n_v, "note": note})
+
+    print()
+    print("sd raw is the dispersion of the gap itself; sd xs is what survives")
+    print("cross-sectional demeaning. The difference is the COMMON gap -- the index")
+    print("moved and every name moved with it -- which a dollar-neutral book cannot")
+    print("collect. Only sd xs is tradeable here, and Edge is computed against it.")
+    print()
+    print("READ THIS ROW FOR IC, NOT FOR SIZE. That the overnight move is large is")
+    print("already established (75.8 bps median against 9.6 midday) and is not")
+    print("evidence of anything. A large move with zero IC is a large loss. If IC")
+    print("val is at zero here, flatten_at_session_close is EXONERATED: it was not")
+    print("the binding constraint, and P3's negative stands without that confound.")
+
+    if args.json:
+        os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
+        with open(args.json, "w") as fh:
+            json.dump({"mode": "overnight", "signal": args.signal,
+                       "signal_desc": sig_desc, "lookback": args.lookback,
+                       "n_tickers": N, "raw_dir": RAW_DIR,
+                       "n_sessions": int(L.size), "n_sessions_train": n_tr,
+                       "n_sessions_val": n_va, "rows": rows}, fh, indent=2, default=float)
+        print()
+        print(f"[json] {args.json}")
+    return 0
 
 
 def main(argv=None):
@@ -318,6 +503,10 @@ def main(argv=None):
                     help="held fixed across every row; see build_signal")
     ap.add_argument("--lookback", type=int, default=1,
                     help="bars of trailing return for --signal reversal (default 1)")
+    ap.add_argument("--overnight", action="store_true",
+                    help="price the overnight hold instead of the intraday table: "
+                         "enter on the last bar of session d, exit on the first bar "
+                         "of d+1, lifting the flatten_at_session_close cap")
     ap.add_argument("--json", type=str, default=None)
     args = ap.parse_args(argv)
 
@@ -331,6 +520,9 @@ def main(argv=None):
     i_val = int(T * (TRAIN_FRAC + VAL_FRAC))
     print(f"[split] train 0:{i_train}  val {i_train}:{i_val}  test {i_val}:{T} (untouched)")
     print(f"[split] val window {panel['index'][i_train].date()} -> {panel['index'][i_val - 1].date()}")
+
+    if args.overnight:
+        return _overnight_table(args, panel, i_train, i_val)
 
     needed = sorted({c for _, ec, _, xc, _, _ in CONVENTIONS for c in (ec, xc)})
     prices, missing, present = load_price_columns(panel["index"], tickers, needed)

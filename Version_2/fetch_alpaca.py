@@ -99,6 +99,23 @@ TICKERS = [
     "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS",
 ]
 
+# Universe override. `TRADING_TICKERS` takes a comma-separated list and
+# replaces TICKERS entirely; `TRADING_TICKERS_EXTRA` appends to it.
+#
+# Added for the delisting-inclusive universe (see scan_delisted.py). The
+# hardcoded TICKERS list above is 100 mega-caps picked in 2026 and therefore
+# contains only names that survived -- a bias that is mild for the intraday
+# work and is a live alternative explanation for any positive OVERNIGHT
+# result, because cross-sectional reversal buys yesterday's losers and in a
+# survivor-only universe those are names already known to have recovered.
+_ov = os.getenv("TRADING_TICKERS", "").strip()
+if _ov:
+    TICKERS = [t.strip().upper() for t in _ov.split(",") if t.strip()]
+_extra = os.getenv("TRADING_TICKERS_EXTRA", "").strip()
+if _extra:
+    TICKERS = TICKERS + [t.strip().upper() for t in _extra.split(",")
+                         if t.strip() and t.strip().upper() not in set(TICKERS)]
+
 HISTORY_YEARS = int(os.getenv("ALPACA_HISTORY_YEARS", "6"))
 
 # Split/dividend adjustment applied by the Alpaca API. Override with

@@ -14,15 +14,23 @@
 # TRADING_TRAIN_FRAC / TRADING_VAL_FRAC, so a fold is the SAME audited
 # xsec_book invoked with different fractions.
 #
-#   fold 1  train -> 2023-01-10   val 2023-01-10 -> 2023-08-15
-#   fold 2  train -> 2023-08-15   val 2023-08-15 -> 2024-03-18
-#   fold 3  train -> 2024-03-18   val 2024-03-18 -> 2024-10-18
-#   fold 4  train -> 2024-10-18   val 2024-10-18 -> 2025-05-27
-#   fold 5  train -> 2025-05-27   val 2025-05-27 -> 2025-12-26
+#   fold 1  train -> 2023-02-08   val 2023-02-08 -> 2023-09-12
+#   fold 2  train -> 2023-09-13   val 2023-09-13 -> 2024-04-16
+#   fold 3  train -> 2024-04-16   val 2024-04-16 -> 2024-11-15
+#   fold 4  train -> 2024-11-15   val 2024-11-15 -> 2025-06-24
+#   fold 5  train -> 2025-06-24   val 2025-06-24 -> 2026-01-27
 #
-# TEST (2025-12-26 -> 2026-08-28) IS NEVER READ. xsec_book and
-# convention_table only ever touch train and val, and no fold's val reaches
-# into that region.
+# CORRECTED 2026-08-30. The dates above previously read fold 5 val as ending
+# 2025-12-26 and named that the start of test. Those were stale by about a
+# month against what the code actually computes -- the windows are FRACTIONS
+# of the panel (TRAIN_FRAC = 0.30 + 0.10k, VAL_FRAC = 0.10), not fixed dates,
+# so they move whenever the panel does, and the comment did not. Anyone
+# reading the old header would have believed a month of reserved data was
+# being scored in fold 5.
+#
+# TEST (2026-01-27 -> 2026-08-28) IS NEVER READ. xsec_book and
+# convention_table only ever touch train and val; fold 5's val ends exactly
+# where test begins, and every run prints its own test region to prove it.
 #
 # Configurations 2, 4 and 5 only. Row 6 (the lambda=1 cost hurdle) stands flat
 # almost always -- on the full split it averaged 0.4 names and produced an

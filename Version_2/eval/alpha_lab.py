@@ -247,25 +247,49 @@ def load_panel(max_tickers=None):
     # script scores, so an unadjusted cache produces confident nonsense.
     # fetch_alpaca.py passes adjustment=Adjustment.ALL, but a stale local
     # cache or a re-seeded Kaggle input dataset silently predates that.
+    # A DELISTING-INCLUSIVE UNIVERSE TRIPS THIS GUARD LEGITIMATELY. The test
+    # "single-bar ratio outside [0.6, 1.6]" cannot tell an unadjusted split
+    # from a name that actually collapsed, and a universe that includes the
+    # names which died contains real -65% bars: FRC gaps 81.75 -> 28.56 from
+    # 2023-03-10 15:55 to 2023-03-13 09:30, the SVB weekend. So the guard now
+    # reports WHEN the jump happened and whether the ticker's history ends
+    # before the panel's, which is what separates the two cases -- a split is
+    # an isolated jump in a name that keeps trading, a collapse clusters and
+    # the name stops.
     jumpy = []
     for j, t in enumerate(names):
-        c = P[:, j]
-        c = c[np.isfinite(c) & (c > 0)]
+        fin = np.isfinite(P[:, j]) & (P[:, j] > 0)
+        c = P[fin, j]
         if c.size < 2:
             continue
         r = c[1:] / c[:-1]
-        if np.any((r < 0.6) | (r > 1.6)):
-            jumpy.append(t)
+        hit = np.where((r < 0.6) | (r > 1.6))[0]
+        if hit.size:
+            rows = np.where(fin)[0]
+            when = index[rows[hit[0] + 1]]
+            ends = index[rows[-1]]
+            jumpy.append((t, int(hit.size), str(when)[:16], str(ends)[:10],
+                          float(r[hit[0]]), bool(rows[-1] < len(index) - 1)))
     if jumpy:
         print()
         print("!" * 78)
         print(f"!! {len(jumpy)} ticker(s) carry a single-bar close ratio outside "
               f"[0.6, 1.6]:")
-        print(f"!!   {", ".join(jumpy[:16])}{" ..." if len(jumpy) > 16 else ""}")
-        print("!! That is the unadjusted-split signature. This cache predates "
-              "adjustment=Adjustment.ALL.")
-        print("!! Every number below is contaminated. Re-fetch before believing "
-              "any of it.")
+        for t, n, when, ends, ratio, delisted in jumpy[:16]:
+            delisted_tag = "series ENDS here -- collapse/delisting, not a split"
+            split_tag = "name keeps trading -- CHECK FOR AN UNADJUSTED SPLIT"
+            tag = delisted_tag if delisted else split_tag
+            print(f"!!   {t:<7} {n} jump(s), first {when} ratio {ratio:.3f}, "
+                  f"last bar {ends}  [{tag}]")
+        print("!! An unadjusted split looks like this. So does a real collapse. Read "
+              "the tag on each line;")
+        print("!! only the CHECK FOR AN UNADJUSTED SPLIT rows question the cache.")
+        if any(not d for *_, d in jumpy):
+            print("!! At least one is a LIVE name. That is the unadjusted-split")
+            print("!! signature and those numbers are contaminated. Re-fetch.")
+        else:
+            print("!! All of them END at the jump, so these are the universe's real")
+            print("!! collapses -- SIVB, FRC and the rest -- not a stale cache.")
         print("!" * 78)
         print()
 
@@ -296,6 +320,25 @@ def load_panel(max_tickers=None):
                 # per-ticker ADV, and reconstructing it from day_id/bar_of_day
                 # would not survive a missing bar.
                 index=index)
+
+
+def overnight_decision_bars(day_id, session_last_idx, T):
+    """Bars at which an overnight trade is DECIDED, one per session.
+
+    Returns L, the last-bar index of every session that has a bar before it and
+    a session after it. The decision bar is L-1, the entry bar L, the exit bar
+    L+1 -- which is the first bar of the next session, because the panel is
+    RTH-only and contiguous, so the overnight hold is the single transition
+    L -> L+1.
+
+    Shared by convention_table (which measures its IC) and xsec_book (which
+    builds the book), so the two cannot drift apart on which bars are eligible.
+    """
+    L = np.unique(session_last_idx)
+    L = L[(L - 1 >= 0) & (L + 1 < T)]
+    # A single-bar session has no decision bar inside itself, and entering on
+    # the strength of the PREVIOUS session's close is a different trade.
+    return L[day_id[L - 1] == day_id[L]]
 
 
 def exit_index(T, h, session_last_idx=None):

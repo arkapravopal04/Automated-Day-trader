@@ -98,7 +98,8 @@ import pandas as pd
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from paths import RAW_DIR, TRAIN_FRAC, VAL_FRAC  # noqa: E402
-from eval.alpha_lab import (  # noqa: E402
+from eval.alpha_lab import (
+    overnight_decision_bars,  # noqa: E402
     BARS_PER_DAY,
     TRADING_DAYS,
     block_ic,
@@ -220,7 +221,7 @@ def env_cost_constants():
     )
 
 
-def side_cost_bps(price, shares, adv, sigma_daily, k):
+def side_cost_bps(price, shares, adv, sigma_daily, k, spread_bps=None):
     """Per-side friction in bps of notional. Mirrors `_compute_fill_price`.
 
         half-spread   max(spread_bps, half a tick) -- the minimum quotable US
@@ -238,7 +239,13 @@ def side_cost_bps(price, shares, adv, sigma_daily, k):
     """
     price = np.asarray(price, dtype=np.float64)
     half_tick_bps = 1e4 * (k["tick"] / 2.0) / price
-    half_spread = np.maximum(k["spread_bps"], half_tick_bps)
+    # `spread_bps` overrides EnvConfig's when the caller has measured the
+    # spread for the specific moment being traded. The overnight book needs
+    # this: its exit leg is the 09:30 print, where the measured effective
+    # spread is 2.93 bps against 0.068 midday -- 43x -- and charging it the
+    # midday figure is the single largest understatement in its cost.
+    sp = k["spread_bps"] if spread_bps is None else spread_bps
+    half_spread = np.maximum(sp, half_tick_bps)
     part = np.clip(np.asarray(shares, dtype=np.float64) / adv, 0.0, 1.0)
     impact_bps = 1e4 * k["impact_coef"] * sigma_daily * np.sqrt(part)
     return half_spread + half_tick_bps + k["commission_bps"] + impact_bps
@@ -304,8 +311,22 @@ def execution_frame(index, tickers, session_last_idx, column="open"):
                 f"directory; point TRADING_RAW_DIR at one (e.g. data/parquet_agg5) "
                 f"or use --frame exec. Present: {sorted(raw.columns)[:12]}"
             )
-        col = raw[column]
-        col = col.mask(col <= 0).reindex(index).ffill().bfill()
+        col = raw[column].mask(raw[column] <= 0)
+        # A ticker that DELISTED mid-sample has no price afterwards, and one
+        # that listed late has none before. ffill().bfill() across the union
+        # index invents both: it would hand a delisted name a frozen price for
+        # every remaining year, which reads as a real quote with exactly zero
+        # return and zero risk -- the most attractive thing a cost-aware book
+        # can be offered. Fill only INSIDE the ticker's own life; outside it
+        # the price is NaN, and NaN propagates to the return and drops the name
+        # from the cross-section, which is what actually happened.
+        #
+        # This mattered the moment the universe stopped being 100 survivors:
+        # see scan_delisted.py.
+        first, last = col.first_valid_index(), col.last_valid_index()
+        col = col.reindex(index).ffill()
+        if first is not None:
+            col = col.where((col.index >= first) & (col.index <= last))
         Px[:, j] = col.to_numpy(dtype=np.float32)
 
     shift = lambda a: np.concatenate([a[1:], a[-1:]], axis=0)
@@ -420,6 +441,57 @@ def load_edge_npz(path, index, tickers):
     return out.to_numpy(dtype=np.float32), f"trunk edge from {os.path.basename(path)}"
 
 
+def reversal_edge(P, fwd, i_train, day_id, lookback=1):
+    """The target-free reversal signal, rescaled to bps by a TRAIN-ONLY fit.
+
+    Why this exists. The overnight walk-forward measured mean IC +0.0353
+    (t 2.68) for the target-free reversal against +0.0254 for the 27-feature
+    ridge and +0.0280 for the 15-feature one: the features do not beat the raw
+    signal at this horizon. Running the book only on `--edge ridge` would price
+    the WEAKER of the two and risk calling the overnight hold dead on a signal
+    that is not the one carrying the effect -- the mirror of the error the
+    walk-forward protocol exists to prevent.
+
+    THE RESCALING IS NOT COSMETIC. `build_edge`'s contract is that edge[t, i]
+    is in BPS, because the weight formula compares |edge| against lambda * cost
+    directly; a signal on any other scale silently rescales lambda and makes
+    the sweep meaningless. A trailing return in bps is not a forecast in bps,
+    so it is projected onto the realised target by a univariate least-squares
+    slope fit on TRAIN ONLY. No intercept: both sides are cross-sectionally
+    demeaned, so the intercept is zero by construction.
+
+    The slope is one number estimated on train, which is one fitted parameter
+    against the ridge's F+1 -- so this is a strictly more constrained
+    estimator, not a freer one.
+    """
+    T, N = P.shape
+    with np.errstate(divide="ignore", invalid="ignore"):
+        trail = np.full((T, N), np.nan, dtype=np.float32)
+        trail[lookback:] = np.log(P[lookback:] / P[:-lookback]) * 1e4
+
+    # The trailing window must not straddle the overnight gap: on the first
+    # `lookback` bars of a session it spans a 17-hour move rather than a
+    # 5-minute one. Same mask convention_table.build_signal applies, for the
+    # same reason.
+    idx = np.arange(T)
+    first_of_day = np.r_[True, np.diff(day_id) != 0]
+    day_start = np.maximum.accumulate(np.where(first_of_day, idx, 0))
+    trail[(idx - day_start) < lookback] = np.nan
+
+    sig = cross_sectional_demean(-trail)
+    tgt = cross_sectional_demean(fwd)
+    x, y = sig[:i_train].ravel(), tgt[:i_train].ravel()
+    ok = np.isfinite(x) & np.isfinite(y)
+    denom = float(np.dot(x[ok], x[ok]))
+    if not np.isfinite(denom) or denom <= 0:
+        raise SystemExit("reversal edge: degenerate train design")
+    b = float(np.dot(x[ok], y[ok]) / denom)
+    return (sig * b).astype(np.float32), (
+        f"reversal ({lookback}-bar negated trailing return, demeaned, session-gap "
+        f"masked), rescaled to bps by a train-only slope {b:+.5f} on "
+        f"{int(ok.sum()):,} rows -- target-free signal, ONE fitted parameter")
+
+
 def build_edge(kind, X, fwd, i_train, features, edge_npz=None, index=None,
                tickers=None, ridge_alpha=RIDGE_ALPHA):
     """Return (edge_bps [T, N], description).
@@ -483,7 +555,59 @@ def build_edge(kind, X, fwd, i_train, features, edge_npz=None, index=None,
 # The book
 # ---------------------------------------------------------------------------
 
-def book_weights(edge_row, rt_cost_row, lam, min_names=2, size_by_cost=True):
+def trailing_overnight_vol(fwd, day_id, session_last_idx, T, window=60, min_obs=20):
+    """[T, N] causal per-name volatility of the OVERNIGHT return, in bps.
+
+    WHY THE BOOK NEEDS THIS. `book_weights` has no risk term at all: weights go
+    as (|edge| - lambda*cost)/cost, so two names with the same edge and cost are
+    held identically however differently they move. The reversal edge is
+    proportional to the trailing move, and the trailing move is proportional to
+    volatility, so the book systematically loads its largest positions onto its
+    most volatile names. That is the mechanism behind `Sharpe ex top-5`
+    collapsing: three of five overnight folds flip negative when the five best
+    sessions are removed.
+
+    Dividing by this turns equal-DOLLAR sizing into equal-RISK sizing.
+
+    CAUSALITY IS THE WHOLE POINT. The window is the `window` sessions STRICTLY
+    BEFORE the one being sized -- `[:-1]` before the rolling call, not after --
+    so a session's own gap can never inform the position taken into it. Getting
+    that backwards would be a look-ahead that makes the tail vanish by
+    construction, which is exactly the flattery this is meant to remove.
+
+    Names with fewer than `min_obs` prior gaps fall back to the cross-sectional
+    median of that session, so a late IPO is sized like a typical name rather
+    than dropped or given a degenerate zero-vol weight.
+    """
+    L = overnight_decision_bars(day_id, session_last_idx, T)
+    dec = L - 1
+    R = fwd[dec]                                  # [S, N] realised gaps, session-ordered
+    S, N = R.shape
+    out = np.full((T, N), np.nan, dtype=np.float32)
+    if S < 2:
+        return out
+
+    df = pd.DataFrame(R.astype(np.float64)).shift(1)
+    # shift(1) BEFORE rolling: row s sees sessions [s-window, s-1] and never s.
+    V = df.rolling(window=window, min_periods=min_obs).std().to_numpy(dtype=np.float64)
+    # Early sessions have no `min_obs` window yet. Fall back to an EXPANDING std
+    # rather than leaving them unscaled: an unscaled session inside a risk-scaled
+    # run is two sizing regimes in one number, which is worse than a noisier
+    # estimate. Sessions 0-1 have no prior at all and stay NaN by design.
+    exp = df.expanding(min_periods=2).std().to_numpy(dtype=np.float64)
+    V = np.where(np.isfinite(V), V, exp)
+
+    with np.errstate(invalid="ignore"):
+        med = np.nanmedian(np.where(np.isfinite(V) & (V > 0), V, np.nan), axis=1)
+    med = np.where(np.isfinite(med) & (med > 0), med, np.nan)
+    fill = np.repeat(med[:, None], N, axis=1)
+    V = np.where(np.isfinite(V) & (V > 0), V, fill)
+    out[dec] = V.astype(np.float32)
+    return out
+
+
+def book_weights(edge_row, rt_cost_row, lam, min_names=2, size_by_cost=True,
+                 risk_row=None):
     """One bar's weights, gross-normalised and dollar-neutral. (w [N], n_selected).
 
     `size_by_cost=False` is the ablation that isolates what the `/ cost` term
@@ -515,6 +639,23 @@ def book_weights(edge_row, rt_cost_row, lam, min_names=2, size_by_cost=True):
     w[act] = excess[act] * np.sign(edge_row[act])
     if size_by_cost:
         w[act] /= rt_cost_row[act]
+    if risk_row is not None:
+        # Equal-RISK rather than equal-dollar. Divide by the name's causal
+        # trailing volatility so a name that moves twice as much is held half
+        # as large. Non-finite or non-positive vol falls back to the selected
+        # names' median rather than to 1.0: a hardcoded 1.0 is a silent
+        # assertion that the name has unit volatility, which would make it the
+        # LARGEST position in a book measured in bps.
+        r = np.asarray(risk_row, dtype=np.float64)[act]
+        good = np.isfinite(r) & (r > 0)
+        if not good.any():
+            # No usable vol for any selected name. Stand FLAT rather than fall
+            # through unscaled: an unscaled bar inside a risk-scaled run mixes
+            # two sizing rules into one reported number. Only the first two
+            # sessions of train can reach this.
+            return np.zeros(N, dtype=np.float64), n_sel
+        r = np.where(good, r, np.median(r[good]))
+        w[act] /= r
     w[act] -= w[act].mean()              # dollar-neutral
     gross = np.abs(w).sum()
     if gross <= 0:
@@ -523,7 +664,8 @@ def book_weights(edge_row, rt_cost_row, lam, min_names=2, size_by_cost=True):
 
 
 def solve_weights(edge_row, price_row, adv, sigma, lam, capital, k, min_names=2,
-                  iters=2, size_by_cost=True):
+                  iters=2, size_by_cost=True, risk_row=None,
+                  spread_entry=None, spread_exit=None):
     """Weights and the per-side cost they were solved against. (w, n_sel, cost_side).
 
     There is a circularity to resolve: impact depends on the share count, the
@@ -537,8 +679,20 @@ def solve_weights(edge_row, price_row, adv, sigma, lam, capital, k, min_names=2,
     shares = np.zeros_like(price_row, dtype=np.float64)
     w, n_sel, cost_side = None, 0, None
     for _ in range(max(iters, 1)):
-        cost_side = side_cost_bps(price_row, shares, adv, sigma, k)
-        w, n_sel = book_weights(edge_row, 2.0 * cost_side, lam, min_names, size_by_cost)
+        cost_side = side_cost_bps(price_row, shares, adv, sigma, k, spread_entry)
+        # THE HURDLE MUST USE THE ROUND TRIP THAT WILL ACTUALLY BE PAID. When
+        # the two legs are struck at different times their spreads differ, and
+        # doubling the CHEAP leg would admit names that cannot pay for their own
+        # exit -- the exact error the round-trip hurdle exists to prevent. The
+        # exit leg is priced at this bar's price and ADV: overnight the price
+        # moves ~1% and ADV is a per-name constant, so the spread is the term
+        # that actually differs.
+        if spread_exit is None:
+            rt = 2.0 * cost_side
+        else:
+            rt = cost_side + side_cost_bps(price_row, shares, adv, sigma, k, spread_exit)
+        w, n_sel = book_weights(edge_row, rt, lam, min_names, size_by_cost,
+                                risk_row=risk_row)
         with np.errstate(divide="ignore", invalid="ignore"):
             shares = np.abs(w) * capital / np.where(price_row > 0, price_row, np.nan)
         shares = np.nan_to_num(shares, nan=0.0)
@@ -569,8 +723,29 @@ def rebalance_schedule(t0, t1, h, session_last_idx):
     return out
 
 
+def overnight_schedule(t0, t1, day_id, session_last_idx, T):
+    """[(entry, exit)] for the overnight hold: one period per session.
+
+    `rebalance_schedule` cannot express this. It caps every hold at
+    `session_last_idx` because `flatten_at_session_close` liquidates there, and
+    at the last decision bar of a session its `t >= sl` branch fires and emits
+    NOTHING -- which is precisely the trade being priced here.
+
+    In the execution frame a period (t, e) fills at Px[t] and exits at Px[e],
+    and Px[t] is raw open[t+1]. So the gap trade is (L-1, L): fill at open[L],
+    exit at open[L+1]. One bet per name per session.
+
+    A trade is emitted only when BOTH legs fall inside [t0, t1), so no period
+    is scored partly on the wrong split -- the same rule rebalance_schedule
+    applies to sessions straddling the boundary.
+    """
+    L = overnight_decision_bars(day_id, session_last_idx, T)
+    return [(int(l - 1), int(l)) for l in L if l - 1 >= t0 and l < t1]
+
+
 def run_book(edge, ret, P, adv, sigma, k, schedule, day_id, n_bars, lam,
-             capital, min_names=2, size_by_cost=True):
+             capital, min_names=2, size_by_cost=True, risk=None,
+             spread_entry=None, spread_exit=None, carry_bps=0.0):
     """Walk the schedule once and return the period ledger plus totals.
 
     Friction is charged on TURNOVER, one side per unit traded, at the bar where
@@ -598,7 +773,7 @@ def run_book(edge, ret, P, adv, sigma, k, schedule, day_id, n_bars, lam,
         px = P[bar].astype(np.float64)
         with np.errstate(divide="ignore", invalid="ignore"):
             sh = np.nan_to_num(np.abs(w) * capital / np.where(px > 0, px, np.nan), nan=0.0)
-        cs = np.nan_to_num(side_cost_bps(px, sh, adv, sigma, k), nan=0.0)
+        cs = np.nan_to_num(side_cost_bps(px, sh, adv, sigma, k, spread_exit), nan=0.0)
         return float(np.abs(w) @ cs)
 
     for (t, e) in schedule:
@@ -611,14 +786,21 @@ def run_book(edge, ret, P, adv, sigma, k, schedule, day_id, n_bars, lam,
 
         w, n_sel, cost_side = solve_weights(
             edge[t], P[t].astype(np.float64), adv, sigma, lam, capital, k,
-            min_names, size_by_cost=size_by_cost
+            min_names, size_by_cost=size_by_cost,
+            risk_row=(None if risk is None else risk[t]),
+            spread_entry=spread_entry, spread_exit=spread_exit
         )
         dw = w - prev_w
         tot_turn += float(np.abs(dw).sum())
 
         r = np.nan_to_num(ret[t], nan=0.0)
         gross_s.append(float(w @ r))
-        cost_s.append(float(np.abs(dw) @ np.nan_to_num(cost_side, nan=0.0)))
+        # Carry: borrow on the short leg and financing on the long, charged on
+        # GROSS exposure for every night the position is held. Not a trading
+        # cost -- it is paid for holding, which is exactly what this book newly
+        # does and the intraday book never did.
+        cost_s.append(float(np.abs(dw) @ np.nan_to_num(cost_side, nan=0.0))
+                      + carry_bps * float(np.abs(w).sum()))
         sel_s.append(n_sel)
 
         # Drift: a +50 bps name is 0.5% more of the book at the exit than at
@@ -805,7 +987,7 @@ def main(argv=None):
                     help="hold in bars; repeatable (default 24)")
     ap.add_argument("--lam", type=float, action="append", default=None,
                     help="lambda to sweep; repeatable (default 0..3)")
-    ap.add_argument("--edge", choices=("ridge", "oracle", "npz"), default="ridge")
+    ap.add_argument("--edge", choices=("ridge", "oracle", "npz", "reversal"), default="ridge")
     ap.add_argument("--edge-npz", type=str, default=None,
                     help="with --edge npz: the file written by "
                          "training/pretrain_trunk.py --dump-edge")
@@ -828,14 +1010,49 @@ def main(argv=None):
     ap.add_argument("--variant", choices=("full", "nosize"), default="full",
                     help="'nosize' drops the / cost sizing term and keeps the "
                          "hurdle -- the ablation that says which half is working")
+    ap.add_argument("--min-names-frac", type=float, default=0.0,
+                    help="lambda selection floor on BREADTH: the train book must "
+                         "average at least this fraction of the universe. The "
+                         "existing --min-active-frac floor only asks whether the "
+                         "book is ON, not whether it holds anything, so it admits "
+                         "a book that trades every session and holds 1.7 names.")
     ap.add_argument("--min-active-frac", type=float, default=0.10,
                     help="a lambda whose TRAIN book stands flat more than "
                          "(1 - this) of the time is not a selection candidate; "
                          "see the note in main()")
+    ap.add_argument("--open-spread-bps", type=float, default=None,
+                    help="HALF-spread in bps charged on the leg struck at the 09:30 "
+                         "print. Measured by eval/measure_open_spread.py "
+                         "(Corwin-Schultz): full spread 2.93 bps at the open against "
+                         "0.068 midday, so 1.46 here. Overnight mode only.")
+    ap.add_argument("--close-spread-bps", type=float, default=None,
+                    help="HALF-spread in bps on the leg struck at the 15:55 bar "
+                         "(measured full spread 0.52 bps, so 0.26).")
+    ap.add_argument("--carry-bps", type=float, default=0.0,
+                    help="borrow + financing in bps of GROSS per night held. Not "
+                         "measured -- there is no borrow data in this project -- so "
+                         "it is an assumption and the sweep below reports its "
+                         "breakeven. 0.20 corresponds to ~50 bps/yr on the short leg.")
+    ap.add_argument("--risk-scale", choices=("none", "vol"), default="none",
+                    help="vol: size by edge/(cost*trailing overnight vol) instead of "
+                         "edge/cost, i.e. equal-risk rather than equal-dollar. "
+                         "Overnight mode only; the vol is causal.")
+    ap.add_argument("--risk-window", type=int, default=60,
+                    help="sessions of trailing overnight vol for --risk-scale vol")
+    ap.add_argument("--overnight", action="store_true",
+                    help="price the OVERNIGHT hold instead of intraday: lift the "
+                         "flatten_at_session_close cap and trade the single "
+                         "session-close -> next-session-open transition, one bet "
+                         "per name per session. Forces hold=1.")
     ap.add_argument("--json", type=str, default=None)
     args = ap.parse_args(argv)
 
     holds = args.hold or [DEFAULT_HOLD]
+    if args.overnight:
+        if args.hold:
+            print("[overnight] --hold is ignored: the gap trade is one period, "
+                  "session close to next session open, by definition.")
+        holds = [1]
     lams = args.lam or list(DEFAULT_LAMBDAS)
 
     print("=" * 100)
@@ -909,13 +1126,32 @@ def main(argv=None):
            "frame": args.frame, "holds": {}}
 
     for h in holds:
-        fwd = forward_return_bps(Px, h, sli_x)
+        if args.overnight:
+            # NO SESSION CAP -- the cap is exactly what is being lifted. The
+            # uncapped 1-bar exec return at index L-1 is log(open[L+1]/open[L]),
+            # the gap itself.
+            #
+            # Then MASK to the decision bars. Leaving the other 77 bars in would
+            # hand build_edge a regression whose target is a 5-minute return on
+            # 98.7% of its rows and a 17-hour one on the rest, and the fit would
+            # be dominated by the horizon that is not being traded. The plan is
+            # explicit: fit the edge on the OVERNIGHT target specifically,
+            # because a different horizon has a different conditional mean.
+            fwd = forward_return_bps(Px, 1, None)
+            keep = np.zeros(fwd.shape[0], dtype=bool)
+            keep[overnight_decision_bars(day_id, sli, T) - 1] = True
+            fwd = np.where(keep[:, None], fwd, np.nan).astype(np.float32)
+        else:
+            fwd = forward_return_bps(Px, h, sli_x)
         ridge_alpha = (args.ridge_alpha if args.ridge_alpha == "auto"
                        else float(args.ridge_alpha))
-        edge, edge_desc = build_edge(args.edge, X, fwd, i_train, features,
-                                     ridge_alpha=ridge_alpha,
-                                     edge_npz=args.edge_npz,
-                                     index=panel["index"], tickers=tickers)
+        if args.edge == "reversal":
+            edge, edge_desc = reversal_edge(P, fwd, i_train, day_id)
+        else:
+            edge, edge_desc = build_edge(args.edge, X, fwd, i_train, features,
+                                         ridge_alpha=ridge_alpha,
+                                         edge_npz=args.edge_npz,
+                                         index=panel["index"], tickers=tickers)
         print()
         print(f"[edge] hold {h}: {edge_desc}")
 
@@ -955,18 +1191,59 @@ def main(argv=None):
             print("[hurdle] lambda >= 1 IS UNREACHABLE ON THIS EDGE -- every row at "
                   "or above it is an empty book, not a selective one.")
 
-        sched_tr = rebalance_schedule(0, i_train, h, sli_x)
-        sched_va = rebalance_schedule(i_train, i_val, h, sli_x)
+        # Per-leg spreads. The overnight round trip is struck at two different
+        # moments with very different liquidity, and the book had been charging
+        # the cheaper one twice.
+        sp_entry = args.close_spread_bps
+        sp_exit = args.open_spread_bps
+        if (sp_entry is not None or sp_exit is not None) and not args.overnight:
+            raise SystemExit("--open-spread-bps/--close-spread-bps describe the "
+                             "overnight round trip's two legs; they are meaningless "
+                             "without --overnight.")
+        if args.overnight and (sp_entry is not None or sp_exit is not None
+                               or args.carry_bps):
+            print(f"[cost] overnight legs: entry half-spread "
+                  f"{'env default' if sp_entry is None else f'{sp_entry:.3f} bps'}, "
+                  f"exit half-spread "
+                  f"{'env default' if sp_exit is None else f'{sp_exit:.3f} bps'}, "
+                  f"carry {args.carry_bps:.3f} bps of gross/night")
+
+        risk = None
+        if args.risk_scale == "vol":
+            if not args.overnight:
+                raise SystemExit("--risk-scale vol is defined on the overnight "
+                                 "schedule only; the intraday book would need a "
+                                 "5-minute vol estimate, which is a different object.")
+            risk = trailing_overnight_vol(fwd, day_id, sli, T, window=args.risk_window)
+            fin = risk[np.isfinite(risk)]
+            print(f"[risk] equal-risk sizing on {args.risk_window}-session trailing "
+                  f"overnight vol (causal): median {np.median(fin):.0f} bps, "
+                  f"p10 {np.percentile(fin, 10):.0f}  p90 {np.percentile(fin, 90):.0f} "
+                  f"({np.percentile(fin, 90) / max(np.percentile(fin, 10), 1e-9):.1f}x "
+                  f"spread -- the dispersion the scaling acts on)")
+
+        if args.overnight:
+            sched_tr = overnight_schedule(0, i_train, day_id, sli, T)
+            sched_va = overnight_schedule(i_train, i_val, day_id, sli, T)
+            print(f"[overnight] {len(sched_tr)} train / {len(sched_va)} val gap "
+                  f"periods -- one per session, flatten_at_session_close lifted")
+        else:
+            sched_tr = rebalance_schedule(0, i_train, h, sli_x)
+            sched_va = rebalance_schedule(i_train, i_val, h, sli_x)
 
         by_cost = args.variant == "full"
         rows = []
         for lam in lams:
             tr = summarise(run_book(edge, fwd, Px, adv, sigma, k, sched_tr, day_id,
                                     i_train, lam, args.capital, args.min_names,
-                                    size_by_cost=by_cost), h)
+                                    size_by_cost=by_cost, risk=risk,
+                                    spread_entry=sp_entry, spread_exit=sp_exit,
+                                    carry_bps=args.carry_bps), h)
             va = summarise(run_book(edge, fwd, Px, adv, sigma, k, sched_va, day_id,
                                     i_val - i_train, lam, args.capital, args.min_names,
-                                    size_by_cost=by_cost), h)
+                                    size_by_cost=by_cost, risk=risk,
+                                    spread_entry=sp_entry, spread_exit=sp_exit,
+                                    carry_bps=args.carry_bps), h)
             rows.append({"lam": lam, "train": tr, "val": va})
 
         # SELECTION IS ON TRAIN, AND IT NEEDS A FLOOR.
@@ -985,19 +1262,63 @@ def main(argv=None):
         # compete. This is a constraint on the SEARCH, not on the strategy, and
         # it is set on train only, so it grants no val information.
         min_active = args.min_active_frac
+        # BREADTH FLOOR. `min_active_frac` asks whether the book is ON; it does
+        # not ask whether it holds anything. Measured on the overnight book with
+        # all three flatteries corrected: the train-selected lambda produced 1.7
+        # names at 71% flat on fold 1 and 2.3 names on fold 2, and those two
+        # folds are what lifted the mean ratio from 0.69 (full breadth) to 2.40.
+        # A 1.7-name dollar-neutral book is not a selective strategy, it is a
+        # handful of bets, and this project has already been burned twice by
+        # exactly that corner -- see the lambda=1 row in AGENTS.md that swung
+        # from -0.329 to +0.245 between two runs of identical code.
+        min_names_n = args.min_names_frac * N
         viable = [r for r in rows
                   if r["train"] and np.isfinite(r["train"].get("sharpe", np.nan))
                   and r["train"].get("turnover_per_bar", 0) > 0
-                  and (100.0 - r["train"].get("flat_pct", 100.0)) / 100.0 >= min_active]
+                  and (100.0 - r["train"].get("flat_pct", 100.0)) / 100.0 >= min_active
+                  and r["train"].get("mean_names", 0.0) >= min_names_n]
         chosen = max(viable, key=lambda r: r["train"]["sharpe"])["lam"] if viable else None
         if chosen is None:
             print(f"  [select] no lambda kept the train book active for "
-                  f"{min_active:.0%} of its periods -- nothing selected.")
+                  f"{min_active:.0%} of its periods and holding "
+                  f"{min_names_n:.0f}+ names -- nothing selected.")
 
         print_sweep(h, rows, chosen)
         if chosen is not None:
             sel = next(r for r in rows if r["lam"] == chosen)
             print_detail(h, chosen, sel)
+
+            # THE DEGENERATE CORNER, MADE LOUD.
+            #
+            # `--min-names-frac` defaults to 0 so that every number already in
+            # the record reproduces. That leaves the corner reachable, and it is
+            # not a hypothetical: on the corrected overnight book the
+            # train-selected lambda produced a 1.7-name dollar-neutral book,
+            # flat 71% of the time, whose top five sessions carried 555% of its
+            # net PnL -- and it posted ratio 2.93, the best number in the study.
+            # Every breadth floor from 5% up puts the same configuration at
+            # 0.96-1.53. So this warning is not fastidiousness; it separates the
+            # only "pass" this project has produced from the truth.
+            tr_names = sel["train"].get("mean_names", 0.0)
+            va_names = sel["val"].get("mean_names", 0.0)
+            t5 = abs(sel["val"].get("top5_share", 0.0))
+            thin = tr_names < max(0.05 * N, 5.0)
+            if thin or t5 > 1.0:
+                print()
+                print("*" * 92)
+                if thin:
+                    print(f"** DEGENERATE BOOK: the selected lambda holds {tr_names:.1f} "
+                          f"train / {va_names:.1f} val names out of {N}.")
+                    print("** A book this thin is a handful of bets, not a selective "
+                          "strategy, and its Sharpe")
+                    print("** and ratio are computed on an almost-empty sample. Re-run "
+                          "with --min-names-frac.")
+                if t5 > 1.0:
+                    print(f"** TAIL-CARRIED: the top 5 periods account for "
+                          f"{t5:.0%} of net PnL on val.")
+                    print("** Above 100% the rest of the sample is a net LOSS and the "
+                          "headline is five sessions.")
+                print("*" * 92)
         out["holds"][str(h)] = {"edge_desc": edge_desc, "val_ic": ic, "val_t": tstat,
                                 "chosen_lambda": chosen, "rows": rows}
 
