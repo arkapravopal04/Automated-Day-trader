@@ -118,6 +118,66 @@ DEFAULT_LAMBDAS = (0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0)
 DEFAULT_HOLD = 24
 RIDGE_ALPHA = 10.0
 
+# Candidate penalties for `--ridge-alpha auto`. 10.0 stays the DEFAULT so every
+# number measured before this existed remains reproducible; changing the default
+# silently would make the P3 tables incomparable with the ones already recorded
+# in AGENTS.md.
+#
+# Why it needs to be selectable at all: 10.0 was set when the design was ~15
+# features wide. P3's panel is 27, nearly double, and more collinear -- the
+# 12 `ib_*` columns are all functions of the same 5 one-minute bars. A ridge
+# penalty is not scale-free in the feature count, so holding it fixed while the
+# design widens confounds "did the features help" with "was the penalty right
+# for this width", and biases against the wider panel.
+RIDGE_ALPHAS = (0.1, 1.0, 10.0, 100.0, 1_000.0, 10_000.0)
+
+
+def select_ridge_alpha(Xcs, target, i_train, F, alphas=RIDGE_ALPHAS, inner_frac=0.8):
+    """Pick a ridge penalty on TRAIN ONLY. -> (alpha, [(alpha, inner_ic), ...])
+
+    The selection uses an inner holdout carved from the END of train, never the
+    validation split. Tuning a hyperparameter on validation and then reporting
+    validation is the same defect as fitting there: it turns an out-of-sample
+    number into an in-sample one, and this project has already retracted one
+    result to that family of mistake.
+
+    The inner split is TIME-ORDERED, not random. Shuffling rows of a panel puts
+    bars from the same session on both sides of the split, and adjacent 5-minute
+    bars share most of their information -- a shuffled holdout would score a
+    penalty on data it effectively saw, and select too little regularisation.
+
+    Ranking is by pooled IC on the inner holdout. Block-clustering matters for
+    the STANDARD ERROR of an IC, not for its point estimate, and only the
+    ranking is used here.
+    """
+    i_inner = int(i_train * inner_frac)
+    if i_inner < 100 or i_train - i_inner < 100:
+        return RIDGE_ALPHA, []
+
+    Xf = Xcs[:i_inner].reshape(-1, F)
+    yf = target[:i_inner].ravel()
+    Xh = Xcs[i_inner:i_train].reshape(-1, F)
+    yh = target[i_inner:i_train].ravel()
+    ok = np.isfinite(yh) & np.isfinite(Xh).all(axis=1)
+    Xh, yh = Xh[ok], yh[ok]
+    if Xh.shape[0] < 1000:
+        return RIDGE_ALPHA, []
+
+    scored = []
+    for a in alphas:
+        beta, _ = ridge_fit_chunked(Xf, yf, alpha=a)
+        if beta is None:
+            continue
+        pred = Xh @ beta[:-1] + beta[-1]
+        ic = (float(np.corrcoef(pred, yh)[0, 1])
+              if np.isfinite(pred).all() and pred.std() > 0 else float("nan"))
+        scored.append((float(a), ic))
+
+    finite = [(a, ic) for a, ic in scored if np.isfinite(ic)]
+    if not finite:
+        return RIDGE_ALPHA, scored
+    return max(finite, key=lambda t: t[1])[0], scored
+
 # Deployable capital the book runs on. 100 streams x EnvConfig.initial_cash is
 # what the env models today, so gross 1 here is the same dollar amount the env
 # has at risk -- which is what makes the impact term comparable between them.
@@ -360,7 +420,8 @@ def load_edge_npz(path, index, tickers):
     return out.to_numpy(dtype=np.float32), f"trunk edge from {os.path.basename(path)}"
 
 
-def build_edge(kind, X, fwd, i_train, features, edge_npz=None, index=None, tickers=None):
+def build_edge(kind, X, fwd, i_train, features, edge_npz=None, index=None,
+               tickers=None, ridge_alpha=RIDGE_ALPHA):
     """Return (edge_bps [T, N], description).
 
     edge_bps[t, i] estimates, in bps, what name i earns AGAINST THE CROSS-
@@ -397,15 +458,24 @@ def build_edge(kind, X, fwd, i_train, features, edge_npz=None, index=None, ticke
                 "oracle (realised demeaned forward return -- NOT tradeable)")
 
     F = len(features)
+
+    picked = ""
+    if ridge_alpha == "auto":
+        ridge_alpha, scored = select_ridge_alpha(Xcs, target, i_train, F)
+        if scored:
+            grid = "  ".join(f"{a:g}:{ic:+.5f}" for a, ic in scored)
+            print(f"[ridge] inner-holdout IC by alpha (TRAIN only) -- {grid}")
+        picked = " [selected on a train-only inner holdout]"
+
     beta, n_used = ridge_fit_chunked(
-        Xcs[:i_train].reshape(-1, F), target[:i_train].ravel()
+        Xcs[:i_train].reshape(-1, F), target[:i_train].ravel(), alpha=ridge_alpha
     )
     if beta is None:
         raise SystemExit("ridge fit failed -- not enough finite rows in train")
     T, N = fwd.shape
     edge = (Xcs.reshape(-1, F) @ beta[:-1] + beta[-1]).reshape(T, N).astype(np.float32)
     desc = (f"ridge:xsectional over {F} features, fit on {n_used:,} train rows "
-            f"(ridge alpha={RIDGE_ALPHA})")
+            f"(ridge alpha={ridge_alpha:g}{picked})")
     return edge, desc
 
 
@@ -745,6 +815,11 @@ def main(argv=None):
                          "'close' is close-to-close, which the env cannot trade; "
                          "the m1_*/m12_*/bar_vwap rows fill inside bar t+1 and "
                          "need an intrabar.py raw directory")
+    ap.add_argument("--ridge-alpha", default=str(RIDGE_ALPHA),
+                    help="ridge penalty for --edge ridge. A number, or 'auto' to "
+                         "select one on a train-only inner holdout (see "
+                         "select_ridge_alpha). Default 10.0 -- unchanged, so "
+                         "previously recorded results stay reproducible")
     ap.add_argument("--capital", type=float, default=DEFAULT_CAPITAL,
                     help="dollars the book runs at gross 1 (default 1e6, the "
                          "100 x initial_cash the env models)")
@@ -835,7 +910,10 @@ def main(argv=None):
 
     for h in holds:
         fwd = forward_return_bps(Px, h, sli_x)
+        ridge_alpha = (args.ridge_alpha if args.ridge_alpha == "auto"
+                       else float(args.ridge_alpha))
         edge, edge_desc = build_edge(args.edge, X, fwd, i_train, features,
+                                     ridge_alpha=ridge_alpha,
                                      edge_npz=args.edge_npz,
                                      index=panel["index"], tickers=tickers)
         print()

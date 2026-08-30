@@ -114,12 +114,17 @@ def main(argv=None):
                          "Row 6 (the lambda=1 cost hurdle) is the degenerate corner "
                          "-- it stands flat almost always, so on a short fold its "
                          "ALPHA/TURN is computed on a handful of bets and is noise")
+    ap.add_argument("--ridge-alpha", default=None,
+                    help="forwarded to xsec_book; 'auto' selects the penalty on a "
+                         "train-only inner holdout, per configuration")
     ap.add_argument("--verbose", action="store_true",
                     help="let each xsec_book run print its own output too")
     ap.add_argument("--json", type=str, default=None)
     args = ap.parse_args(argv)
 
     common = ["--tickers", str(args.tickers)] if args.tickers else []
+    if args.ridge_alpha:
+        common += ["--ridge-alpha", args.ridge_alpha]
 
     hdr = (f"{'Configuration':<38}{'Names':>7}{'Turn/bar':>10}{'Alpha/turn':>12}"
            f"{'Cost/turn':>11}{'Ratio':>8}{'Net SR':>9}")
