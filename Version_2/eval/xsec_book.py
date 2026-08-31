@@ -221,7 +221,8 @@ def env_cost_constants():
     )
 
 
-def side_cost_bps(price, shares, adv, sigma_daily, k, spread_bps=None):
+def side_cost_bps(price, shares, adv, sigma_daily, k, spread_bps=None,
+                  auction_bps=None):
     """Per-side friction in bps of notional. Mirrors `_compute_fill_price`.
 
         half-spread   max(spread_bps, half a tick) -- the minimum quotable US
@@ -236,9 +237,40 @@ def side_cost_bps(price, shares, adv, sigma_daily, k, spread_bps=None):
     anything to size on: a fixed half tick is 0.04 bps on the dearest name in
     the panel and 2.5 bps on the cheapest. Cost varies ~60x across the
     cross-section while the edge does not.
+
+    AUCTION LEGS ARE A DIFFERENT MICROSTRUCTURE AND `auction_bps` SELECTS IT.
+    An MOC or MOO order does not lift an offer or hit a bid: every order in the
+    cross is filled at ONE clearing price, so there is no quoted half-spread to
+    pay and no adverse tick snap to give up -- the clearing price is a single
+    number on the tick grid, and it is not rounded against the order's side.
+    Both of those terms are therefore DROPPED, not reduced, and what is left is
+
+        auction_bps + commission + impact
+
+    where `auction_bps` is the declared per-side cost of crossing in the
+    auction: the imbalance concession a marketable-on-close order pays for
+    demanding liquidity from the cross. It is an ASSUMPTION, exactly like
+    `--carry-bps`, and it is not measured in this project -- there is no
+    auction imbalance feed here. The impact term is retained unchanged: a large
+    MOC order moves the closing print whether or not it paid a spread to get
+    there.
+
+    Dropping the spread is not a subsidy, it is a correction. The book's two
+    legs are the 16:00 cross and the 09:30 cross, and charging a quoted
+    half-spread on a fill that crosses at a single auction price is charging
+    for liquidity the order never took. What that correction is WORTH is a
+    result, and the arithmetic runs the other way from the usual one -- the
+    ratio divides by cost, so removing cost raises it without touching the
+    signal. That is precisely why the number has to be declared before it is
+    swept and not chosen afterwards.
     """
     price = np.asarray(price, dtype=np.float64)
     half_tick_bps = 1e4 * (k["tick"] / 2.0) / price
+    if auction_bps is not None:
+        part_a = np.clip(np.asarray(shares, dtype=np.float64) / adv, 0.0, 1.0)
+        impact_a = 1e4 * k["impact_coef"] * sigma_daily * np.sqrt(part_a)
+        return (float(auction_bps) + k["commission_bps"] + impact_a
+                + np.zeros_like(half_tick_bps))
     # `spread_bps` overrides EnvConfig's when the caller has measured the
     # spread for the specific moment being traded. The overnight book needs
     # this: its exit leg is the 09:30 print, where the measured effective
@@ -555,7 +587,8 @@ def build_edge(kind, X, fwd, i_train, features, edge_npz=None, index=None,
 # The book
 # ---------------------------------------------------------------------------
 
-def trailing_overnight_vol(fwd, day_id, session_last_idx, T, window=60, min_obs=20):
+def trailing_overnight_vol(fwd, day_id, session_last_idx, T, window=60, min_obs=20,
+                           lag=1, dec_offset=1):
     """[T, N] causal per-name volatility of the OVERNIGHT return, in bps.
 
     WHY THE BOOK NEEDS THIS. `book_weights` has no risk term at all: weights go
@@ -578,17 +611,27 @@ def trailing_overnight_vol(fwd, day_id, session_last_idx, T, window=60, min_obs=
     Names with fewer than `min_obs` prior gaps fall back to the cross-sectional
     median of that session, so a late IPO is sized like a typical name rather
     than dropped or given a degenerate zero-vol weight.
+
+    `lag` must be the HOLD in sessions. `fwd` carries the return of the whole
+    hold, so at hold h a session's own realised outcome is not known until h-1
+    sessions later, and the causal window has to be shifted by h. At h = 1 this
+    is the shift(1) it always was.
     """
-    L = overnight_decision_bars(day_id, session_last_idx, T)
-    dec = L - 1
+    L = eligible_overnight_bars(day_id, session_last_idx, T, dec_offset)
+    dec = L - int(dec_offset)
     R = fwd[dec]                                  # [S, N] realised gaps, session-ordered
     S, N = R.shape
     out = np.full((T, N), np.nan, dtype=np.float32)
     if S < 2:
         return out
 
-    df = pd.DataFrame(R.astype(np.float64)).shift(1)
-    # shift(1) BEFORE rolling: row s sees sessions [s-window, s-1] and never s.
+    df = pd.DataFrame(R.astype(np.float64)).shift(int(lag))
+    # shift(lag) BEFORE rolling: row s sees sessions [s-lag-window+1, s-lag] and
+    # never s. `lag` IS THE HOLD, not a constant 1. At hold h the gap recorded
+    # against session s-1 is an h-night return that does not finish until
+    # session s+h-2, so shifting by one would size session s on an outcome that
+    # has not happened yet -- a look-ahead that grows with the hold and would
+    # make the longer holds look better for the wrong reason.
     V = df.rolling(window=window, min_periods=min_obs).std().to_numpy(dtype=np.float64)
     # Early sessions have no `min_obs` window yet. Fall back to an EXPANDING std
     # rather than leaving them unscaled: an unscaled session inside a risk-scaled
@@ -613,7 +656,146 @@ CAP_TOL = 1e-6
 CAP_FEAS_SLACK = 1e-3
 
 
-def apply_weight_cap(w, act, n_sel, mult, frac=None, iters=CAP_ITERS, tol=CAP_TOL):
+def cap_threshold(n_sel, mult, frac):
+    """min(`mult` x equal weight, `frac`) -- the binding per-name bound."""
+    cap = float("inf")
+    if mult is not None:
+        cap = min(cap, float(mult) / float(n_sel))
+    if frac is not None:
+        cap = min(cap, float(frac))
+    return cap
+
+
+def leg_feasible(w, act, n_sel, mult, frac, slack=CAP_FEAS_SLACK):
+    """Does a dollar-neutral book below the cap exist on THIS bar's two legs?
+
+    The breadth test `cap * n_sel >= 1` is necessary and NOT sufficient. A
+    dollar-neutral book carries half its gross on each leg, so the binding
+    condition is per leg: `cap * n_leg >= 0.5` on BOTH sides. Twenty longs and
+    three shorts passes the breadth test at A = 0.10 and still admits no book
+    -- the short leg cannot carry 0.5 with three names capped at 0.10.
+
+    Kept SEPARATE from `apply_weight_cap`'s own `feasible`, which keeps its
+    Appendix-A meaning (the breadth test) so every count already in the record
+    reproduces. This is the sharper test, and it is what the step-14 flat rule
+    is stated against.
+    """
+    if mult is None and frac is None:
+        return True
+    cap = cap_threshold(n_sel, mult, frac)
+    n_pos = int((w[act] > 0).sum())
+    n_neg = int((w[act] < 0).sum())
+    need = 0.5 * (1.0 + slack)
+    return (cap * n_pos >= need) and (cap * n_neg >= need)
+
+
+def _cap_by_leg(w, act, cap, realloc):
+    """The risk-aware enforcements. (w, converged, feasible).
+
+    Both share one principle the `gross` rule does not have: **mass released by
+    a clip never crosses to the other leg.** That is the defect the mode exists
+    to close. Under `gross`, clipping is followed by a demean over all selected
+    names and a re-normalisation back to gross 1, so cutting one oversized
+    SHORT silently enlarges every LONG -- FRC on 2023-03-10 took weight from a
+    clip while it was days from failing. A position limit that funds itself by
+    growing unrelated positions is not a position limit, it is a transfer, and
+    nothing in the rule says where the transfer lands.
+
+    `none`   clip at `cap` and stop. The released risk is not redeployed at
+             all; the book runs UNDER-INVESTED on bars where the cap binds, and
+             that shortfall is the honest consequence of a binding limit.
+    `edge`   clip, then water-fill the same leg back toward its half of gross,
+             in proportion to the names' remaining `(|edge| - lambda*cost)/cost`
+             -- which is what the pre-cap magnitudes already are. Names already
+             at the cap take none of it. So the released risk is redeployed,
+             but only into the leg that released it and only in proportion to
+             the edge that was there to begin with.
+
+    Dollar-neutrality is then restored by scaling the LARGER leg down to the
+    smaller, never by scaling the smaller up: the same principle again. Gross
+    ends at `2 * min(leg)`, at most 1 and below it whenever the cap bound.
+
+    Both are closed-form -- clip, water-fill, balance -- so there is no fixed
+    point to miss and `converged` is checked rather than iterated. `feasible`
+    keeps its declared meaning: the bar admitted a book at full gross.
+    """
+    w = np.asarray(w, dtype=np.float64).copy()
+    a = np.abs(w)
+    legs = {}
+    for name, mask in (("pos", act & (w > 0)), ("neg", act & (w < 0))):
+        v = a[mask]
+        if v.size == 0:
+            legs[name] = (mask, np.zeros(0))
+            continue
+        # A dollar-neutral book at gross 1 carries exactly 0.5 on each leg, so
+        # 0.5 is the leg's target and not a parameter. `none` clips and leaves
+        # the shortfall; `edge` water-fills back toward the target within the
+        # leg. Both are inert when the cap does not bind.
+        x = _water_fill(v, cap, 0.5) if realloc == "edge" else np.minimum(v, cap)
+        legs[name] = (mask, x)
+    g_pos = float(legs["pos"][1].sum())
+    g_neg = float(legs["neg"][1].sum())
+    half = min(g_pos, g_neg)
+    out = np.zeros_like(w)
+    for name in ("pos", "neg"):
+        mask, x = legs[name]
+        if x.size == 0:
+            continue
+        s = float(x.sum())
+        scaled = x * (half / s) if s > 0 else x
+        out[mask] = scaled if name == "pos" else -scaled
+    gross = float(np.abs(out).sum())
+    if gross <= 0:
+        return np.zeros_like(w), True, False
+    # FEASIBILITY IS A PROPERTY OF THE BAR, NOT OF THE ENFORCEMENT. It asks
+    # whether a dollar-neutral book at full gross exists below the cap, which
+    # needs `cap * n >= 0.5` on BOTH legs. Reading it off the realised gross
+    # instead would make `none` report every bar the cap merely BOUND as one
+    # where no book existed -- `none` deliberately never refills, so its gross
+    # is below 1 whenever the cap did anything at all. That shortfall is a real
+    # and separate quantity and it is reported as `gross_deployed`.
+    need = 0.5 * (1.0 + CAP_FEAS_SLACK)
+    feasible = bool(cap * legs["pos"][1].size >= need
+                    and cap * legs["neg"][1].size >= need)
+    # Reported against REALISED gross, the same units `max_share` is measured
+    # in. On an under-invested bar a position at `cap` is a larger share of the
+    # smaller book, and saying otherwise would be reporting the cap against a
+    # book that was not held.
+    ok = bool(float(np.abs(out).max()) <= cap * (1.0 + 1e-3))
+    return out, (True if not feasible else ok), feasible
+
+
+def _water_fill(v, cap, target):
+    """x_i = min(cap, s * v_i) with sum(x) = target, or the leg's max if short.
+
+    The proportional-with-a-ceiling allocation. The capped set only grows as
+    `s` rises, so the loop is bounded by the leg's own size and terminates on
+    the first pass that adds nobody.
+    """
+    v = np.asarray(v, dtype=np.float64)
+    n = v.size
+    if n == 0:
+        return v
+    if cap * n <= target:
+        return np.full(n, cap)          # leg maxes out; it cannot reach target
+    capped = np.zeros(n, dtype=bool)
+    for _ in range(n + 1):
+        rem = target - cap * float(capped.sum())
+        free = ~capped
+        sv = float(v[free].sum())
+        if sv <= 0:
+            break
+        s = rem / sv
+        newly = free & (s * v > cap)
+        if not newly.any():
+            x = np.where(capped, cap, s * v)
+            return x
+        capped |= newly
+    return np.where(capped, cap, 0.0)
+
+
+def apply_weight_cap(w, act, n_sel, mult, frac=None, iters=CAP_ITERS, tol=CAP_TOL,
+                     realloc="gross"):
     """Bound each name's share of gross at min(`mult` x equal weight, `frac`).
 
     (w, converged, feasible). Input and output are both gross-normalised and
@@ -653,14 +835,19 @@ def apply_weight_cap(w, act, n_sel, mult, frac=None, iters=CAP_ITERS, tol=CAP_TO
     the smaller leg cannot carry its half. Neither is silently accepted; both
     are counted, because a cap quietly failing to bind is failing on exactly the
     bars it exists for.
+
+    `realloc` chooses WHERE THE CLIPPED MASS GOES, which the rule above never
+    said. `"gross"` is the enforcement pre-registered in step 5 and is left
+    byte-for-byte unchanged so every recorded number reproduces; `"none"` and
+    `"edge"` are the risk-aware alternatives and are documented on
+    `_cap_by_leg`. The distinction is not cosmetic: under `"gross"` the
+    re-demean and re-normalisation fund the clip out of the OTHER leg.
     """
     if (mult is None and frac is None) or n_sel <= 0:
         return w, True, True
-    cap = float("inf")
-    if mult is not None:
-        cap = min(cap, float(mult) / float(n_sel))
-    if frac is not None:
-        cap = min(cap, float(frac))
+    cap = cap_threshold(n_sel, mult, frac)
+    if realloc != "gross":
+        return _cap_by_leg(w, act, cap, realloc)
     # FEASIBLE MEANS "a dollar-neutral book below the cap exists, with slack".
     # `cap * n_sel == 1` exactly is not slack: the only admissible book is the
     # exact equal-weight one, and the iteration cannot be asked to land it to
@@ -671,7 +858,7 @@ def apply_weight_cap(w, act, n_sel, mult, frac=None, iters=CAP_ITERS, tol=CAP_TO
     for _ in range(int(iters)):
         g = float(np.abs(w).sum())
         if g <= 0:
-            return w, True
+            return w, True, feasible
         thresh = cap * g
         if float(np.abs(w).max()) <= thresh * (1.0 + tol):
             break
@@ -690,7 +877,7 @@ def apply_weight_cap(w, act, n_sel, mult, frac=None, iters=CAP_ITERS, tol=CAP_TO
 
 def book_weights(edge_row, rt_cost_row, lam, min_names=2, size_by_cost=True,
                  risk_row=None, max_weight_mult=None, max_weight_frac=None,
-                 diag=None):
+                 cap_realloc="gross", flat_if_infeasible=False, diag=None):
     """One bar's weights, gross-normalised and dollar-neutral. (w [N], n_selected).
 
     `size_by_cost=False` is the ablation that isolates what the `/ cost` term
@@ -754,14 +941,38 @@ def book_weights(edge_row, rt_cost_row, lam, min_names=2, size_by_cost=True,
     # one name is worth more than three of them, nor more than a tenth of it.
     feasible = True
     if max_weight_mult is not None or max_weight_frac is not None:
+        # PER-BAR BREADTH FLOOR (step 14). A bar whose two legs cannot both
+        # carry half the gross under the cap admits NO dollar-neutral book
+        # below it -- the enforcement will return something above the cap
+        # whatever it does, because nothing below it exists. Standing flat is
+        # the only response that is not a violation, and it is a STRATEGY
+        # CHANGE, so it is off by default and pre-registered separately.
+        #
+        # Checked here rather than inside the cap because a flat bar is not a
+        # book: it must not land in the concentration diagnostics, or the
+        # reported max-share would be the concentration of a position that was
+        # never taken.
+        if flat_if_infeasible and not leg_feasible(w, act, n_sel,
+                                                   max_weight_mult,
+                                                   max_weight_frac):
+            if diag is not None:
+                diag["bar_flat_infeasible"] = diag.get("bar_flat_infeasible", 0) + 1
+            return np.zeros(N, dtype=np.float64), 0
         w, ok, feasible = apply_weight_cap(w, act, n_sel, max_weight_mult,
-                                           max_weight_frac)
+                                           max_weight_frac,
+                                           realloc=cap_realloc)
         if diag is not None:
             diag["cap_bars"] = diag.get("cap_bars", 0) + 1
             if not ok:
                 diag["cap_unconverged"] = diag.get("cap_unconverged", 0) + 1
             if not feasible:
                 diag["cap_infeasible"] = diag.get("cap_infeasible", 0) + 1
+            # GROSS ACTUALLY DEPLOYED. Under `--cap-realloc none|edge` the book
+            # is allowed to run below gross 1 rather than fund a clip out of
+            # the other leg, so the shortfall is the size of the risk the cap
+            # removed instead of transferring. It is 1.0 on every bar under
+            # `gross`, which is the point being made.
+            diag.setdefault("gross_deployed", []).append(float(np.abs(w).sum()))
     if diag is not None and n_sel > 0:
         g = float(np.abs(w).sum())
         if g > 0:
@@ -778,7 +989,9 @@ def book_weights(edge_row, rt_cost_row, lam, min_names=2, size_by_cost=True,
 def solve_weights(edge_row, price_row, adv, sigma, lam, capital, k, min_names=2,
                   iters=2, size_by_cost=True, risk_row=None,
                   spread_entry=None, spread_exit=None,
-                  max_weight_mult=None, max_weight_frac=None, diag=None):
+                  auction_entry=None, auction_exit=None,
+                  max_weight_mult=None, max_weight_frac=None,
+                  cap_realloc="gross", flat_if_infeasible=False, diag=None):
     """Weights and the per-side cost they were solved against. (w, n_sel, cost_side).
 
     There is a circularity to resolve: impact depends on the share count, the
@@ -793,7 +1006,8 @@ def solve_weights(edge_row, price_row, adv, sigma, lam, capital, k, min_names=2,
     w, n_sel, cost_side = None, 0, None
     n_iter = max(iters, 1)
     for it in range(n_iter):
-        cost_side = side_cost_bps(price_row, shares, adv, sigma, k, spread_entry)
+        cost_side = side_cost_bps(price_row, shares, adv, sigma, k, spread_entry,
+                                  auction_bps=auction_entry)
         # THE HURDLE MUST USE THE ROUND TRIP THAT WILL ACTUALLY BE PAID. When
         # the two legs are struck at different times their spreads differ, and
         # doubling the CHEAP leg would admit names that cannot pay for their own
@@ -801,10 +1015,11 @@ def solve_weights(edge_row, price_row, adv, sigma, lam, capital, k, min_names=2,
         # exit leg is priced at this bar's price and ADV: overnight the price
         # moves ~1% and ADV is a per-name constant, so the spread is the term
         # that actually differs.
-        if spread_exit is None:
+        if spread_exit is None and auction_exit is None:
             rt = 2.0 * cost_side
         else:
-            rt = cost_side + side_cost_bps(price_row, shares, adv, sigma, k, spread_exit)
+            rt = cost_side + side_cost_bps(price_row, shares, adv, sigma, k,
+                                           spread_exit, auction_bps=auction_exit)
         # `diag` is recorded on the LAST impact pass only. The earlier passes
         # price the book as if it were infinitesimal, so their weights are an
         # intermediate the book never holds, and counting them would report the
@@ -813,6 +1028,8 @@ def solve_weights(edge_row, price_row, adv, sigma, lam, capital, k, min_names=2,
                                 risk_row=risk_row,
                                 max_weight_mult=max_weight_mult,
                                 max_weight_frac=max_weight_frac,
+                                cap_realloc=cap_realloc,
+                                flat_if_infeasible=flat_if_infeasible,
                                 diag=(diag if it == n_iter - 1 else None))
         with np.errstate(divide="ignore", invalid="ignore"):
             shares = np.abs(w) * capital / np.where(price_row > 0, price_row, np.nan)
@@ -844,8 +1061,60 @@ def rebalance_schedule(t0, t1, h, session_last_idx):
     return out
 
 
-def overnight_schedule(t0, t1, day_id, session_last_idx, T):
-    """[(entry, exit)] for the overnight hold: one period per session.
+def eligible_overnight_bars(day_id, session_last_idx, T, dec_offset=1):
+    """The session-last bars whose DECISION bar is `dec_offset` back, in-session.
+
+    `overnight_decision_bars` answers which sessions have a gap to trade. This
+    adds the second question the MOC cutoff forces: is the bar the decision is
+    actually taken on still inside the same session? At `dec_offset = 2` the
+    first session of the panel and any session shorter than three bars drop out,
+    and a bar whose `L - 2` lands in the PREVIOUS session would otherwise decide
+    on the strength of a different day's tape.
+
+    Shared by the schedule, the forward return and the volatility estimate, so
+    the three cannot disagree about which sessions are eligible.
+    """
+    L = overnight_decision_bars(day_id, session_last_idx, T)
+    d = L - int(dec_offset)
+    return L[(d >= 0) & (day_id[d] == day_id[L])]
+
+
+def overnight_forward_return(P_entry, P_exit, L, h, dec_offset=1):
+    """[T, N] bps. The return of the h-NIGHT hold, at each decision bar.
+
+    Row `L[i] - dec_offset` carries
+    `log(P_exit[L[i+h-1]] / P_entry[L[i] - dec_offset]) * 1e4`:
+    fill at session i's entry print, exit at session i+h-1's exit print. Every
+    other row is NaN, so `build_edge` and the IC see the horizon that is
+    actually traded and nothing else -- the same masking the hold-1 book did,
+    generalised.
+
+    At h = 1 with one price array this is exactly `forward_return_bps(P, 1)`
+    masked to the decision bars, expression for expression, so the hold-1
+    numbers already in the record reproduce through this path.
+
+    WHAT h > 1 IS. Sessions i .. i+h-1 means h nights AND the h-1 day sessions
+    between them. The book is NOT flat during those days -- it cannot be, the
+    position is carried -- so a multi-night hold buys its lower turnover with
+    intraday exposure the reversal signal says nothing about. That is a real
+    cost of the trade and not an accounting one; it is the reason the sweep is
+    a question rather than a foregone conclusion.
+    """
+    T = P_entry.shape[0]
+    out = np.full((T, P_entry.shape[1]), np.nan, dtype=np.float32)
+    L = np.asarray(L, dtype=np.int64)
+    h = int(h)
+    if L.size < h:
+        return out
+    ent = L[: L.size - h + 1] - int(dec_offset)
+    ex = L[h - 1:]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out[ent] = np.log(P_exit[ex] / P_entry[ent]) * 1e4
+    return out
+
+
+def overnight_schedule(t0, t1, day_id, session_last_idx, T, hold=1, dec_offset=1):
+    """[(entry, exit)] for the overnight hold: one period per `hold` sessions.
 
     `rebalance_schedule` cannot express this. It caps every hold at
     `session_last_idx` because `flatten_at_session_close` liquidates there, and
@@ -859,15 +1128,34 @@ def overnight_schedule(t0, t1, day_id, session_last_idx, T):
     A trade is emitted only when BOTH legs fall inside [t0, t1), so no period
     is scored partly on the wrong split -- the same rule rebalance_schedule
     applies to sessions straddling the boundary.
+
+    `hold` NIGHTS PER PERIOD. The periods are non-overlapping, so the eligible
+    sessions inside the split are stepped by `hold`, not by one: period j runs
+    from session j*hold's entry to session (j+1)*hold - 1's exit. Turnover per
+    SESSION therefore falls as 1/hold while turnover per PERIOD stays at one
+    round trip, which is the whole point of the sweep -- cost has two factors
+    and the spread is only one of them.
+
+    The stepping is applied AFTER the split filter, so a period never straddles
+    the train/val boundary and the first period of val always starts at val's
+    first eligible session, whatever hold is.
     """
-    L = overnight_decision_bars(day_id, session_last_idx, T)
-    return [(int(l - 1), int(l)) for l in L if l - 1 >= t0 and l < t1]
+    L = eligible_overnight_bars(day_id, session_last_idx, T, dec_offset)
+    h = max(int(hold), 1)
+    off = int(dec_offset)
+    sub = [int(l) for l in L if l - off >= t0 and l < t1]
+    out = []
+    for j in range(0, len(sub) - h + 1, h):
+        out.append((sub[j] - off, sub[j + h - 1]))
+    return out
 
 
 def run_book(edge, ret, P, adv, sigma, k, schedule, day_id, n_bars, lam,
              capital, min_names=2, size_by_cost=True, risk=None,
              spread_entry=None, spread_exit=None, carry_bps=0.0,
-             max_weight_mult=None, max_weight_frac=None):
+             max_weight_mult=None, max_weight_frac=None, P_exit=None,
+             auction_entry=None, auction_exit=None, nights=1,
+             cap_realloc="gross", flat_if_infeasible=False):
     """Walk the schedule once and return the period ledger plus totals.
 
     Friction is charged on TURNOVER, one side per unit traded, at the bar where
@@ -883,6 +1171,13 @@ def run_book(edge, ret, P, adv, sigma, k, schedule, day_id, n_bars, lam,
     would admit trades that cannot pay for their own exit.
     """
     N = edge.shape[1]
+    # THE TWO LEGS MAY BE STRUCK ON DIFFERENT PRICES. `P` is the price the
+    # ENTRY fills on and `P_exit` the price the exit fills on; they are the
+    # same array in every frame where both legs are the same kind of print, and
+    # they differ under `--exec-legs moc_moo`, where the entry crosses in the
+    # 16:00 closing auction and the exit in the 09:30 opening one.
+    if P_exit is None:
+        P_exit = P
     prev_w = np.zeros(N, dtype=np.float64)
     prev_exit = None
     prev_day = None
@@ -893,10 +1188,11 @@ def run_book(edge, ret, P, adv, sigma, k, schedule, day_id, n_bars, lam,
 
     def liquidation_cost(w, bar):
         """Cost of closing `w` at `bar`, impact priced off the size being closed."""
-        px = P[bar].astype(np.float64)
+        px = P_exit[bar].astype(np.float64)
         with np.errstate(divide="ignore", invalid="ignore"):
             sh = np.nan_to_num(np.abs(w) * capital / np.where(px > 0, px, np.nan), nan=0.0)
-        cs = np.nan_to_num(side_cost_bps(px, sh, adv, sigma, k, spread_exit), nan=0.0)
+        cs = np.nan_to_num(side_cost_bps(px, sh, adv, sigma, k, spread_exit,
+                                         auction_bps=auction_exit), nan=0.0)
         return float(np.abs(w) @ cs)
 
     for (t, e) in schedule:
@@ -912,7 +1208,9 @@ def run_book(edge, ret, P, adv, sigma, k, schedule, day_id, n_bars, lam,
             min_names, size_by_cost=size_by_cost,
             risk_row=(None if risk is None else risk[t]),
             spread_entry=spread_entry, spread_exit=spread_exit,
+            auction_entry=auction_entry, auction_exit=auction_exit,
             max_weight_mult=max_weight_mult, max_weight_frac=max_weight_frac,
+            cap_realloc=cap_realloc, flat_if_infeasible=flat_if_infeasible,
             diag=diag
         )
         dw = w - prev_w
@@ -924,8 +1222,13 @@ def run_book(edge, ret, P, adv, sigma, k, schedule, day_id, n_bars, lam,
         # GROSS exposure for every night the position is held. Not a trading
         # cost -- it is paid for holding, which is exactly what this book newly
         # does and the intraday book never did.
+        # `nights` is the number of overnight holds inside the period. At hold
+        # 1 it is 1 and this term is unchanged; at hold h the position is
+        # financed for h nights and the h-1 day sessions between them, so the
+        # charge scales with h. Weekends are still one night's borrow, the same
+        # idealisation the hold-1 book already makes.
         cost_s.append(float(np.abs(dw) @ np.nan_to_num(cost_side, nan=0.0))
-                      + carry_bps * float(np.abs(w).sum()))
+                      + carry_bps * nights * float(np.abs(w).sum()))
         sel_s.append(n_sel)
 
         # Drift: a +50 bps name is 0.5% more of the book at the exit than at
@@ -1009,9 +1312,25 @@ def summarise(ledger, h):
     diag = ledger.get("diag") or {}
     shares = np.asarray(diag.get("max_share", []), dtype=float)
     conc = {}
+    # Recorded whether or not any bar produced a book, so a configuration that
+    # stands flat everywhere still says WHY rather than reporting an empty dict.
+    if diag.get("bar_flat_infeasible"):
+        conc["bar_flat_infeasible"] = int(diag["bar_flat_infeasible"])
+    gd = np.asarray(diag.get("gross_deployed", []), dtype=float)
+    if gd.size:
+        # 1.0 on every bar under --cap-realloc gross, by construction. Below it
+        # only when a risk-aware enforcement declined to fund a clip out of the
+        # other leg, and the mean is then the fraction of the intended book the
+        # cap allowed to be held.
+        conc["gross_deployed_mean"] = float(gd.mean())
+        conc["gross_deployed_p10"] = float(np.percentile(gd, 10))
+        conc["gross_deployed_min"] = float(gd.min())
     if shares.size:
         nsel = np.asarray(diag.get("n_sel", []), dtype=float)
-        conc = dict(
+        # update, NOT rebind: the two counters above are recorded for
+        # configurations that produce no book at all, and assigning over `conc`
+        # here silently dropped them on every run that produced one.
+        conc.update(
             max_share_p50=float(np.percentile(shares, 50)),
             max_share_p90=float(np.percentile(shares, 90)),
             max_share_p99=float(np.percentile(shares, 99)),
@@ -1076,6 +1395,69 @@ def summarise(ledger, h):
 
 ROW = ("{lam:>6} {t_sharpe:>9} {t_ratio:>8} {t_ann:>8}   "
        "{v_sharpe:>9} {v_ratio:>8} {v_ann:>8} {v_names:>7} {v_flat:>7} {v_turn:>8}")
+
+
+def choose_lambda(rows, viable, mode, lam_fixed):
+    """(lambda, note). The three selection rules, and why the default is unsafe.
+
+    `train-max` -- argmax of train Sharpe among the candidates that clear the
+    activity and breadth floors. This is what every number in the record used,
+    and it is CHOOSING ON NOISE. On fold 3 of the re-frozen reference it
+    separated train Sharpes of -0.102 and -0.116 -- a gap of 0.014, against a
+    Lo standard error on a train Sharpe of order 0.5 -- and the half point of
+    val Sharpe that moved on the difference is not attributable to the
+    criterion. Worse, it lets the treatment differ across folds: lambda 1.00 on
+    one fold and 0.25 on another means the five folds are averaging five
+    different strategies, which is exactly the defect that was removed from
+    KAPPA by fixing it a priori.
+
+    `fixed` -- one lambda, declared in advance, on every fold. No selection
+    happens, so there is nothing to overfit and the five folds are five
+    measurements of ONE strategy. The floors are still evaluated and a failure
+    is reported LOUDLY, but it does not change the choice: a pre-registered
+    value that turns out to produce a thin book on some fold is a result about
+    that fold, and quietly substituting a different lambda there would put the
+    fold-varying treatment straight back in.
+
+    `train-1se` -- the compromise, for when adaptivity is wanted anyway. Take
+    the train optimum, take its Lo standard error, and choose the LARGEST
+    lambda whose train Sharpe is within one standard error of it. Larger lambda
+    is the conservative direction here: the hurdle is |edge| > lambda * cost, so
+    a bigger lambda trades less and demands more edge per unit of cost. The
+    tie-breaking is then explicit -- "any candidate statistically
+    indistinguishable from the best, resolved toward less trading" -- rather
+    than an argmax over differences the data cannot resolve.
+    """
+    if not viable:
+        return None, ""
+    if mode == "fixed":
+        lam = float(lam_fixed)
+        row = next((r for r in rows if float(r["lam"]) == lam), None)
+        if row is None:
+            return None, (f"lambda {lam:g} was declared but is not in the sweep "
+                          f"-- nothing selected")
+        if row not in viable:
+            return lam, (f"lambda {lam:g} FIXED a priori and FAILS this fold's "
+                         f"floors (train book {row['train'].get('mean_names', 0):.1f} "
+                         f"names, {row['train'].get('flat_pct', 0):.0f}% flat). "
+                         f"It is used anyway: substituting another value here is "
+                         f"how the treatment starts differing across folds.")
+        return lam, f"lambda {lam:g} FIXED a priori -- no selection performed"
+    if mode == "train-1se":
+        best = max(viable, key=lambda r: r["train"]["sharpe"])
+        s_star = float(best["train"]["sharpe"])
+        se = float(best["train"].get("sharpe_se", float("nan")))
+        if not np.isfinite(se) or se <= 0:
+            return best["lam"], ("1-SE rule: no usable standard error on the "
+                                 "train optimum, fell back to the argmax")
+        floor = s_star - se
+        within = [r for r in viable if float(r["train"]["sharpe"]) >= floor]
+        pick = max(within, key=lambda r: float(r["lam"]))
+        return pick["lam"], (f"1-SE rule: train optimum {s_star:+.3f} at lambda "
+                             f"{best['lam']:g}, se {se:.3f}, {len(within)} of "
+                             f"{len(viable)} candidates within it -- taking the "
+                             f"largest, lambda {pick['lam']:g}")
+    return max(viable, key=lambda r: r["train"]["sharpe"])["lam"], ""
 
 
 def _fmt(x, spec=".2f"):
@@ -1255,6 +1637,68 @@ def main(argv=None):
                          "held FLAT for that period, in TRAIN and VAL alike -- the "
                          "exclusion is part of the strategy definition, so lambda "
                          "must be selected on the book being graded. Overnight only.")
+    ap.add_argument("--exec-legs", choices=("open_open", "moc_moo"),
+                    default="open_open",
+                    help="WHICH PRINTS THE OVERNIGHT ROUND TRIP IS STRUCK ON. "
+                         "'open_open' is the frame every number in the record "
+                         "was measured in: entry at the open of the session's "
+                         "LAST bar (15:55) and exit at the next session's first "
+                         "open (09:30). 'moc_moo' moves the entry to the 16:00 "
+                         "CLOSE of that last bar -- the closing auction print -- "
+                         "so the trade is MOC in, MOO out, which is the book "
+                         "this strategy actually describes. The 15:55-to-16:00 "
+                         "move stops being part of the held return and becomes "
+                         "part of the decision. Overnight mode only.")
+    ap.add_argument("--entry-auction-bps", type=float, default=None,
+                    help="Price the ENTRY leg as an AUCTION CROSS at this "
+                         "per-side cost in bps, instead of charging a quoted "
+                         "half-spread and an adverse tick snap. An MOC order "
+                         "fills at the single closing price; it does not lift "
+                         "an offer. Impact is still charged. The number is an "
+                         "ASSUMPTION -- there is no auction imbalance data in "
+                         "this project -- so it is declared before the sweep, "
+                         "like --carry-bps, and its breakeven is reported.")
+    ap.add_argument("--exit-auction-bps", type=float, default=None,
+                    help="The same for the EXIT leg (MOO, the 09:30 opening "
+                         "cross). This is the leg the measured 1.464 bps "
+                         "half-spread is charged on today, and it is the larger "
+                         "of the two by 5.6x, so it is where the correction "
+                         "is worth the most.")
+    ap.add_argument("--cap-realloc", choices=("gross", "none", "edge"),
+                    default="gross",
+                    help="WHERE THE MASS CLIPPED BY THE WEIGHT CAP GOES. "
+                         "'gross' (default, reproduces the record) re-demeans "
+                         "and re-normalises back to gross 1, which funds the "
+                         "clip out of the OTHER leg -- an unmanaged transfer. "
+                         "'none' clips and stops, so the book runs "
+                         "under-invested when the cap binds. 'edge' water-fills "
+                         "the same leg back toward its half of gross in "
+                         "proportion to the names' remaining edge-over-cost, "
+                         "and never crosses legs. See _cap_by_leg.")
+    ap.add_argument("--cap-flat-if-infeasible", action="store_true",
+                    help="PER-BAR BREADTH FLOOR. Stand flat on any bar whose "
+                         "two legs cannot both carry half the gross under the "
+                         "cap -- at A = 0.10 that needs 5 names a side, 10 in "
+                         "all. Such a bar admits no dollar-neutral book below "
+                         "the cap at any weighting, so the alternative is "
+                         "reporting a book that violates the limit. It is a "
+                         "STRATEGY CHANGE and is off by default.")
+    ap.add_argument("--lam-select", choices=("train-max", "fixed", "train-1se"),
+                    default="train-max",
+                    help="HOW LAMBDA IS CHOSEN. 'train-max' (default) takes the "
+                         "argmax of train Sharpe among the candidates that pass "
+                         "the floors -- which on fold 3 discriminated between "
+                         "train Sharpes of -0.102 and -0.116 and moved half a "
+                         "point of val Sharpe on the difference. 'fixed' uses "
+                         "--lam-fixed on every fold and selects nothing. "
+                         "'train-1se' takes the LARGEST lambda whose train "
+                         "Sharpe is within one Lo standard error of the train "
+                         "optimum, which makes the tie-breaking explicit "
+                         "instead of accidental.")
+    ap.add_argument("--lam-fixed", type=float, default=None,
+                    help="the lambda used by --lam-select fixed. Added to the "
+                         "sweep if it is not already in it, so the row it "
+                         "reports is the row it ran.")
     ap.add_argument("--json", type=str, default=None)
     args = ap.parse_args(argv)
 
@@ -1268,13 +1712,43 @@ def main(argv=None):
         raise SystemExit("--max-weight-frac is a share of gross and must lie in "
                          "(0, 1].")
 
+    for nm, v in (("--entry-auction-bps", args.entry_auction_bps),
+                  ("--exit-auction-bps", args.exit_auction_bps)):
+        if v is not None and v < 0:
+            raise SystemExit(f"{nm} is a cost in bps and cannot be negative.")
+    if (args.entry_auction_bps is not None or args.exit_auction_bps is not None
+            or args.exec_legs != "open_open") and not args.overnight:
+        raise SystemExit("--exec-legs and the auction costs describe the "
+                         "overnight round trip's two crossing prints; they are "
+                         "meaningless without --overnight.")
+    if args.lam_select == "fixed" and args.lam_fixed is None:
+        raise SystemExit("--lam-select fixed needs --lam-fixed: the whole point "
+                         "is that the value is declared, not searched for.")
+    if args.cap_flat_if_infeasible and args.max_weight_frac is None:
+        raise SystemExit("--cap-flat-if-infeasible is defined against the "
+                         "ABSOLUTE cap; without --max-weight-frac the relative "
+                         "cap is satisfiable at every breadth and the floor "
+                         "would never bind.")
+    if args.cap_realloc != "gross" and (args.max_weight_mult is None
+                                        and args.max_weight_frac is None):
+        raise SystemExit("--cap-realloc changes how the weight cap is enforced "
+                         "and needs a cap to enforce.")
+
     holds = args.hold or [DEFAULT_HOLD]
     if args.overnight:
-        if args.hold:
-            print("[overnight] --hold is ignored: the gap trade is one period, "
-                  "session close to next session open, by definition.")
-        holds = [1]
+        # `--hold` IS NOW MEANINGFUL OVERNIGHT: it is the number of NIGHTS the
+        # position is carried, not bars. It used to be forced to 1 because the
+        # gap trade was defined as the single close-to-open transition. It is
+        # swept because cost has two factors and the spread is only one of
+        # them: at hold 1 the book does a full round trip every session, so
+        # turnover is ~2 per session and cost eats half of gross. Holding h
+        # nights cuts turnover to 2/h per session -- and buys h-1 day sessions
+        # of exposure the reversal signal is silent about, which is the part
+        # that has to be measured rather than assumed.
+        holds = [max(int(h), 1) for h in (args.hold or [1])]
     lams = args.lam or list(DEFAULT_LAMBDAS)
+    if args.lam_fixed is not None and args.lam_fixed not in lams:
+        lams = sorted(set(lams) | {float(args.lam_fixed)})
 
     print("=" * 100)
     print("CROSS-SECTIONAL BOOK -- cost-aware sizing")
@@ -1325,14 +1799,64 @@ def main(argv=None):
         Px, sli_x = execution_frame(panel["index"], tickers, sli, column=frame_col)
     print(f"[frame] {args.frame}: {frame_desc}")
 
+    # THE TWO CROSSING PRINTS. `Px` is the exit frame in every configuration;
+    # `Px_entry` is what the entry leg fills on and differs only under
+    # `--exec-legs moc_moo`.
+    #
+    # `execution_frame(column="close")[t]` is `close[t+1]`, so at the decision
+    # bar `L-1` it is the close of the session's LAST bar -- the 16:00 print,
+    # which on consolidated data is the closing cross. That is the price an MOC
+    # order fills at. The existing frame's `open[t+1]` at the same bar is 15:55,
+    # five minutes earlier and a quoted fill.
+    #
+    # This is not a free re-labelling. Moving the entry to 16:00 REMOVES the
+    # 15:55->16:00 move from the held return and puts it into the information
+    # set the decision is made on. The book gets five more minutes of signal and
+    # five fewer minutes of return, and which way that lands is a result.
+    Px_entry = Px
+    dec_offset = 1
+    if args.exec_legs == "moc_moo":
+        if args.frame != "exec":
+            raise SystemExit("--exec-legs moc_moo defines its own two prints "
+                             "(16:00 close in, 09:30 open out) and cannot be "
+                             f"combined with --frame {args.frame}.")
+        # THE MOC CUTOFF IS 15:50 ET AND IT MOVES THE DECISION, NOT JUST THE
+        # FILL. NYSE and Nasdaq stop accepting market-on-close orders at 15:50.
+        # A decision taken on data through 15:55 -- the close of bar L-1, which
+        # is where the existing overnight book decides -- CANNOT be submitted as
+        # an MOC. Filling it at the 16:00 cross anyway would be a five-minute
+        # look-ahead dressed as an execution improvement, and it is exactly the
+        # kind of subsidy this project has spent three sessions removing.
+        #
+        # So the decision bar moves back one more bar, to L-2, whose close is
+        # 15:50 -- the last moment an MOC can still be entered. The book then
+        # decides on strictly LESS information than the 15:55 book does, and
+        # fills at the cross. `dec_offset = 2` is what carries that through the
+        # schedule, the forward return and the causal vol window alike.
+        #
+        # The entry price is correspondingly `close[t+2]`: at the decision bar
+        # L-2 that is `close[L]`, the 16:00 print, which on consolidated data is
+        # the closing cross.
+        Pc, _ = execution_frame(panel["index"], tickers, sli, column="close")
+        Px_entry = np.concatenate([Pc[1:], Pc[-1:]], axis=0)
+        dec_offset = 2
+        print("[frame] exec-legs moc_moo: DECIDE at 15:50 (close of bar L-2, the "
+              "MOC entry cutoff),")
+        print("[frame]   ENTER at the 16:00 closing cross, EXIT at the 09:30 "
+              "opening cross. The held")
+        print("[frame]   return is exactly close-to-open. The book sees FIVE "
+              "MINUTES LESS than the")
+        print("[frame]   15:55 book does -- the cutoff costs information, it does "
+              "not grant any.")
+
     adv, sigma = measure_liquidity(panel["index"], tickers, day_id, i_train, P)
     print(f"[liq] train-measured: median ADV {np.median(adv):,.0f} shares, "
           f"median sigma_daily {np.median(sigma) * 100:.2f}%")
 
     # Per-name, per-bar cost at an equal-weight reference size. This is the
     # whole point of the exercise: cost is a [T, N] object, never a scalar.
-    ref_sh = (args.capital / max(N, 1)) / np.where(Px > 0, Px, np.nan)
-    cs_ref = side_cost_bps(Px, np.nan_to_num(ref_sh, nan=0.0), adv, sigma, k)
+    ref_sh = (args.capital / max(N, 1)) / np.where(Px_entry > 0, Px_entry, np.nan)
+    cs_ref = side_cost_bps(Px_entry, np.nan_to_num(ref_sh, nan=0.0), adv, sigma, k)
     fin = np.isfinite(cs_ref)
     lo, hi = np.percentile(cs_ref[fin], 1), np.percentile(cs_ref[fin], 99)
     print(f"[cost] per-side bps at equal weight on ${args.capital:,.0f}: "
@@ -1348,6 +1872,18 @@ def main(argv=None):
            "max_weight_mult": args.max_weight_mult,
            "max_weight_frac": args.max_weight_frac,
            "earnings_calendar": args.earnings_calendar,
+           "exec_legs": args.exec_legs,
+           "entry_auction_bps": args.entry_auction_bps,
+           "exit_auction_bps": args.exit_auction_bps,
+           "open_spread_bps": args.open_spread_bps,
+           "close_spread_bps": args.close_spread_bps,
+           "carry_bps": args.carry_bps,
+           "cap_realloc": args.cap_realloc,
+           "cap_flat_if_infeasible": bool(args.cap_flat_if_infeasible),
+           "lam_select": args.lam_select,
+           "lam_fixed": args.lam_fixed,
+           "min_names_frac": args.min_names_frac,
+           "min_active_frac": args.min_active_frac,
            "holds": {}}
 
     # THE EARNINGS MASK, BUILT ONCE AND CHECKED BEFORE IT IS USED.
@@ -1397,10 +1933,10 @@ def main(argv=None):
             # be dominated by the horizon that is not being traded. The plan is
             # explicit: fit the edge on the OVERNIGHT target specifically,
             # because a different horizon has a different conditional mean.
-            fwd = forward_return_bps(Px, 1, None)
-            keep = np.zeros(fwd.shape[0], dtype=bool)
-            keep[overnight_decision_bars(day_id, sli, T) - 1] = True
-            fwd = np.where(keep[:, None], fwd, np.nan).astype(np.float32)
+            fwd = overnight_forward_return(
+                Px_entry, Px,
+                eligible_overnight_bars(day_id, sli, T, dec_offset),
+                h, dec_offset=dec_offset)
         else:
             fwd = forward_return_bps(Px, h, sli_x)
         ridge_alpha = (args.ridge_alpha if args.ridge_alpha == "auto"
@@ -1432,7 +1968,11 @@ def main(argv=None):
         # the horizon so overlapping outcomes cannot land in different
         # clusters. Printed, never used for selection.
         tgt = cross_sectional_demean(fwd)
-        block_days = int(math.ceil(h / BARS_PER_DAY)) + 1
+        # Blocks sized to the horizon so overlapping outcomes cannot land in
+        # different clusters. Overnight `h` is already in SESSIONS, so it is
+        # h + 1 days directly rather than h bars converted.
+        block_days = (h + 1 if args.overnight
+                      else int(math.ceil(h / BARS_PER_DAY)) + 1)
         va_rows = np.arange(i_train, i_val)
         blk = np.repeat(day_id[va_rows] // block_days, N)
         ic, tstat, nblk, nobs = block_ic(edge[va_rows].ravel(), tgt[va_rows].ravel(), blk)
@@ -1473,8 +2013,22 @@ def main(argv=None):
             raise SystemExit("--open-spread-bps/--close-spread-bps describe the "
                              "overnight round trip's two legs; they are meaningless "
                              "without --overnight.")
-        if args.overnight and (sp_entry is not None or sp_exit is not None
-                               or args.carry_bps):
+        if args.overnight and (args.entry_auction_bps is not None
+                               or args.exit_auction_bps is not None):
+            def _leg(auc, sp):
+                if auc is not None:
+                    return (f"AUCTION cross at {auc:.3f} bps + impact "
+                            f"(no half-spread, no adverse tick snap)")
+                return ("env default" if sp is None else f"{sp:.3f} bps half-spread")
+            print(f"[cost] overnight legs, AUCTION-PRICED: "
+                  f"entry {_leg(args.entry_auction_bps, sp_entry)}; "
+                  f"exit {_leg(args.exit_auction_bps, sp_exit)}")
+            print("[cost] the auction cost is an ASSUMPTION, not a measurement "
+                  "-- there is no imbalance feed in this project. The ratio "
+                  "divides by cost, so this raises it arithmetically and the "
+                  "value has to have been declared before the run.")
+        elif args.overnight and (sp_entry is not None or sp_exit is not None
+                                 or args.carry_bps):
             print(f"[cost] overnight legs: entry half-spread "
                   f"{'env default' if sp_entry is None else f'{sp_entry:.3f} bps'}, "
                   f"exit half-spread "
@@ -1487,19 +2041,34 @@ def main(argv=None):
                 raise SystemExit("--risk-scale vol is defined on the overnight "
                                  "schedule only; the intraday book would need a "
                                  "5-minute vol estimate, which is a different object.")
-            risk = trailing_overnight_vol(fwd, day_id, sli, T, window=args.risk_window)
-            fin = risk[np.isfinite(risk)]
+            risk = trailing_overnight_vol(fwd, day_id, sli, T,
+                                          window=args.risk_window, lag=h,
+                                          dec_offset=dec_offset)
+            # NOT `fin`. That name holds the finite mask of `cs_ref`, which the
+            # hurdle line above reads on EVERY pass of the hold loop; rebinding
+            # it here made the second hold in a sweep index an array with
+            # floats. A latent bug for as long as overnight ran one hold only.
+            rv = risk[np.isfinite(risk)]
             print(f"[risk] equal-risk sizing on {args.risk_window}-session trailing "
-                  f"overnight vol (causal): median {np.median(fin):.0f} bps, "
-                  f"p10 {np.percentile(fin, 10):.0f}  p90 {np.percentile(fin, 90):.0f} "
-                  f"({np.percentile(fin, 90) / max(np.percentile(fin, 10), 1e-9):.1f}x "
+                  f"overnight vol (causal, lagged {h} session(s)): "
+                  f"median {np.median(rv):.0f} bps, "
+                  f"p10 {np.percentile(rv, 10):.0f}  p90 {np.percentile(rv, 90):.0f} "
+                  f"({np.percentile(rv, 90) / max(np.percentile(rv, 10), 1e-9):.1f}x "
                   f"spread -- the dispersion the scaling acts on)")
 
         if args.overnight:
-            sched_tr = overnight_schedule(0, i_train, day_id, sli, T)
-            sched_va = overnight_schedule(i_train, i_val, day_id, sli, T)
-            print(f"[overnight] {len(sched_tr)} train / {len(sched_va)} val gap "
-                  f"periods -- one per session, flatten_at_session_close lifted")
+            sched_tr = overnight_schedule(0, i_train, day_id, sli, T, hold=h,
+                                          dec_offset=dec_offset)
+            sched_va = overnight_schedule(i_train, i_val, day_id, sli, T, hold=h,
+                                          dec_offset=dec_offset)
+            print(f"[overnight] {len(sched_tr)} train / {len(sched_va)} val "
+                  f"periods at hold {h} night(s) -- one per {h} session(s), "
+                  f"flatten_at_session_close lifted")
+            if h > 1:
+                print(f"[overnight] hold {h} carries the book through {h - 1} "
+                      f"DAY session(s) per period. Turnover per session falls "
+                      f"as 1/{h}; the intraday exposure that buys it is not "
+                      f"something the reversal edge forecasts.")
         else:
             sched_tr = rebalance_schedule(0, i_train, h, sli_x)
             sched_va = rebalance_schedule(i_train, i_val, h, sli_x)
@@ -1507,20 +2076,32 @@ def main(argv=None):
         by_cost = args.variant == "full"
         rows = []
         for lam in lams:
-            tr = summarise(run_book(edge, fwd, Px, adv, sigma, k, sched_tr, day_id,
+            tr = summarise(run_book(edge, fwd, Px_entry, adv, sigma, k, sched_tr, day_id,
                                     i_train, lam, args.capital, args.min_names,
                                     size_by_cost=by_cost, risk=risk,
                                     spread_entry=sp_entry, spread_exit=sp_exit,
                                     carry_bps=args.carry_bps,
                                     max_weight_mult=args.max_weight_mult,
-                                    max_weight_frac=args.max_weight_frac), h)
-            va = summarise(run_book(edge, fwd, Px, adv, sigma, k, sched_va, day_id,
+                                    max_weight_frac=args.max_weight_frac,
+                                    P_exit=Px,
+                                    auction_entry=args.entry_auction_bps,
+                                    auction_exit=args.exit_auction_bps,
+                                    nights=(h if args.overnight else 1),
+                                    cap_realloc=args.cap_realloc,
+                                    flat_if_infeasible=args.cap_flat_if_infeasible), h)
+            va = summarise(run_book(edge, fwd, Px_entry, adv, sigma, k, sched_va, day_id,
                                     i_val - i_train, lam, args.capital, args.min_names,
                                     size_by_cost=by_cost, risk=risk,
                                     spread_entry=sp_entry, spread_exit=sp_exit,
                                     carry_bps=args.carry_bps,
                                     max_weight_mult=args.max_weight_mult,
-                                    max_weight_frac=args.max_weight_frac), h)
+                                    max_weight_frac=args.max_weight_frac,
+                                    P_exit=Px,
+                                    auction_entry=args.entry_auction_bps,
+                                    auction_exit=args.exit_auction_bps,
+                                    nights=(h if args.overnight else 1),
+                                    cap_realloc=args.cap_realloc,
+                                    flat_if_infeasible=args.cap_flat_if_infeasible), h)
             rows.append({"lam": lam, "train": tr, "val": va})
 
         # SELECTION IS ON TRAIN, AND IT NEEDS A FLOOR.
@@ -1554,7 +2135,10 @@ def main(argv=None):
                   and r["train"].get("turnover_per_bar", 0) > 0
                   and (100.0 - r["train"].get("flat_pct", 100.0)) / 100.0 >= min_active
                   and r["train"].get("mean_names", 0.0) >= min_names_n]
-        chosen = max(viable, key=lambda r: r["train"]["sharpe"])["lam"] if viable else None
+        chosen, sel_note = choose_lambda(rows, viable, args.lam_select,
+                                         args.lam_fixed)
+        if sel_note:
+            print(f"  [select] {sel_note}")
         if chosen is None:
             print(f"  [select] no lambda kept the train book active for "
                   f"{min_active:.0%} of its periods and holding "
