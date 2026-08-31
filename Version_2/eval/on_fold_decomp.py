@@ -73,7 +73,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 def run_book_detail(edge, ret, P, adv, sigma, k, schedule, day_id, lam, capital,
                     min_names=2, risk=None, spread_entry=None, spread_exit=None,
-                    carry_bps=0.0):
+                    carry_bps=0.0, max_weight_mult=None, max_weight_frac=None):
     """`xsec_book.run_book`, but keeping the [period, name] grid.
 
     Every line mirrors run_book term for term -- the day-change liquidation,
@@ -107,6 +107,7 @@ def run_book_detail(edge, ret, P, adv, sigma, k, schedule, day_id, lam, capital,
             min_names, size_by_cost=True,
             risk_row=(None if risk is None else risk[t]),
             spread_entry=spread_entry, spread_exit=spread_exit,
+            max_weight_mult=max_weight_mult, max_weight_frac=max_weight_frac,
         )
         dw = w - prev_w
         tot_turn += float(np.abs(dw).sum())
@@ -153,23 +154,57 @@ def main(argv=None):
     ap.add_argument("--capital", type=float, default=1_000_000.0)
     ap.add_argument("--min-names", type=int, default=2)
     ap.add_argument("--split", choices=("val", "train"), default="val")
+    ap.add_argument("--max-weight-mult", type=float, default=None,
+                    help="override the per-name cap; default is whatever "
+                         "--from-json was run under")
+    ap.add_argument("--max-weight-frac", type=float, default=None,
+                    help="override the ABSOLUTE per-name cap (share of gross); "
+                         "default is whatever --from-json was run under")
+    ap.add_argument("--earnings-calendar", type=str, default=None,
+                    help="override the earnings exclusion; default is whatever "
+                         "--from-json was run under")
     ap.add_argument("--top", type=int, default=15, help="names printed at each tail")
     ap.add_argument("--json", type=str, default=None)
     args = ap.parse_args(argv)
 
     lam, ref = args.lam, None
+    # THE RISK CONTROLS ARE INHERITED FROM THE JSON, NOT RE-SPECIFIED.
+    #
+    # `--from-json` already supplies lambda, because a decomposition has to
+    # describe the book that exists rather than search for a new one. The
+    # per-name cap and the earnings exclusion are part of that book in exactly
+    # the same way, so they are read from the same file. Passing them by hand
+    # would make it possible to decompose the frozen reference under settings it
+    # was never run at, and the reconciliation gate below would then be
+    # comparing two different books and failing for the wrong reason.
+    cap_mult, cap_frac = args.max_weight_mult, args.max_weight_frac
+    earn_cal = args.earnings_calendar
     if args.from_json:
         d = json.load(open(args.from_json))
         h = d["holds"]["1"]
         if lam is None:
             lam = float(h["chosen_lambda"])
         ref = next((r for r in h["rows"] if abs(r["lam"] - lam) < 1e-9), None)
+        if cap_mult is None:
+            cap_mult = d.get("max_weight_mult")
+        if cap_frac is None:
+            cap_frac = d.get("max_weight_frac")
+        if earn_cal is None:
+            earn_cal = d.get("earnings_calendar")
     if lam is None:
         raise SystemExit("--lam or --from-json required")
 
     print("=" * 100)
     print(f"OVERNIGHT FOLD DECOMPOSITION -- lambda {lam}, split {args.split}")
     print("=" * 100)
+    _cap_bits = []
+    if cap_mult is not None:
+        _cap_bits.append(f"{cap_mult:g}x equal weight")
+    if cap_frac is not None:
+        _cap_bits.append(f"{cap_frac:g} of gross")
+    print(f"[controls] per-name cap "
+          f"{'off' if not _cap_bits else ' and '.join(_cap_bits)}; "
+          f"earnings exclusion {'off' if not earn_cal else earn_cal}")
 
     k = env_cost_constants()
     panel = load_panel(None)
@@ -193,6 +228,14 @@ def main(argv=None):
     edge, edge_desc = reversal_edge(P, fwd, i_train, day_id)
     print(f"[edge] {edge_desc}")
 
+    if earn_cal:
+        from eval.earnings import (apply_to_edge, assert_mapping, exclusion_mask,
+                                   load_calendar)
+        cal = load_calendar(earn_cal)
+        assert_mapping(index, tickers, day_id, cal)
+        emask, _ = exclusion_mask(index, tickers, day_id, cal)
+        edge = apply_to_edge(edge, emask)
+
     risk = None
     if args.risk_scale == "vol":
         risk = trailing_overnight_vol(fwd, day_id, sli, T, window=args.risk_window)
@@ -208,7 +251,8 @@ def main(argv=None):
                           args.capital, args.min_names, risk=risk,
                           spread_entry=args.close_spread_bps,
                           spread_exit=args.open_spread_bps,
-                          carry_bps=args.carry_bps)
+                          carry_bps=args.carry_bps,
+                          max_weight_mult=cap_mult, max_weight_frac=cap_frac)
 
     G, C, W = det["G"], det["C"], det["W"]
     g_per, c_per = G.sum(axis=1), C.sum(axis=1)

@@ -606,8 +606,91 @@ def trailing_overnight_vol(fwd, day_id, session_last_idx, T, window=60, min_obs=
     return out
 
 
+CAP_ITERS = 32
+CAP_TOL = 1e-6
+# Slack required before a bar counts as admitting a capped book at all. Sized
+# to the convergence tolerance the fixed point is checked at, not chosen.
+CAP_FEAS_SLACK = 1e-3
+
+
+def apply_weight_cap(w, act, n_sel, mult, frac=None, iters=CAP_ITERS, tol=CAP_TOL):
+    """Bound each name's share of gross at min(`mult` x equal weight, `frac`).
+
+    (w, converged, feasible). Input and output are both gross-normalised and
+    dollar-neutral over `act`; the cap is a fraction of gross, so it means the
+    same thing on every bar regardless of how much the book is holding.
+
+    TWO CAPS, AND THE TIGHTER ONE BINDS. `mult / n_sel` is RELATIVE -- it bounds
+    a name against the breadth of the book it sits in and says nothing about the
+    book's absolute concentration. On a six-name book at mult=3 it permits half
+    the gross in one position, which is more than the concentration the control
+    was written to forbid. `frac` is the absolute floor that rule never had: no
+    name is more than `frac` of the book, however narrow the book gets. See
+    Appendix A of eval/PREREG_step5_risk_controls.md -- this is an amendment
+    closing a defect in the relative rule, and it is tighter than that rule on
+    every bar, so it cannot be a search for a better number.
+
+    THE CAP IS NOT A CLIP. Clipping alone breaks both invariants the weights are
+    built to satisfy -- it changes gross, so the cap threshold it was just
+    measured against is stale, and it changes the mean, so the book is no longer
+    dollar-neutral. So the three operations are iterated to a fixed point:
+    clip at `mult/n_sel` of the CURRENT gross, re-demean over the selected names,
+    repeat. Each pass moves strictly less mass than the last (the clip removes
+    the excess above the threshold, and the threshold falls by less than the
+    excess), so this contracts; the loop is bounded anyway and non-convergence
+    is REPORTED rather than absorbed.
+
+    Feasibility. Gross 1 across n names needs `cap * n >= 1`. The relative cap
+    satisfies that for any n whenever mult >= 1, but the ABSOLUTE cap does not:
+    `frac = 0.10` needs at least 10 selected names, and dollar-neutrality needs
+    each LEG to carry half the gross, i.e. at least 0.5/frac names on the
+    smaller side. `min_names` is 2, so narrower bars occur. On such a bar no
+    dollar-neutral book below `frac` EXISTS; the iteration drives it to the
+    tightest weighting the bar admits -- equal weight over the selected names --
+    and stops there. It is reported as INFEASIBLE, which is a fact about the
+    book's breadth, and kept separate from `unconverged`, which keeps its
+    original meaning: a book whose selected names are almost all one sign, so
+    the smaller leg cannot carry its half. Neither is silently accepted; both
+    are counted, because a cap quietly failing to bind is failing on exactly the
+    bars it exists for.
+    """
+    if (mult is None and frac is None) or n_sel <= 0:
+        return w, True, True
+    cap = float("inf")
+    if mult is not None:
+        cap = min(cap, float(mult) / float(n_sel))
+    if frac is not None:
+        cap = min(cap, float(frac))
+    # FEASIBLE MEANS "a dollar-neutral book below the cap exists, with slack".
+    # `cap * n_sel == 1` exactly is not slack: the only admissible book is the
+    # exact equal-weight one, and the iteration cannot be asked to land it to
+    # the 1e-3 tolerance below. A knife-edge bar is a BREADTH failure and is
+    # counted as infeasible; `cap_unconverged` keeps its declared meaning of a
+    # lopsided long/short split, which is a different fact about the bar.
+    feasible = cap * float(n_sel) >= 1.0 + CAP_FEAS_SLACK
+    for _ in range(int(iters)):
+        g = float(np.abs(w).sum())
+        if g <= 0:
+            return w, True
+        thresh = cap * g
+        if float(np.abs(w).max()) <= thresh * (1.0 + tol):
+            break
+        np.clip(w, -thresh, thresh, out=w)
+        w[act] -= w[act].mean()
+    g = float(np.abs(w).sum())
+    if g <= 0:
+        return np.zeros_like(w), True, feasible
+    w = w / g
+    ok = bool(float(np.abs(w).max()) <= cap * (1.0 + 1e-3))
+    # An infeasible bar cannot be "converged" -- there is no book below the cap
+    # to converge to -- so it is never counted as a lopsided-split failure. The
+    # two counters answer different questions and must not be pooled.
+    return w, (True if not feasible else ok), feasible
+
+
 def book_weights(edge_row, rt_cost_row, lam, min_names=2, size_by_cost=True,
-                 risk_row=None):
+                 risk_row=None, max_weight_mult=None, max_weight_frac=None,
+                 diag=None):
     """One bar's weights, gross-normalised and dollar-neutral. (w [N], n_selected).
 
     `size_by_cost=False` is the ablation that isolates what the `/ cost` term
@@ -660,12 +743,42 @@ def book_weights(edge_row, rt_cost_row, lam, min_names=2, size_by_cost=True,
     gross = np.abs(w).sum()
     if gross <= 0:
         return np.zeros(N, dtype=np.float64), n_sel
-    return w / gross, n_sel               # gross-normalised
+    w = w / gross                         # gross-normalised
+
+    # PER-NAME CONCENTRATION CAP, min(KAPPA/n_selected, A). Pre-registered at
+    # KAPPA=3.0 and amended to add A=0.10 in Appendix A of
+    # eval/PREREG_step5_risk_controls.md. It is applied LAST, after selection,
+    # sizing, risk scaling and demeaning, because it is a constraint on the book
+    # that results -- not a second opinion about which names are worth holding.
+    # The hurdle still decides what is in the book; the cap only decides that no
+    # one name is worth more than three of them, nor more than a tenth of it.
+    feasible = True
+    if max_weight_mult is not None or max_weight_frac is not None:
+        w, ok, feasible = apply_weight_cap(w, act, n_sel, max_weight_mult,
+                                           max_weight_frac)
+        if diag is not None:
+            diag["cap_bars"] = diag.get("cap_bars", 0) + 1
+            if not ok:
+                diag["cap_unconverged"] = diag.get("cap_unconverged", 0) + 1
+            if not feasible:
+                diag["cap_infeasible"] = diag.get("cap_infeasible", 0) + 1
+    if diag is not None and n_sel > 0:
+        g = float(np.abs(w).sum())
+        if g > 0:
+            diag.setdefault("max_share", []).append(float(np.abs(w).max()) / g)
+            diag.setdefault("n_sel", []).append(int(n_sel))
+            # Recorded ALONGSIDE max_share so the two arrays cannot drift out of
+            # alignment: the concentration of a bar that admits no capped book
+            # is not evidence about the cap, and has to be separable from the
+            # concentration of a bar that does.
+            diag.setdefault("feasible", []).append(bool(feasible))
+    return w, n_sel
 
 
 def solve_weights(edge_row, price_row, adv, sigma, lam, capital, k, min_names=2,
                   iters=2, size_by_cost=True, risk_row=None,
-                  spread_entry=None, spread_exit=None):
+                  spread_entry=None, spread_exit=None,
+                  max_weight_mult=None, max_weight_frac=None, diag=None):
     """Weights and the per-side cost they were solved against. (w, n_sel, cost_side).
 
     There is a circularity to resolve: impact depends on the share count, the
@@ -678,7 +791,8 @@ def solve_weights(edge_row, price_row, adv, sigma, lam, capital, k, min_names=2,
     """
     shares = np.zeros_like(price_row, dtype=np.float64)
     w, n_sel, cost_side = None, 0, None
-    for _ in range(max(iters, 1)):
+    n_iter = max(iters, 1)
+    for it in range(n_iter):
         cost_side = side_cost_bps(price_row, shares, adv, sigma, k, spread_entry)
         # THE HURDLE MUST USE THE ROUND TRIP THAT WILL ACTUALLY BE PAID. When
         # the two legs are struck at different times their spreads differ, and
@@ -691,8 +805,15 @@ def solve_weights(edge_row, price_row, adv, sigma, lam, capital, k, min_names=2,
             rt = 2.0 * cost_side
         else:
             rt = cost_side + side_cost_bps(price_row, shares, adv, sigma, k, spread_exit)
+        # `diag` is recorded on the LAST impact pass only. The earlier passes
+        # price the book as if it were infinitesimal, so their weights are an
+        # intermediate the book never holds, and counting them would report the
+        # concentration of a position that was never taken.
         w, n_sel = book_weights(edge_row, rt, lam, min_names, size_by_cost,
-                                risk_row=risk_row)
+                                risk_row=risk_row,
+                                max_weight_mult=max_weight_mult,
+                                max_weight_frac=max_weight_frac,
+                                diag=(diag if it == n_iter - 1 else None))
         with np.errstate(divide="ignore", invalid="ignore"):
             shares = np.abs(w) * capital / np.where(price_row > 0, price_row, np.nan)
         shares = np.nan_to_num(shares, nan=0.0)
@@ -745,7 +866,8 @@ def overnight_schedule(t0, t1, day_id, session_last_idx, T):
 
 def run_book(edge, ret, P, adv, sigma, k, schedule, day_id, n_bars, lam,
              capital, min_names=2, size_by_cost=True, risk=None,
-             spread_entry=None, spread_exit=None, carry_bps=0.0):
+             spread_entry=None, spread_exit=None, carry_bps=0.0,
+             max_weight_mult=None, max_weight_frac=None):
     """Walk the schedule once and return the period ledger plus totals.
 
     Friction is charged on TURNOVER, one side per unit traded, at the bar where
@@ -767,6 +889,7 @@ def run_book(edge, ret, P, adv, sigma, k, schedule, day_id, n_bars, lam,
 
     gross_s, cost_s, sel_s = [], [], []
     tot_turn = 0.0
+    diag = {}
 
     def liquidation_cost(w, bar):
         """Cost of closing `w` at `bar`, impact priced off the size being closed."""
@@ -788,7 +911,9 @@ def run_book(edge, ret, P, adv, sigma, k, schedule, day_id, n_bars, lam,
             edge[t], P[t].astype(np.float64), adv, sigma, lam, capital, k,
             min_names, size_by_cost=size_by_cost,
             risk_row=(None if risk is None else risk[t]),
-            spread_entry=spread_entry, spread_exit=spread_exit
+            spread_entry=spread_entry, spread_exit=spread_exit,
+            max_weight_mult=max_weight_mult, max_weight_frac=max_weight_frac,
+            diag=diag
         )
         dw = w - prev_w
         tot_turn += float(np.abs(dw).sum())
@@ -814,7 +939,8 @@ def run_book(edge, ret, P, adv, sigma, k, schedule, day_id, n_bars, lam,
         tot_turn += float(np.abs(prev_w).sum())
 
     return dict(gross=np.asarray(gross_s), cost=np.asarray(cost_s),
-                selected=np.asarray(sel_s), turnover=tot_turn, n_bars=int(n_bars))
+                selected=np.asarray(sel_s), turnover=tot_turn, n_bars=int(n_bars),
+                diag=diag)
 
 
 def summarise(ledger, h):
@@ -874,7 +1000,49 @@ def summarise(ledger, h):
     alpha_pt = float(g.sum()) / turn if turn > 0 else float("nan")
     cost_pt = float(c.sum()) / turn if turn > 0 else float("nan")
 
+    # CONCENTRATION, THE OTHER KIND. `top5_share` above asks whether the P&L
+    # came from five SESSIONS. This asks whether the book came from one NAME:
+    # the distribution, across periods, of the largest single position as a
+    # fraction of gross. It is recorded on every run, capped or not, because
+    # the uncapped number is what the cap is being set against and it must be
+    # readable off a run that predates the cap.
+    diag = ledger.get("diag") or {}
+    shares = np.asarray(diag.get("max_share", []), dtype=float)
+    conc = {}
+    if shares.size:
+        nsel = np.asarray(diag.get("n_sel", []), dtype=float)
+        conc = dict(
+            max_share_p50=float(np.percentile(shares, 50)),
+            max_share_p90=float(np.percentile(shares, 90)),
+            max_share_p99=float(np.percentile(shares, 99)),
+            max_share_max=float(shares.max()),
+            # The same numbers in the units the cap is stated in: multiples of
+            # the equal weight of the bar's own book, so KAPPA reads directly
+            # against them.
+            max_mult_p50=float(np.percentile(shares * nsel, 50)),
+            max_mult_p90=float(np.percentile(shares * nsel, 90)),
+            max_mult_p99=float(np.percentile(shares * nsel, 99)),
+            max_mult_max=float((shares * nsel).max()),
+            cap_bars=int(diag.get("cap_bars", 0)),
+            cap_unconverged=int(diag.get("cap_unconverged", 0)),
+            # Bars too narrow for the ABSOLUTE cap to be satisfiable at all
+            # (fewer than 1/A names). Reported, never absorbed -- see Appendix A.
+            cap_infeasible=int(diag.get("cap_infeasible", 0)),
+        )
+        # THE CAP'S OWN INTENT, MEASURED ONLY WHERE IT COULD BE SERVED. A
+        # dollar-neutral book of n names cannot be less concentrated than 1/n,
+        # so a 2-name bar reads 0.500 under any cap whatsoever. Reporting the
+        # unconditional max makes the rule look broken on bars where no rule
+        # could succeed. Both are printed; neither replaces the other, and the
+        # infeasible COUNT above is what says how much of the window this is.
+        feas = np.asarray(diag.get("feasible", []), dtype=bool)
+        if feas.size == shares.size and feas.any():
+            conc["max_share_feasible_max"] = float(shares[feas].max())
+            conc["max_share_feasible_p99"] = float(np.percentile(shares[feas], 99))
+            conc["feasible_bars"] = int(feas.sum())
+
     return dict(
+        **conc,
         periods=n_per,
         periods_per_year=per_year,
         gross_bps=float(g.mean()),
@@ -968,7 +1136,28 @@ def print_detail(hold, lam, res):
         ("hit rate % (active only)", "hit_rate", ".1f"),
         ("active periods", "active_periods", ".0f"),
         ("periods", "periods", ".0f"),
+        # LARGEST SINGLE NAME, as a share of gross and as a multiple of the
+        # bar's own equal weight. Printed on every run: uncapped these are the
+        # measurement the cap is set against, capped they are the proof it bound.
+        ("max name, share of gross", None, None),
+        ("  p50", "max_share_p50", ".3f"),
+        ("  p90", "max_share_p90", ".3f"),
+        ("  p99", "max_share_p99", ".3f"),
+        ("  max", "max_share_max", ".3f"),
+        ("max name, x equal weight", None, None),
+        ("  p50", "max_mult_p50", ".2f"),
+        ("  p90", "max_mult_p90", ".2f"),
+        ("  p99", "max_mult_p99", ".2f"),
+        ("  max", "max_mult_max", ".2f"),
+        ("cap bars not converged", "cap_unconverged", ".0f"),
+        ("cap bars infeasible (n < 1/A)", "cap_infeasible", ".0f"),
+        ("max share, feasible bars only", None, None),
+        ("  p99", "max_share_feasible_p99", ".3f"),
+        ("  max", "max_share_feasible_max", ".3f"),
     ):
+        if key is None:
+            print(f"{label:<26}")
+            continue
         print(f"{label:<26}{_fmt(tr.get(key), spec):>14}{_fmt(va.get(key), spec):>14}")
 
 
@@ -1044,8 +1233,40 @@ def main(argv=None):
                          "flatten_at_session_close cap and trade the single "
                          "session-close -> next-session-open transition, one bet "
                          "per name per session. Forces hold=1.")
+    ap.add_argument("--max-weight-mult", type=float, default=None,
+                    help="PER-NAME CONCENTRATION CAP: no name may exceed this "
+                         "multiple of the bar's own equal weight (1/n_selected) "
+                         "as a fraction of gross. Pre-registered at 3.0; see "
+                         "eval/PREREG_step5_risk_controls.md. Off by default, so "
+                         "every number already in the record reproduces.")
+    ap.add_argument("--max-weight-frac", type=float, default=None,
+                    help="ABSOLUTE per-name cap: no name may exceed this share "
+                         "of gross, whatever the book's breadth. The tighter of "
+                         "this and --max-weight-mult binds. Pre-registered at "
+                         "A = 0.10 in Appendix A of "
+                         "eval/PREREG_step5_risk_controls.md, as an amendment "
+                         "closing a defect in the relative rule -- 3.0x equal "
+                         "weight permits 50% of gross on a six-name book. Off "
+                         "by default, so every number already in the record "
+                         "reproduces.")
+    ap.add_argument("--earnings-calendar", type=str, default=None,
+                    help="csv from eval/fetch_earnings_calendar.py. Names with a "
+                         "scheduled release inside a period's overnight window are "
+                         "held FLAT for that period, in TRAIN and VAL alike -- the "
+                         "exclusion is part of the strategy definition, so lambda "
+                         "must be selected on the book being graded. Overnight only.")
     ap.add_argument("--json", type=str, default=None)
     args = ap.parse_args(argv)
+
+    if args.earnings_calendar and not args.overnight:
+        raise SystemExit("--earnings-calendar describes which OVERNIGHT window a "
+                         "release lands in; it is meaningless without --overnight.")
+    if args.max_weight_mult is not None and args.max_weight_mult < 1.0:
+        raise SystemExit("--max-weight-mult below 1.0 cannot be satisfied at gross "
+                         "1: n names capped at m/n sum to m < 1.")
+    if args.max_weight_frac is not None and not (0.0 < args.max_weight_frac <= 1.0):
+        raise SystemExit("--max-weight-frac is a share of gross and must lie in "
+                         "(0, 1].")
 
     holds = args.hold or [DEFAULT_HOLD]
     if args.overnight:
@@ -1123,7 +1344,46 @@ def main(argv=None):
 
     out = {"cost_desc": cost_desc, "edge_kind": args.edge, "n_tickers": N,
            "capital": args.capital, "variant": args.variant,
-           "frame": args.frame, "holds": {}}
+           "frame": args.frame,
+           "max_weight_mult": args.max_weight_mult,
+           "max_weight_frac": args.max_weight_frac,
+           "earnings_calendar": args.earnings_calendar,
+           "holds": {}}
+
+    # THE EARNINGS MASK, BUILT ONCE AND CHECKED BEFORE IT IS USED.
+    #
+    # `assert_mapping` re-derives, from this panel's own session index, the
+    # session each of nine independently-known releases must exclude, and
+    # refuses to run if any of them lands on the wrong night. Getting AMC and
+    # BMO the wrong way round excludes the safe session and holds the dangerous
+    # one -- the control would be off while every log said it was on.
+    earn_mask, earn_stats = None, None
+    if args.earnings_calendar:
+        from eval.earnings import (assert_mapping, exclusion_mask, load_calendar,
+                                   apply_to_edge)
+        cal = load_calendar(args.earnings_calendar)
+        print(f"[earnings] {args.earnings_calendar}: {len(cal):,} events, "
+              f"{cal.ticker.nunique()} symbols, "
+              f"{cal.date.min().date()} .. {cal.date.max().date()}")
+        assert_mapping(panel["index"], tickers, day_id, cal)
+        earn_mask, earn_stats = exclusion_mask(panel["index"], tickers, day_id, cal)
+        out["earnings_stats"] = earn_stats
+
+    if args.max_weight_mult is not None or args.max_weight_frac is not None:
+        parts = []
+        if args.max_weight_mult is not None:
+            parts.append(f"{args.max_weight_mult:.2f} x the equal weight of the "
+                         f"bar's own book")
+        if args.max_weight_frac is not None:
+            parts.append(f"{args.max_weight_frac:.3f} of gross outright")
+        joined = " and ".join(parts)
+        lead = "the tighter of " if len(parts) > 1 else ""
+        print(f"[cap] per-name weight cap: {lead}{joined}")
+        if args.max_weight_frac is not None:
+            n_min = int(math.ceil(1.0 / args.max_weight_frac))
+            print(f"[cap] the absolute cap needs >= {n_min} selected names to be "
+                  f"satisfiable at gross 1; narrower bars are counted as "
+                  f"infeasible, not absorbed")
 
     for h in holds:
         if args.overnight:
@@ -1152,6 +1412,19 @@ def main(argv=None):
                                          ridge_alpha=ridge_alpha,
                                          edge_npz=args.edge_npz,
                                          index=panel["index"], tickers=tickers)
+        # STAND FLAT INTO THE PRINT. Applied to the edge AFTER it is built, so
+        # the estimator -- including reversal_edge's single train-only slope --
+        # is fitted on the same data it always was and only the SELECTION
+        # changes. NaN, not zero: `book_weights` selects on isfinite, so a NaN
+        # takes the name out of the cross-section entirely, while a zero would
+        # leave it in as an offsetting leg.
+        if earn_mask is not None:
+            n_before = int(np.isfinite(edge).sum())
+            edge = apply_to_edge(edge, earn_mask)
+            n_after = int(np.isfinite(edge).sum())
+            print(f"[earnings] edge blanked on {n_before - n_after:,} of "
+                  f"{n_before:,} finite cells ({100.0 * (n_before - n_after) / max(n_before, 1):.2f}%)")
+
         print()
         print(f"[edge] hold {h}: {edge_desc}")
 
@@ -1238,12 +1511,16 @@ def main(argv=None):
                                     i_train, lam, args.capital, args.min_names,
                                     size_by_cost=by_cost, risk=risk,
                                     spread_entry=sp_entry, spread_exit=sp_exit,
-                                    carry_bps=args.carry_bps), h)
+                                    carry_bps=args.carry_bps,
+                                    max_weight_mult=args.max_weight_mult,
+                                    max_weight_frac=args.max_weight_frac), h)
             va = summarise(run_book(edge, fwd, Px, adv, sigma, k, sched_va, day_id,
                                     i_val - i_train, lam, args.capital, args.min_names,
                                     size_by_cost=by_cost, risk=risk,
                                     spread_entry=sp_entry, spread_exit=sp_exit,
-                                    carry_bps=args.carry_bps), h)
+                                    carry_bps=args.carry_bps,
+                                    max_weight_mult=args.max_weight_mult,
+                                    max_weight_frac=args.max_weight_frac), h)
             rows.append({"lam": lam, "train": tr, "val": va})
 
         # SELECTION IS ON TRAIN, AND IT NEEDS A FLOOR.
